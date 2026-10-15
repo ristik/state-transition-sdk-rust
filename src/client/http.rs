@@ -21,7 +21,12 @@ use crate::api::inclusion_proof::InclusionProof;
 use crate::api::{CertificationData, InclusionProofResponse, NonInclusionProof, StateId};
 use crate::cbor::Decoder;
 
-use super::{AggregatorClient, MembershipStatus, NonInclusionAggregatorClient};
+use super::{
+    rpc_code, AggregatorClient, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
+    InclusionProofBatch, MembershipStatus, NonInclusionAggregatorClient, RequestOptions, StateRoot,
+    MAX_BATCH_STATE_IDS,
+};
+use crate::consolidation::PartitionView;
 
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -249,7 +254,29 @@ impl HttpAggregatorClient {
         params: serde_json::Value,
         headers: &[(&str, &str)],
     ) -> Result<serde_json::Value, HttpError> {
-        self.validate_endpoint()?;
+        self.rpc_raw(method, params, headers, None)
+            .map_err(|e| match e {
+                RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
+                RawFailure::Transport(m) => HttpError::Transport(m),
+                RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
+                RawFailure::Envelope(EnvelopeError::Rpc { code, message, .. }) => {
+                    HttpError::Rpc { code, message }
+                }
+                RawFailure::TooLarge(limit) => HttpError::ResponseTooLarge { limit },
+                RawFailure::Config(e) => e,
+            })
+    }
+
+    /// One JSON-RPC call with an optional per-request timeout, keeping the
+    /// structured error data.
+    fn rpc_raw(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        headers: &[(&str, &str)],
+        timeout: Option<Duration>,
+    ) -> Result<serde_json::Value, RawFailure> {
+        self.validate_endpoint().map_err(RawFailure::Config)?;
         let id = request_id();
         let body = serde_json::json!({
             "id": id,
@@ -263,6 +290,9 @@ impl HttpAggregatorClient {
             .agent
             .post(&self.url)
             .set("Content-Type", "application/json");
+        if let Some(t) = timeout {
+            request = request.timeout(t);
+        }
         for (k, v) in headers {
             request = request.set(k, v);
         }
@@ -270,80 +300,113 @@ impl HttpAggregatorClient {
         let response = match request.send_string(&body) {
             Ok(r) => r,
             Err(ureq::Error::Status(status, r)) => {
-                return Err(HttpError::Http {
-                    status,
-                    body: read_response(r, MAX_ERROR_BODY_BYTES)?,
-                });
+                let body = read_response_raw(r, MAX_ERROR_BODY_BYTES)?;
+                // a JSON-RPC error may ride on a non-2xx status: keep it typed
+                let rpc = match decode_rpc_envelope(&body, &id) {
+                    Err(e @ EnvelopeError::Rpc { .. }) => Some(e),
+                    _ => None,
+                };
+                return Err(RawFailure::Http { status, body, rpc });
             }
-            Err(e) => return Err(HttpError::Transport(e.to_string())),
+            Err(e) => return Err(RawFailure::Transport(e.to_string())),
         };
         if !(200..300).contains(&response.status()) {
-            return Err(HttpError::Http {
+            return Err(RawFailure::Http {
                 status: response.status(),
-                body: read_response(response, MAX_ERROR_BODY_BYTES)?,
+                body: read_response_raw(response, MAX_ERROR_BODY_BYTES)?,
+                rpc: None,
             });
         }
 
-        let text = read_response(response, MAX_RESPONSE_BODY_BYTES)?;
-        decode_rpc_response(&text, &id)
+        let text = read_response_raw(response, MAX_RESPONSE_BODY_BYTES)?;
+        decode_rpc_envelope(&text, &id).map_err(RawFailure::Envelope)
     }
 }
 
-fn read_response(response: ureq::Response, limit: usize) -> Result<String, HttpError> {
+/// Failure of one raw JSON-RPC exchange.
+enum RawFailure {
+    Http {
+        status: u16,
+        body: String,
+        rpc: Option<EnvelopeError>,
+    },
+    Transport(String),
+    Envelope(EnvelopeError),
+    TooLarge(usize),
+    Config(HttpError),
+}
+
+fn read_response_raw(response: ureq::Response, limit: usize) -> Result<String, RawFailure> {
     let mut bytes = Vec::new();
     response
         .into_reader()
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| HttpError::Transport(e.to_string()))?;
+        .map_err(|e| RawFailure::Transport(e.to_string()))?;
     if bytes.len() > limit {
-        return Err(HttpError::ResponseTooLarge { limit });
+        return Err(RawFailure::TooLarge(limit));
     }
-    String::from_utf8(bytes).map_err(|e| HttpError::Decode(e.to_string()))
+    String::from_utf8(bytes).map_err(|e| RawFailure::Envelope(EnvelopeError::Decode(e.to_string())))
 }
 
-fn decode_rpc_response(text: &str, expected_id: &str) -> Result<serde_json::Value, HttpError> {
+/// A decoded JSON-RPC envelope failure.
+enum EnvelopeError {
+    Decode(String),
+    Rpc {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+}
+
+fn decode_rpc_envelope(text: &str, expected_id: &str) -> Result<serde_json::Value, EnvelopeError> {
+    let decode = |m: &str| EnvelopeError::Decode(m.to_string());
     let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| HttpError::Decode(e.to_string()))?;
+        serde_json::from_str(text).map_err(|e| EnvelopeError::Decode(e.to_string()))?;
     let object = value
         .as_object()
-        .ok_or_else(|| HttpError::Decode("JSON-RPC response must be an object".to_string()))?;
+        .ok_or_else(|| decode("JSON-RPC response must be an object"))?;
     if object.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
-        return Err(HttpError::Decode(
-            "invalid or missing JSON-RPC version".to_string(),
-        ));
+        return Err(decode("invalid or missing JSON-RPC version"));
     }
     let response_id = object
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| HttpError::Decode("invalid or missing JSON-RPC id".to_string()))?;
+        .ok_or_else(|| decode("invalid or missing JSON-RPC id"))?;
     if response_id != expected_id {
-        return Err(HttpError::Decode("JSON-RPC id mismatch".to_string()));
+        return Err(decode("JSON-RPC id mismatch"));
     }
 
     match (object.get("result"), object.get("error")) {
-        (Some(_), Some(_)) => Err(HttpError::Decode(
-            "JSON-RPC response contains both result and error".to_string(),
-        )),
+        (Some(_), Some(_)) => Err(decode("JSON-RPC response contains both result and error")),
         (Some(result), None) => Ok(result.clone()),
         (None, Some(error)) => {
             let code = error
                 .get("code")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| HttpError::Decode("invalid JSON-RPC error code".to_string()))?;
+                .ok_or_else(|| decode("invalid JSON-RPC error code"))?;
             let message = error
                 .get("message")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| HttpError::Decode("invalid JSON-RPC error message".to_string()))?;
-            Err(HttpError::Rpc {
+                .ok_or_else(|| decode("invalid JSON-RPC error message"))?;
+            Err(EnvelopeError::Rpc {
                 code,
                 message: message.to_string(),
+                data: error.get("data").cloned(),
             })
         }
-        (None, None) => Err(HttpError::Decode(
-            "JSON-RPC response contains neither result nor error".to_string(),
+        (None, None) => Err(decode(
+            "JSON-RPC response contains neither result nor error",
         )),
     }
+}
+
+#[cfg(test)]
+fn decode_rpc_response(text: &str, expected_id: &str) -> Result<serde_json::Value, HttpError> {
+    decode_rpc_envelope(text, expected_id).map_err(|e| match e {
+        EnvelopeError::Decode(m) => HttpError::Decode(m),
+        EnvelopeError::Rpc { code, message, .. } => HttpError::Rpc { code, message },
+    })
 }
 
 /// Decode the `[blockNumber, InclusionProof]` response payload.
@@ -467,6 +530,129 @@ impl NonInclusionAggregatorClient for HttpAggregatorClient {
             .for_state(state_id)
             .map_err(|error| HttpError::Decode(error.to_string()))
     }
+}
+
+impl BatchAggregatorClient for HttpAggregatorClient {
+    fn get_inclusion_proofs(
+        &self,
+        request: &BatchRequest<'_>,
+        options: &RequestOptions,
+    ) -> Result<InclusionProofBatch, BatchFailure> {
+        let ids = request.state_ids;
+        if ids.is_empty() || ids.len() > MAX_BATCH_STATE_IDS {
+            return Err(BatchFailure::Rpc {
+                code: rpc_code::INVALID_PARAMS,
+                message: "state id count out of range".to_string(),
+                reason: Some("invalid_request".to_string()),
+                detail: Some("state_count".to_string()),
+                retryable: Some(false),
+            });
+        }
+        let state_root = match request.state_root {
+            StateRoot::Latest => "latest".to_string(),
+            StateRoot::Exact(root) => hex::encode(root),
+        };
+        let params = serde_json::json!({
+            "stateIds": ids.iter().map(|s| hex::encode(s.bytes())).collect::<Vec<_>>(),
+            "stateRoot": state_root,
+        });
+        let result = self
+            .rpc_raw(
+                "get_inclusion_proofs.v1",
+                params,
+                &[],
+                Some(Duration::from_millis(options.timeout_ms.max(1))),
+            )
+            .map_err(batch_failure)?;
+        decode_batch_result(&result)
+    }
+}
+
+fn batch_failure(failure: RawFailure) -> BatchFailure {
+    match failure {
+        RawFailure::Http { rpc: Some(e), .. } => batch_failure(RawFailure::Envelope(e)),
+        RawFailure::Http { status, .. } => BatchFailure::Http { status },
+        RawFailure::Transport(m) if m.contains("timed out") => BatchFailure::Timeout,
+        RawFailure::Transport(m) => BatchFailure::Transport(m),
+        RawFailure::TooLarge(limit) => BatchFailure::TooLarge { limit },
+        RawFailure::Config(e) => BatchFailure::Transport(e.to_string()),
+        RawFailure::Envelope(EnvelopeError::Decode(m)) => BatchFailure::Decode(m),
+        RawFailure::Envelope(EnvelopeError::Rpc {
+            code,
+            message,
+            data,
+        }) => {
+            let text = |k: &str| {
+                data.as_ref()
+                    .and_then(|d| d.get(k))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            };
+            BatchFailure::Rpc {
+                code,
+                message,
+                reason: text("reason"),
+                detail: text("detail"),
+                retryable: data
+                    .as_ref()
+                    .and_then(|d| d.get("retryable"))
+                    .and_then(|v| v.as_bool()),
+            }
+        }
+    }
+}
+
+/// Decode `{"proofs": [<hex CBOR>...], "partitionView": <hex CBOR>?}`.
+fn decode_batch_result(result: &serde_json::Value) -> Result<InclusionProofBatch, BatchFailure> {
+    let bad = |m: &str| BatchFailure::Decode(m.to_string());
+    let object = result
+        .as_object()
+        .ok_or_else(|| bad("batch result must be an object"))?;
+    if object.keys().any(|k| k != "proofs" && k != "partitionView") {
+        return Err(bad("unknown field in batch result"));
+    }
+    let hex_field = |v: &serde_json::Value| -> Result<Vec<u8>, BatchFailure> {
+        let s = v.as_str().ok_or_else(|| bad("expected a hex string"))?;
+        if s.len() > MAX_PROOF_HEX_CHARS {
+            return Err(BatchFailure::TooLarge {
+                limit: MAX_PROOF_HEX_CHARS,
+            });
+        }
+        hex::decode(s).map_err(|e| BatchFailure::Decode(e.to_string()))
+    };
+    let proofs = object
+        .get("proofs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| bad("missing proofs array"))?
+        .iter()
+        .map(|v| {
+            let bytes = hex_field(v)?;
+            match decode_inclusion_proof_response(&bytes) {
+                Ok(InclusionProofResponse::Certified {
+                    block_number,
+                    proof,
+                }) => Ok(BatchProof {
+                    block_number,
+                    proof,
+                }),
+                Ok(InclusionProofResponse::NotCertified { .. }) => {
+                    Err(bad("batch carries an uncertified proof"))
+                }
+                Err(e) => Err(BatchFailure::Decode(e.to_string())),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let partition_view = match object.get("partitionView") {
+        None => None,
+        Some(v) => Some(
+            PartitionView::from_cbor(&hex_field(v)?)
+                .map_err(|e| BatchFailure::Decode(e.to_string()))?,
+        ),
+    };
+    Ok(InclusionProofBatch {
+        proofs,
+        partition_view,
+    })
 }
 
 /// A random JSON-RPC request id.

@@ -83,6 +83,30 @@ impl<'a> VerificationContext<'a> {
         }
     }
 
+    /// A context that continues an existing operation's seal session (so seals
+    /// authenticated earlier in the same operation are not checked again).
+    #[cfg(feature = "client")]
+    pub(crate) fn with_session(
+        seals: SealSession<'a>,
+        registry: &'a MintJustificationRegistry,
+        policy: VerificationPolicy,
+    ) -> Self {
+        Self {
+            trust_base: seals.trust_base(),
+            registry,
+            policy,
+            seals,
+            embedded_token_depth: 0,
+            total_embedded_token_bytes: 0,
+        }
+    }
+
+    /// Hand the operation's seal session back.
+    #[cfg(feature = "client")]
+    pub(crate) fn into_session(self) -> SealSession<'a> {
+        self.seals
+    }
+
     /// Root of trust used by the entire recursive verification chain.
     pub fn trust_base(&self) -> &RootTrustBase {
         self.trust_base

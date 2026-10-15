@@ -128,6 +128,12 @@ Token and payment verification remain available in this configuration. Construct
 
 Verification of tokens authenticates each distinct complete seal once per operation (`verify::SealSession`, a bounded memo of successful quorum checks bound to one trust base). Only the quorum-signature check is reused; paths, reference times, predicates and application rules run for every proof. `verify::verify_token_with_seal_stats` reports the signature work performed. This does not shrink tokens or change their format, and nested proofs that carry other seals still need their own check. Nothing here contacts an aggregator or consolidates a token automatically.
 
+## Explicit proof consolidation (opt-in)
+
+With the `client` feature, `client::ProofClient::consolidate(&token, &options)` returns a *new*, fully verified token whose replaceable outer-history proofs share one unicity seal — useful before EVM / bridge-back or zkVM verification, where a verifier that reuses a successful quorum check pays for the signatures once. It is never automatic (nothing in mint, transfer, receive, import, serialization or `Token::verify` calls it), needs no signing key, and never submits or resubmits a transaction. The token format and size do not change, and proofs nested in signed mint justifications or split/burn dependencies stay byte-identical (they may still need their own seals; the summary reports outer-history and whole-verification quorum checks separately).
+
+An attempt asks the *master* shard (the one with the newest authenticated evidence) for its latest batch and partition view, authenticates it under your trust base and configured topology, then fetches the exact roots the authenticated view names from the other participating shards (bounded parallel on a host), all under one deadline and one `CancelToken`. The batch call is the optional `client::BatchAggregatorClient` capability (`get_inclusion_proofs.v1`), implemented by `HttpAggregatorClient`; it is never emulated from single-proof calls. Results are typed: `Consolidated`, or `Unavailable { reason, retryable }` for missing capability / unretained or not-yet-published views / busy (the original token is untouched), versus errors for integrity failures, transport and server failures, timeouts and cancellation. See `examples/consolidate_for_bridge.rs` and `examples/consolidate_for_zkvm.rs`. Pure planning and checked reconstruction (`consolidation::{ShardRouter, outer_proofs, rebuild_token, ..}`) are `no_std + alloc`.
+
 ## Development
 
 ```bash

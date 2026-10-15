@@ -98,6 +98,24 @@ pub fn verify_token_with_seal_stats(
     (result, context.seals().stats())
 }
 
+/// Verify `token` inside an existing operation's seal session and return the
+/// session, so that later steps of the same operation reuse what was authenticated.
+#[cfg(feature = "client")]
+pub(crate) fn verify_token_in_session<'a>(
+    token: &Token,
+    session: SealSession<'a>,
+    registry: &'a MintJustificationRegistry,
+    policy: VerificationPolicy,
+) -> (Result<(), VerificationError>, SealSession<'a>) {
+    let trust_base = session.trust_base();
+    let mut context = VerificationContext::with_session(session, registry, policy);
+    let result = trust_base
+        .validate()
+        .map_err(VerificationError::InvalidTrustBase)
+        .and_then(|()| verify_token_in_context(token, &mut context));
+    (result, context.into_session())
+}
+
 pub(crate) fn verify_token_in_context(
     token: &Token,
     context: &mut VerificationContext<'_>,
@@ -223,6 +241,48 @@ pub fn verify_inclusion_proof_in(
     state_id: &StateId,
     reference_time: u64,
 ) -> Result<(), VerificationError> {
+    verify_membership_in(seals, proof, state_id, reference_time)?;
+    let certification_data = &proof.certification_data;
+
+    // Finally, the unlock script must satisfy the (reconstructed) lock script.
+    verify_predicate(
+        certification_data.lock_script(),
+        reference_time,
+        certification_data.source_state_hash(),
+        certification_data.transaction_hash(),
+        certification_data.unlock_script(),
+    )
+}
+
+/// Everything [`verify_inclusion_proof_in`] checks **except** the unlock
+/// script: that the proof certifies `state_id` at `reference_time` (binding,
+/// expiry, reference-time order, tree path, shard) under a seal authenticated
+/// by the session's authority.
+///
+/// This is the evidence an already certified state needs for consolidation: the
+/// aggregator checked the witness when it certified the request, and token
+/// verification checks it again for every transaction; a seal replacement does
+/// not touch it.
+pub fn verify_membership_in(
+    seals: &mut SealSession<'_>,
+    proof: &InclusionProof,
+    state_id: &StateId,
+    reference_time: u64,
+) -> Result<(), VerificationError> {
+    verify_membership_under(seals, proof, state_id, reference_time, &[0; 32])
+}
+
+/// [`verify_membership_in`] with the seal memo namespaced by `policy`: a seal
+/// already authenticated under that policy (for example the master seal of an
+/// authenticated partition view, see `AuthenticatedView::policy`) is not
+/// checked again.
+pub fn verify_membership_under(
+    seals: &mut SealSession<'_>,
+    proof: &InclusionProof,
+    state_id: &StateId,
+    reference_time: u64,
+    policy: &[u8; 32],
+) -> Result<(), VerificationError> {
     seals.ensure_trust_base()?;
     let inclusion_certificate = &proof.inclusion_certificate;
     let certification_data = &proof.certification_data;
@@ -267,23 +327,13 @@ pub fn verify_inclusion_proof_in(
     }
 
     // The unicity certificate must chain to a quorum-signed seal on our network.
-    verify_unicity_certificate(seals, &proof.unicity_certificate)?;
-
-    // Finally, the unlock script must satisfy the (reconstructed) lock script.
-    verify_predicate(
-        certification_data.lock_script(),
-        reference_time,
-        certification_data.source_state_hash(),
-        certification_data.transaction_hash(),
-        certification_data.unlock_script(),
-    )?;
-
-    Ok(())
+    verify_unicity_certificate(seals, &proof.unicity_certificate, policy)
 }
 
 fn verify_unicity_certificate(
     seals: &mut SealSession<'_>,
     uc: &UnicityCertificate,
+    policy: &[u8; 32],
 ) -> Result<(), VerificationError> {
     let seal = &uc.unicity_seal;
 
@@ -301,7 +351,7 @@ fn verify_unicity_certificate(
 
     // The root must be signed by a quorum of the trusted validators; an
     // identical seal already authenticated in this session is not re-checked.
-    seals.verify_quorum(seal)
+    seals.verify_quorum_under(seal, policy)
 }
 
 /// Verify that `target` was absent at the certified root carried by `proof`.
@@ -346,7 +396,7 @@ pub fn verify_non_inclusion_proof(
 
     // Authenticate the root before reporting whether the terminal is the
     // requested state. An untrusted certificate must never yield StateIncluded.
-    verify_unicity_certificate(&mut seals, uc)?;
+    verify_unicity_certificate(&mut seals, uc, &[0; 32])?;
 
     if proof.certificate().terminal_matches(target) {
         return Err(VerificationError::StateIncluded);

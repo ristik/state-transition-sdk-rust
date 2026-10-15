@@ -47,5 +47,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Build no_std core (host)
         run: cargo build --no-default-features --features alloc
+      - name: Build no_std client layer (batch capability and consolidation, no std)
+        run: cargo build --no-default-features --features alloc,client
       - name: Build no_std core (wasm32)
         run: cargo build --no-default-features --features alloc --target wasm32-unknown-unknown

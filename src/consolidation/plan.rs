@@ -1,0 +1,288 @@
+//! Pure planning and checked reconstruction for proof consolidation.
+//!
+//! A token's *outer history* is its genesis and transfers, each carrying one
+//! [`InclusionProof`]. Only these proofs are replaceable: proofs embedded in
+//! signed mint justifications, split/burn dependencies or predicate data are
+//! part of the signed transaction bytes and are never touched.
+
+use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
+
+use super::error::PartitionViewError;
+use super::topology::PartitionTopology;
+use crate::api::bft::ShardId;
+#[cfg(feature = "client")]
+use crate::api::bft::UnicityCertificate;
+use crate::api::inclusion_proof::InclusionProof;
+use crate::api::StateId;
+#[cfg(feature = "client")]
+use crate::transaction::{CertifiedMintTransaction, CertifiedTransferTransaction};
+use crate::transaction::{Token, Transaction};
+use crate::verify::{verify_membership_in, SealSession, VerificationError};
+
+/// Routes a state id to its shard by the admitted shard-prefix topology.
+///
+/// There is no modulo rule and no inference from timestamps: a state belongs to
+/// the unique shard whose id is a bit-prefix of the state id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardRouter {
+    shards: Vec<ShardId>,
+}
+
+impl ShardRouter {
+    /// Router of a trusted topology (an empty scheme is the single shard).
+    pub fn new(topology: &PartitionTopology) -> Result<Self, PartitionViewError> {
+        Ok(Self {
+            shards: topology.canonical_order()?,
+        })
+    }
+
+    /// The shards in canonical (left-to-right) order.
+    pub fn shards(&self) -> &[ShardId] {
+        &self.shards
+    }
+
+    /// A router over an already canonical (sorted, complete, prefix-free) scheme,
+    /// bypassing the view admission cap: for scaling tests only.
+    #[cfg(all(test, feature = "std", feature = "client"))]
+    pub(crate) fn from_canonical_unchecked(shards: Vec<ShardId>) -> Self {
+        Self { shards }
+    }
+
+    /// The shard serving `state_id`.
+    pub fn route(&self, state_id: &StateId) -> &ShardId {
+        &self.shards[self.route_index(state_id)]
+    }
+
+    /// Index (in canonical order) of the shard serving `state_id`: a binary
+    /// search over the sorted prefix-free scheme, O(log S) prefix comparisons.
+    pub fn route_index(&self, state_id: &StateId) -> usize {
+        self.route_index_counted(state_id, &mut 0)
+    }
+
+    /// [`route_index`](Self::route_index), counting prefix comparisons.
+    pub(crate) fn route_index_counted(&self, state_id: &StateId, comparisons: &mut u64) -> usize {
+        // a complete prefix-free scheme: exactly one shard is a prefix of the key
+        self.shards
+            .binary_search_by(|s| {
+                *comparisons += 1;
+                s.cmp_prefix_of_key(state_id.bytes())
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// One replaceable proof of a token's outer history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OuterProof<'a> {
+    /// Position: `0` is the genesis, `i` the `i`-th transfer (1-based).
+    pub index: usize,
+    /// The state the proof certifies.
+    pub state_id: StateId,
+    /// The original proof.
+    pub proof: &'a InclusionProof,
+}
+
+/// The replaceable outer-history proofs of `token`, genesis first.
+pub fn outer_proofs(token: &Token) -> Vec<OuterProof<'_>> {
+    let genesis = token.genesis();
+    let mut out = Vec::with_capacity(1 + token.transactions().len());
+    out.push(OuterProof {
+        index: 0,
+        state_id: StateId::derive(
+            genesis.transaction().lock_script(),
+            genesis.transaction().source_state_hash(),
+        ),
+        proof: genesis.inclusion_proof(),
+    });
+    for (i, t) in token.transactions().iter().enumerate() {
+        out.push(OuterProof {
+            index: i + 1,
+            state_id: StateId::derive(
+                t.transaction().lock_script(),
+                t.transaction().source_state_hash(),
+            ),
+            proof: t.inclusion_proof(),
+        });
+    }
+    out
+}
+
+/// Number of distinct complete seals among the given proofs.
+pub fn distinct_seals<'a>(proofs: impl IntoIterator<Item = &'a InclusionProof>) -> usize {
+    // an ordered set of the complete seal encodings: O(L log L) comparisons
+    let seen: BTreeSet<Vec<u8>> = proofs
+        .into_iter()
+        .map(|p| p.unicity_certificate.unicity_seal.to_cbor())
+        .collect();
+    seen.len()
+}
+
+/// The native root-round position the consolidated seal must reach, and the
+/// shard that holds the newest authenticated evidence.
+///
+/// It can only be obtained by authenticating original proofs, never from a
+/// caller-supplied number: an unknown bound means consolidation is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootRoundBound {
+    round: u64,
+    shard: ShardId,
+}
+
+impl RootRoundBound {
+    /// Authenticate every `(state, original proof)` under the session's trust
+    /// base (including its quorum signatures) and take the newest seal round
+    /// (`RootChainRoundNumber`, the native position within one network's
+    /// history). Ties choose the shard of the first evidence in input order (the
+    /// reference implementation's rule).
+    pub fn from_proofs(
+        session: &mut SealSession<'_>,
+        router: &ShardRouter,
+        evidence: &[(StateId, &InclusionProof)],
+    ) -> Result<Self, VerificationError> {
+        for (state_id, proof) in evidence {
+            verify_membership_in(session, proof, state_id, proof.reference_time)?;
+        }
+        let routed: Vec<(&InclusionProof, usize)> = evidence
+            .iter()
+            .map(|(id, p)| (*p, router.route_index(id)))
+            .collect();
+        Self::from_routed(router, &routed)
+    }
+
+    /// The bound of proofs whose membership was **already verified** by the
+    /// caller (a complete token verification), each with its shard index.
+    /// Crate-private: a public constructor must authenticate what it measures.
+    pub(crate) fn from_routed(
+        router: &ShardRouter,
+        evidence: &[(&InclusionProof, usize)],
+    ) -> Result<Self, VerificationError> {
+        let mut best: Option<(u64, usize)> = None;
+        for (proof, shard) in evidence {
+            let round = proof
+                .unicity_certificate
+                .unicity_seal
+                .root_chain_round_number;
+            if best.map_or(true, |(r, _)| round > r) {
+                best = Some((round, *shard));
+            }
+        }
+        let (round, shard) = best.ok_or(VerificationError::SealMalformed)?;
+        Ok(Self {
+            round,
+            shard: router.shards()[shard].clone(),
+        })
+    }
+
+    /// The required minimum root round.
+    pub fn round(&self) -> u64 {
+        self.round
+    }
+
+    /// The shard of the newest authenticated evidence (the default master).
+    pub fn shard(&self) -> &ShardId {
+        &self.shard
+    }
+}
+
+/// Build the replacement of `original` from the aggregator's `served` proof and
+/// the authenticated certificate `uc` of the shard: the original certification
+/// data and reference time are kept byte-for-byte, only the tree path (from the
+/// served proof) and the unicity certificate (derived) are new.
+///
+/// Fails if the served proof is not bound to the original certification.
+#[cfg(feature = "client")]
+pub(crate) fn replacement_proof(
+    original: &InclusionProof,
+    served: &InclusionProof,
+    uc: &UnicityCertificate,
+) -> Result<InclusionProof, &'static str> {
+    if served.certification_data != original.certification_data {
+        return Err("certification data differs from the original");
+    }
+    if served.reference_time != original.reference_time {
+        return Err("reference time differs from the original");
+    }
+    Ok(InclusionProof {
+        certification_data: original.certification_data.clone(),
+        reference_time: original.reference_time,
+        inclusion_certificate: served.inclusion_certificate.clone(),
+        unicity_certificate: uc.clone(),
+    })
+}
+
+/// Rebuild `token` with the outer-history proofs replaced, in
+/// [`outer_proofs`] order. The signed transactions (and everything nested in
+/// them) are cloned unchanged. The result is **unverified**; callers verify it
+/// completely.
+#[cfg(feature = "client")]
+pub(crate) fn rebuild_token(
+    token: &Token,
+    proofs: Vec<InclusionProof>,
+) -> Result<Token, &'static str> {
+    if proofs.len() != 1 + token.transactions().len() {
+        return Err("one replacement proof per outer-history transaction is required");
+    }
+    let mut proofs = proofs.into_iter();
+    let genesis = CertifiedMintTransaction::new(
+        token.genesis().transaction().clone(),
+        proofs.next().expect("length checked"),
+    );
+    let transfers = token
+        .transactions()
+        .iter()
+        .zip(proofs)
+        .map(|(t, p)| CertifiedTransferTransaction::new(t.transaction().clone(), p))
+        .collect();
+    Ok(Token::new(genesis, transfers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cbor::{encode_byte_string, Decoder};
+    use alloc::vec;
+
+    fn state_id(first: u8) -> StateId {
+        let mut b = [0u8; 32];
+        b[0] = first;
+        StateId::from_cbor(Decoder::new(&encode_byte_string(&b))).unwrap()
+    }
+
+    fn id(bits: &str) -> ShardId {
+        bits.chars().fold(ShardId::root(), |id, c| {
+            let (z, o) = id.split();
+            if c == '0' {
+                z
+            } else {
+                o
+            }
+        })
+    }
+
+    #[test]
+    fn routes_by_admitted_prefix_only() {
+        let router = ShardRouter::new(&PartitionTopology::new(
+            ["00", "01", "10", "11"].iter().map(|s| id(s)).collect(),
+        ))
+        .unwrap();
+        assert_eq!(router.route(&state_id(0b0010_0000)), &id("00"));
+        assert_eq!(router.route(&state_id(0b0110_0000)), &id("01"));
+        assert_eq!(router.route(&state_id(0b1010_0000)), &id("10"));
+        assert_eq!(router.route(&state_id(0b1110_0000)), &id("11"));
+        // an uneven but complete scheme
+        let router = ShardRouter::new(&PartitionTopology::new(
+            ["0", "10", "11"].iter().map(|s| id(s)).collect(),
+        ))
+        .unwrap();
+        assert_eq!(router.route(&state_id(0x7f)), &id("0"));
+        assert_eq!(router.route(&state_id(0x80)), &id("10"));
+        assert_eq!(router.route(&state_id(0xc0)), &id("11"));
+        // the unsharded partition routes everything to the empty shard
+        let router = ShardRouter::new(&PartitionTopology::single_shard()).unwrap();
+        assert_eq!(router.route(&state_id(0xff)), &ShardId::root());
+        // invalid configuration is rejected, never guessed
+        assert!(ShardRouter::new(&PartitionTopology::new(vec![id("0"), id("00")])).is_err());
+        assert!(ShardRouter::new(&PartitionTopology::new(vec![id("0"), id("10")])).is_err());
+    }
+}

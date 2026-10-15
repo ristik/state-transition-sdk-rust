@@ -8,6 +8,10 @@ Runnable example flows, talking to a
 | `mint` | `state-transition-sdk-js/tests/examples/mint` | `cargo run --example mint --features http` |
 | `transfer` | `.../tests/examples/transfer` | `cargo run --example transfer --features http` |
 | `split` | `.../tests/examples/split` | `cargo run --example split --features http` |
+| `consolidate_for_bridge` | explicit proof consolidation before EVM / bridge-back | `cargo run --example consolidate_for_bridge --features http -- token.hex out.hex` |
+| `consolidate_for_zkvm` | host consolidation, guest verifies from scratch | `cargo run --example consolidate_for_zkvm --features http -- token.hex` |
+
+The two consolidation examples need `UNICITY_PARTITION_ID` and `UNICITY_SHARD_ENDPOINTS` (see `examples/common/consolidation.rs`) and are never run automatically.
 
 Each example prints the resulting token's CBOR as hex, exactly like the model
 examples (`console.log(HexConverter.encode(token.toCBOR()))`). `split` mints a
