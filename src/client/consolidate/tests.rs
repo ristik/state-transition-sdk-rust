@@ -26,6 +26,7 @@ use crate::radix::{bit_at, prefix_region};
 use crate::transaction::ids::{StateMask, TokenSalt, TokenType};
 use crate::transaction::{Transaction, TransferTransaction};
 use crate::verify::{MintJustificationRegistry, MintJustificationVerifier, VerificationContext};
+use alloc::vec;
 
 const PARTITION: u32 = 7;
 const T0: u64 = 1_731_504_000;
@@ -875,4 +876,243 @@ fn transfer_transaction_bytes_are_preserved() {
     let _ = certification_data_for(t, &Secp256k1Signer::from_bytes(&[50; 32]).unwrap());
     let _ = PublicKey::from_bytes(&[2; 33]).err();
     drop(sim);
+}
+
+// ------------------------------------------------ admission and policy ----
+
+fn client_with(
+    sim: &Arc<Mutex<Sim>>,
+    partition: u32,
+    topology: PartitionTopology,
+    mutate_tb: impl Fn(&mut RootTrustBase),
+) -> TestClient {
+    let mut tb = sim.lock().unwrap().trust_base.clone();
+    mutate_tb(&mut tb);
+    ProofClient::with_host_defaults(
+        ProofClientConfig {
+            partition_id: partition,
+            topology,
+        },
+        (0..2)
+            .map(|i| {
+                (
+                    shard_ids()[i].clone(),
+                    Node {
+                        sim: sim.clone(),
+                        shard: i,
+                    },
+                )
+            })
+            .collect(),
+        tb,
+        2,
+    )
+    .unwrap()
+}
+
+#[test]
+fn already_shared_results_are_not_reused_outside_the_configured_policy() {
+    let (sim, token) = spread_token(3);
+    let ConsolidationOutcome::Consolidated { token: shared, .. } =
+        client(&sim, true).consolidate(&token, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    let calls = sim.lock().unwrap().batch_calls;
+
+    // the matching configuration reuses it without any request
+    let ConsolidationOutcome::Consolidated { summary, .. } =
+        client(&sim, true).consolidate(&shared, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    assert!(summary.already_shared);
+    assert_eq!(sim.lock().unwrap().batch_calls, calls);
+
+    // another partition
+    let other_partition = client_with(&sim, PARTITION + 1, topology(true), |_| {});
+    assert!(matches!(
+        other_partition.consolidate(&shared, &quick()),
+        Err(ConsolidationError::Integrity(
+            IntegrityError::Context { .. }
+        ))
+    ));
+
+    // wrong configuration pins
+    let mut wrong = PartitionTopology::new(shard_ids().to_vec());
+    for s in shard_ids() {
+        wrong = wrong.with_shard_conf_hash(&s, [0xee; 32]);
+    }
+    let wrong_pins = client_with(&sim, PARTITION, wrong, |_| {});
+    assert!(matches!(
+        wrong_pins.consolidate(&shared, &quick()),
+        Err(ConsolidationError::Integrity(
+            IntegrityError::Context { .. }
+        ))
+    ));
+
+    // another authority epoch: the shared seal is not acceptable as a target, and the
+    // network's own latest seal is not authenticated either
+    let other_epoch = client_with(&sim, PARTITION, topology(true), |tb| tb.epoch += 1);
+    let out = other_epoch.consolidate(&shared, &quick());
+    assert!(
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(IntegrityError::View(_)))
+        ),
+        "{out:?}"
+    );
+    // ... and it did go to the network instead of short-cutting
+    assert!(sim.lock().unwrap().batch_calls > calls);
+}
+
+fn synthetic_items(n: usize) -> Vec<ProofItem> {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    let token = make_token(&sim, 1, None, 0);
+    let proof = outer_proofs(&token)[0].proof.clone();
+    (0..n)
+        .map(|i| ProofItem {
+            state_id: StateId::from_cbor(Decoder::new(&encode_byte_string(
+                sha256(&(i as u64).to_be_bytes()).data(),
+            )))
+            .unwrap(),
+            proof: proof.clone(),
+        })
+        .collect()
+}
+
+fn eight_shard_client() -> TestClient {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    let mut scheme = vec![ShardId::root()];
+    for _ in 0..3 {
+        scheme = scheme
+            .iter()
+            .flat_map(|s| {
+                let (z, o) = s.split();
+                [z, o]
+            })
+            .collect();
+    }
+    let tb = sim.lock().unwrap().trust_base.clone();
+    ProofClient::with_host_defaults(
+        ProofClientConfig {
+            partition_id: PARTITION,
+            topology: PartitionTopology::new(scheme.clone()),
+        },
+        scheme
+            .into_iter()
+            .map(|s| {
+                (
+                    s,
+                    Node {
+                        sim: sim.clone(),
+                        shard: 0,
+                    },
+                )
+            })
+            .collect(),
+        tb,
+        2,
+    )
+    .unwrap()
+}
+
+fn open_budget<'a>(clock: &'a SystemClock, cancel: &'a CancelToken) -> Budget<'a, SystemClock> {
+    Budget {
+        clock,
+        deadline_ms: u64::MAX,
+        cancel,
+        abort: CancelToken::new(),
+    }
+}
+
+#[test]
+fn admission_work_is_linear_in_the_input_and_oversize_is_refused_first() {
+    let c = eight_shard_client();
+    let (clock, cancel) = (SystemClock::new(), CancelToken::new());
+    let budget = open_budget(&clock, &cancel);
+    let mut counts = Vec::new();
+    for n in [100usize, 200, 400, 800, 1_600] {
+        let items = synthetic_items(n);
+        let mut steps = 0;
+        let (groups, first_of) = match c.group(&items, &budget, &mut steps) {
+            Ok(x) => x,
+            Err(_) => panic!("{n} distinct states fit"),
+        };
+        assert_eq!(first_of, (0..n).collect::<Vec<_>>());
+        assert_eq!(groups.iter().map(|g| g.ids.len()).sum::<usize>(), n);
+        counts.push((n, steps));
+    }
+    for (n, steps) in &counts {
+        assert_eq!(
+            *steps, *n as u64,
+            "one index operation per input: linear, not quadratic"
+        );
+    }
+
+    // beyond what 8 endpoints could ever carry: refused before any per-item work
+    let items = synthetic_items(8 * MAX_BATCH_STATE_IDS + 1);
+    let mut steps = 0;
+    assert!(matches!(
+        c.group(&items, &budget, &mut steps),
+        Err(Stop::Error(ConsolidationError::TooManyStates { .. }))
+    ));
+    assert_eq!(steps, 0);
+
+    // a single shard over its limit is refused as soon as it is exceeded
+    let one_shard: Vec<ProofItem> = synthetic_items(4_000)
+        .into_iter()
+        .filter(|i| i.state_id.bytes()[0] >> 5 == 0)
+        .take(MAX_BATCH_STATE_IDS + 1)
+        .collect();
+    let mut steps = 0;
+    assert!(matches!(
+        c.group(&one_shard, &budget, &mut steps),
+        Err(Stop::Error(ConsolidationError::TooManyStates { .. }))
+    ));
+    assert_eq!(steps, one_shard.len() as u64, "stops at the offending item");
+
+    // a cancelled attempt does no admission work
+    cancel.cancel();
+    let mut steps = 0;
+    assert!(matches!(
+        c.group(&synthetic_items(10), &budget, &mut steps),
+        Err(Stop::Error(ConsolidationError::Cancelled))
+    ));
+    assert_eq!(steps, 0);
+}
+
+#[test]
+fn duplicate_inputs_are_deduplicated_but_conflicts_are_refused() {
+    let (sim, token) = spread_token(3);
+    let c = client(&sim, false);
+    let mut items: Vec<ProofItem> = outer_proofs(&token)
+        .iter()
+        .map(|o| ProofItem {
+            state_id: o.state_id.clone(),
+            proof: o.proof.clone(),
+        })
+        .collect();
+    let n = items.len();
+    items.push(items[1].clone());
+    items.push(items[0].clone());
+    let BundleOutcome::Consolidated(bundle) = c.consolidate_proofs(&items, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(bundle.proofs.len(), n + 2, "one output per input");
+    assert_eq!(bundle.proofs[n], bundle.proofs[1]);
+    assert_eq!(bundle.proofs[n + 1], bundle.proofs[0]);
+    assert_eq!(
+        bundle.summary.requests, 2,
+        "distinct states are requested once"
+    );
+
+    // the same state with different original certification
+    let mut conflicting = items.clone();
+    conflicting[n].proof.reference_time += 1;
+    assert!(matches!(
+        c.consolidate_proofs(&conflicting, &quick()),
+        Err(ConsolidationError::Configuration(_))
+    ));
 }

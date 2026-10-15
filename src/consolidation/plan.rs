@@ -5,6 +5,7 @@
 //! signed mint justifications, split/burn dependencies or predicate data are
 //! part of the signed transaction bytes and are never touched.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use super::error::PartitionViewError;
@@ -87,13 +88,11 @@ pub fn outer_proofs(token: &Token) -> Vec<OuterProof<'_>> {
 
 /// Number of distinct complete seals among the given proofs.
 pub fn distinct_seals<'a>(proofs: impl IntoIterator<Item = &'a InclusionProof>) -> usize {
-    let mut seen: Vec<Vec<u8>> = Vec::new();
-    for p in proofs {
-        let seal = p.unicity_certificate.unicity_seal.to_cbor();
-        if !seen.contains(&seal) {
-            seen.push(seal);
-        }
-    }
+    // an ordered set of the complete seal encodings: O(L log L) comparisons
+    let seen: BTreeSet<Vec<u8>> = proofs
+        .into_iter()
+        .map(|p| p.unicity_certificate.unicity_seal.to_cbor())
+        .collect();
     seen.len()
 }
 
@@ -153,7 +152,7 @@ impl RootRoundBound {
 /// served proof) and the unicity certificate (derived) are new.
 ///
 /// Fails if the served proof is not bound to the original certification.
-pub fn replacement_proof(
+pub(crate) fn replacement_proof(
     original: &InclusionProof,
     served: &InclusionProof,
     uc: &UnicityCertificate,
@@ -176,7 +175,10 @@ pub fn replacement_proof(
 /// [`outer_proofs`] order. The signed transactions (and everything nested in
 /// them) are cloned unchanged. The result is **unverified**; callers verify it
 /// completely.
-pub fn rebuild_token(token: &Token, proofs: Vec<InclusionProof>) -> Result<Token, &'static str> {
+pub(crate) fn rebuild_token(
+    token: &Token,
+    proofs: Vec<InclusionProof>,
+) -> Result<Token, &'static str> {
     if proofs.len() != 1 + token.transactions().len() {
         return Err("one replacement proof per outer-history transaction is required");
     }

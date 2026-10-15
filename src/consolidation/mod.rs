@@ -25,6 +25,7 @@ mod plan;
 mod shard_tree;
 mod topology;
 
+pub(crate) use assemble::view_policy;
 pub use assemble::{AuthenticatedView, ShardCertificate};
 pub use error::PartitionViewError;
 pub use partition_view::{
@@ -32,9 +33,7 @@ pub use partition_view::{
     MAX_PARTITION_VIEW_IR_BYTES, MAX_PARTITION_VIEW_LEAVES, MAX_PARTITION_VIEW_SHARD_ID_BITS,
     MAX_PARTITION_VIEW_SUMMARY_VALUE_BYTES, PARTITION_VIEW_VERSION,
 };
-pub use plan::{
-    distinct_seals, outer_proofs, rebuild_token, replacement_proof, OuterProof, RootRoundBound,
-    ShardRouter,
-};
+pub use plan::{distinct_seals, outer_proofs, OuterProof, RootRoundBound, ShardRouter};
+pub(crate) use plan::{rebuild_token, replacement_proof};
 pub use shard_tree::ShardTree;
 pub use topology::PartitionTopology;

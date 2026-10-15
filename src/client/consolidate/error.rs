@@ -110,6 +110,11 @@ pub enum IntegrityError {
         /// What differed.
         what: &'static str,
     },
+    /// The evidence does not belong to the configured partition/shard/pins.
+    Context {
+        /// What differs.
+        what: &'static str,
+    },
     /// A response is not for the exact root that was requested.
     RootSubstitution {
         /// Shard that served it.

@@ -211,18 +211,7 @@ impl PartitionView {
         };
         let tree = self.verify_tree(enclosing, partition, topology)?;
         // the policy this authentication is for namespaces the authority's memo
-        let policy: [u8; 32] = {
-            let d = DataHasher::new(HashAlgorithm::Sha256)
-                .expect("sha256")
-                .update(b"unicity-token/view-policy/v1")
-                .update(&partition.to_be_bytes())
-                .update(&[u8::from(pins.is_some())])
-                .update(&pins.map_or([0u8; 32], PartitionTopology::digest))
-                .finalize();
-            let mut p = [0u8; 32];
-            p.copy_from_slice(d.data());
-            p
-        };
+        let policy = view_policy(partition, pins);
         authority
             .authenticate_seal_under(&enclosing.unicity_seal, &policy)
             .map_err(PartitionViewError::Seal)?;
@@ -251,6 +240,21 @@ impl PartitionView {
             identity: id,
         })
     }
+}
+
+/// Digest of the immutable policy (partition, pinned flag and pins) a view is
+/// authenticated for: the namespace of the seal memo.
+pub(crate) fn view_policy(partition: u32, pins: Option<&PartitionTopology>) -> [u8; 32] {
+    let d = DataHasher::new(HashAlgorithm::Sha256)
+        .expect("sha256")
+        .update(b"unicity-token/view-policy/v1")
+        .update(&partition.to_be_bytes())
+        .update(&[u8::from(pins.is_some())])
+        .update(&pins.map_or([0u8; 32], PartitionTopology::digest))
+        .finalize();
+    let mut p = [0u8; 32];
+    p.copy_from_slice(d.data());
+    p
 }
 
 /// A partition view whose commitment to its seal and whose seal itself were
