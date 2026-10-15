@@ -31,6 +31,7 @@
 
 mod context;
 mod error;
+mod memo;
 mod mint_justification;
 mod seal;
 
@@ -90,7 +91,26 @@ pub fn verify_token_with_seal_stats(
     registry: &MintJustificationRegistry,
     policy: VerificationPolicy,
 ) -> (Result<(), VerificationError>, SealStats) {
-    let mut context = VerificationContext::new(trust_base, registry, policy);
+    verify_token_with_memo_capacity(
+        token,
+        trust_base,
+        registry,
+        policy,
+        DEFAULT_SEAL_MEMO_CAPACITY,
+    )
+}
+
+/// [`verify_token_with_seal_stats`] with an explicit memo capacity; `0` is the
+/// reference behavior that repeats every body and quorum check.
+pub(crate) fn verify_token_with_memo_capacity(
+    token: &Token,
+    trust_base: &RootTrustBase,
+    registry: &MintJustificationRegistry,
+    policy: VerificationPolicy,
+    capacity: usize,
+) -> (Result<(), VerificationError>, SealStats) {
+    let mut context =
+        VerificationContext::with_memo_capacity(trust_base, registry, policy, capacity);
     let result = trust_base
         .validate()
         .map_err(VerificationError::InvalidTrustBase)
@@ -335,6 +355,16 @@ fn verify_unicity_certificate(
     uc: &UnicityCertificate,
     policy: &[u8; 32],
 ) -> Result<(), VerificationError> {
+    // The body (network, shard path and partition path folding to the seal hash)
+    // and the seal's quorum are properties of the certificate alone: an identical
+    // certificate that already passed in this operation is not recomputed. Only
+    // complete equality (seal witness included) hits; every per-proof check -
+    // request, expiry, reference time, leaf path, shard membership, predicate - is
+    // done by the caller for each proof.
+    if seals.body_verified(uc, policy) {
+        return Ok(());
+    }
+    seals.note_body_check();
     let seal = &uc.unicity_seal;
 
     if seal.network_id != seals.trust_base().network_id {
@@ -351,7 +381,9 @@ fn verify_unicity_certificate(
 
     // The root must be signed by a quorum of the trusted validators; an
     // identical seal already authenticated in this session is not re-checked.
-    seals.verify_quorum_under(seal, policy)
+    seals.verify_quorum_under(seal, policy)?;
+    seals.remember_body(uc, policy);
+    Ok(())
 }
 
 /// Verify that `target` was absent at the certified root carried by `proof`.

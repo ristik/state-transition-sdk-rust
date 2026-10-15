@@ -25,7 +25,10 @@ use crate::predicate::builtin::SignaturePredicate;
 use crate::radix::{bit_at, prefix_region};
 use crate::transaction::ids::{StateMask, TokenSalt, TokenType};
 use crate::transaction::{Transaction, TransferTransaction};
-use crate::verify::{MintJustificationRegistry, MintJustificationVerifier, VerificationContext};
+use crate::verify::{
+    MintJustificationRegistry, MintJustificationVerifier, VerificationContext,
+    DEFAULT_SEAL_MEMO_CAPACITY,
+};
 use alloc::vec;
 
 const PARTITION: u32 = 7;
@@ -1233,4 +1236,229 @@ fn duplicate_inputs_are_deduplicated_but_conflicts_are_refused() {
         c.consolidate_proofs(&conflicting, &quick()),
         Err(ConsolidationError::Configuration(_))
     ));
+}
+
+// ------------------------------------------- counted verification work ----
+
+fn stats_of(
+    token: &Token,
+    tb: &RootTrustBase,
+    capacity: usize,
+) -> (
+    Result<(), crate::verify::VerificationError>,
+    crate::verify::SealStats,
+) {
+    crate::verify::verify_token_with_memo_capacity(
+        token,
+        tb,
+        &MintJustificationRegistry::new(),
+        VerificationPolicy::default(),
+        capacity,
+    )
+}
+
+/// Verification of a token costs one quorum check per distinct seal, one body check
+/// per distinct certificate and one leaf check per proof: after consolidation that is
+/// 1 quorum + m bodies + L leaves, independent of L.
+#[test]
+fn verification_work_is_one_quorum_m_bodies_and_l_leaves() {
+    let mut consolidated = Vec::new();
+    let mut original = Vec::new();
+    for transfers in [1usize, 2, 4, 6, 9] {
+        let (sim, token) = spread_token(transfers);
+        let tb = sim.lock().unwrap().trust_base.clone();
+        let l = 1 + transfers;
+        let ConsolidationOutcome::Consolidated { token: out, .. } =
+            client(&sim, false).consolidate(&token, &quick()).unwrap()
+        else {
+            panic!()
+        };
+        let (r, st) = stats_of(&token, &tb, DEFAULT_SEAL_MEMO_CAPACITY);
+        r.unwrap();
+        original.push((l, st));
+        let (r, st) = stats_of(&out, &tb, DEFAULT_SEAL_MEMO_CAPACITY);
+        r.unwrap();
+        consolidated.push((l, st));
+        // m = participating shards (the two shards of this partition)
+        let m = distinct_certificates(&out);
+        assert!(m <= 2);
+        assert_eq!(st.quorum_checks, 1, "L={l}");
+        assert_eq!(
+            st.body_checks as usize, m,
+            "L={l}: one body check per distinct certificate"
+        );
+        assert_eq!(
+            st.body_hits as usize,
+            l - m,
+            "L={l}: every other proof reuses it"
+        );
+    }
+    // flat in L after consolidation ...
+    assert!(consolidated
+        .iter()
+        .all(|(_, s)| s.body_checks == consolidated[0].1.body_checks));
+    // ... while the unconsolidated token pays per proof (each landed in its own round)
+    for (l, st) in &original {
+        assert_eq!(st.quorum_checks as usize, *l, "distinct seals, L={l}");
+        assert_eq!(st.body_checks as usize, *l);
+        assert_eq!(st.body_hits, 0);
+    }
+}
+
+fn distinct_certificates(t: &Token) -> usize {
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    for o in outer_proofs(t) {
+        let b = o.proof.unicity_certificate.to_cbor();
+        if !seen.contains(&b) {
+            seen.push(b);
+        }
+    }
+    seen.len()
+}
+
+/// The memoized verifier and the reference that repeats everything must agree on
+/// every verdict, including each way of tampering with a certificate.
+#[test]
+fn memoized_verification_equals_the_reference_on_tampered_tokens() {
+    let (sim, token) = spread_token(4);
+    let tb = sim.lock().unwrap().trust_base.clone();
+    let ConsolidationOutcome::Consolidated { token: shared, .. } =
+        client(&sim, false).consolidate(&token, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    type Edit = Box<dyn Fn(&mut Vec<InclusionProof>)>;
+    let edits: Vec<(&str, Edit)> = vec![
+        ("none", Box::new(|_| {})),
+        (
+            "signature byte",
+            Box::new(|p| p[2].unicity_certificate.unicity_seal.signatures[0].1[5] ^= 1),
+        ),
+        (
+            "extra signature witness",
+            Box::new(|p| {
+                p[1].unicity_certificate
+                    .unicity_seal
+                    .signatures
+                    .push(("x".into(), vec![1; 65]))
+            }),
+        ),
+        (
+            "drop signatures below quorum",
+            Box::new(|p| p[3].unicity_certificate.unicity_seal.signatures.truncate(2)),
+        ),
+        (
+            "shard sibling",
+            Box::new(|p| {
+                p[1].unicity_certificate
+                    .shard_tree_certificate
+                    .sibling_hash_list[0][0] ^= 1
+            }),
+        ),
+        (
+            "partition step",
+            Box::new(|p| p[4].unicity_certificate.unicity_tree_certificate.steps[0].hash[0] ^= 1),
+        ),
+        (
+            "seal hash",
+            Box::new(|p| p[2].unicity_certificate.unicity_seal.hash[0] ^= 1),
+        ),
+        (
+            "ir hash",
+            Box::new(|p| p[3].unicity_certificate.input_record.hash[0] ^= 1),
+        ),
+        (
+            "swap certificates",
+            Box::new(|p| {
+                let a = p[0].unicity_certificate.clone();
+                p[0].unicity_certificate = p[1].unicity_certificate.clone();
+                p[1].unicity_certificate = a;
+            }),
+        ),
+    ];
+    for base in [&token, &shared] {
+        for (name, edit) in &edits {
+            let mut proofs: Vec<_> = outer_proofs(base).iter().map(|o| o.proof.clone()).collect();
+            edit(&mut proofs);
+            let tampered = rebuild_token(base, proofs).unwrap();
+            let (reference, _) = stats_of(&tampered, &tb, 0);
+            for cap in [1usize, 2, DEFAULT_SEAL_MEMO_CAPACITY] {
+                let (got, _) = stats_of(&tampered, &tb, cap);
+                assert_eq!(got, reference, "{name}, capacity {cap}");
+            }
+            // swapping two proofs' certificates is a no-op when both already carry the same one
+            let noop = *name == "swap certificates" && std::ptr::eq(base, &shared);
+            if *name != "none" && *name != "extra signature witness" && !noop {
+                assert!(reference.is_err(), "{name} must be rejected");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_different_signature_witness_never_inherits_a_body_verdict() {
+    let (sim, token) = spread_token(1);
+    let tb = sim.lock().unwrap().trust_base.clone();
+    let mut proofs: Vec<_> = outer_proofs(&token)
+        .iter()
+        .map(|o| o.proof.clone())
+        .collect();
+    // two proofs with the very same certificate except for an extra (ignored) witness
+    proofs[1].unicity_certificate = proofs[0].unicity_certificate.clone();
+    let mut twin = proofs[1].clone();
+    twin.unicity_certificate
+        .unicity_seal
+        .signatures
+        .push(("extra".into(), vec![9; 65]));
+    // the proofs' own paths do not fit these certificates; only the body counters matter here
+    let seals = |p: &InclusionProof| p.unicity_certificate.clone();
+    let mut session = crate::verify::SealSession::new(&tb);
+    let (a, b) = (seals(&proofs[0]), seals(&twin));
+    assert_ne!(a, b);
+    let policy = [0u8; 32];
+    assert!(!session.body_verified(&a, &policy));
+    session.remember_body(&a, &policy);
+    assert!(session.body_verified(&a, &policy));
+    assert!(
+        !session.body_verified(&b, &policy),
+        "another witness is another key"
+    );
+    assert!(
+        !session.body_verified(&a, &[1u8; 32]),
+        "another policy is another key"
+    );
+}
+
+#[test]
+fn nested_proofs_share_the_operation_memo() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    let source = make_token(&sim, 3, None, 1);
+    let justification = encode_tag(WRAP_TAG, &encode_byte_string(&source.to_cbor()));
+    let wrapper = mint_justified(&sim, 9, justification, 1);
+    let tb = sim.lock().unwrap().trust_base.clone();
+    let mut registry = MintJustificationRegistry::new();
+    registry.register(Box::new(EmbedsToken)).unwrap();
+    let (r, st) = crate::verify::verify_token_with_memo_capacity(
+        &wrapper,
+        &tb,
+        &registry,
+        VerificationPolicy::default(),
+        DEFAULT_SEAL_MEMO_CAPACITY,
+    );
+    r.unwrap();
+    let proofs = 2 + 2; // wrapper genesis + transfer, source genesis + transfer
+    assert_eq!(
+        (st.body_checks + st.body_hits) as usize,
+        proofs,
+        "every proof goes through the shared memo"
+    );
+    let (_, off) = crate::verify::verify_token_with_memo_capacity(
+        &wrapper,
+        &tb,
+        &registry,
+        VerificationPolicy::default(),
+        0,
+    );
+    assert_eq!(off.body_hits, 0);
+    assert_eq!(off.body_checks as usize, proofs);
 }
