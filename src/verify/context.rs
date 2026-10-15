@@ -68,16 +68,19 @@ impl core::fmt::Debug for VerificationContext<'_> {
 }
 
 impl<'a> VerificationContext<'a> {
-    pub(crate) fn new(
+    /// A context whose seal/certificate memos hold at most `capacity` entries
+    /// (`0` disables reuse: the slow reference behavior).
+    pub(crate) fn with_memo_capacity(
         trust_base: &'a RootTrustBase,
         registry: &'a MintJustificationRegistry,
         policy: VerificationPolicy,
+        capacity: usize,
     ) -> Self {
         Self {
             trust_base,
             registry,
             policy,
-            seals: SealSession::new(trust_base),
+            seals: SealSession::with_capacity(trust_base, capacity),
             embedded_token_depth: 0,
             total_embedded_token_bytes: 0,
         }

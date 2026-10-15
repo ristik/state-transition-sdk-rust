@@ -24,7 +24,9 @@ use crate::api::bft::{RootTrustBase, UnicitySeal};
 use crate::crypto::hash::{DataHasher, HashAlgorithm};
 use crate::crypto::signature::Signature;
 
+use super::memo::FifoIndex;
 use super::VerificationError;
+use crate::api::bft::UnicityCertificate;
 
 /// Default number of successful seals remembered by a session.
 pub const DEFAULT_SEAL_MEMO_CAPACITY: usize = 64;
@@ -42,6 +44,14 @@ pub struct SealStats {
     pub quorum_checks: u64,
     /// Seals accepted from the memo without repeating the signature work.
     pub memo_hits: u64,
+    /// Certificate-body checks actually executed (tree/shard path recomputation
+    /// to the seal hash, network): one per distinct certificate, not per proof.
+    pub body_checks: u64,
+    /// Proofs whose identical certificate had already passed the body check.
+    pub body_hits: u64,
+    /// Index slots examined by memo lookups and evictions: O(1) expected per
+    /// operation, independent of the capacity.
+    pub memo_probes: u64,
 }
 
 /// Authenticates unicity seals against a trusted authority.
@@ -70,9 +80,10 @@ pub trait SealAuthenticator {
 pub struct SealSession<'a> {
     trust_base: &'a RootTrustBase,
     validated: bool,
-    capacity: usize,
-    // digests of complete seal encodings, oldest first
-    memo: Vec<[u8; 32]>,
+    // digests of complete seal encodings, bounded FIFO with O(1) indexed lookup
+    memo: FifoIndex<[u8; 32]>,
+    // certificates whose body (and seal) already passed under (policy, this authority)
+    bodies: FifoIndex<([u8; 32], UnicityCertificate)>,
     stats: SealStats,
 }
 
@@ -87,8 +98,8 @@ impl<'a> SealSession<'a> {
         Self {
             trust_base,
             validated: false,
-            capacity,
-            memo: Vec::new(),
+            memo: FifoIndex::new(capacity),
+            bodies: FifoIndex::new(capacity),
             stats: SealStats::default(),
         }
     }
@@ -100,7 +111,33 @@ impl<'a> SealSession<'a> {
 
     /// Signature work performed so far.
     pub fn stats(&self) -> SealStats {
-        self.stats
+        SealStats {
+            memo_probes: self.memo.probes() + self.bodies.probes(),
+            ..self.stats
+        }
+    }
+
+    /// Whether this exact certificate (complete seal witness included) already
+    /// passed the body check and quorum under `policy` in this session.
+    pub(crate) fn body_verified(&mut self, uc: &UnicityCertificate, policy: &[u8; 32]) -> bool {
+        let hit = self
+            .bodies
+            .contains(uc_fingerprint(uc, policy), |(p, c)| p == policy && c == uc);
+        if hit {
+            self.stats.body_hits += 1;
+        }
+        hit
+    }
+
+    /// Record a body check that is about to run (or just ran).
+    pub(crate) fn note_body_check(&mut self) {
+        self.stats.body_checks += 1;
+    }
+
+    /// Remember a certificate whose body and quorum both passed.
+    pub(crate) fn remember_body(&mut self, uc: &UnicityCertificate, policy: &[u8; 32]) {
+        self.bodies
+            .insert(uc_fingerprint(uc, policy), (*policy, uc.clone()));
     }
 
     pub(crate) fn ensure_trust_base(&mut self) -> Result<(), VerificationError> {
@@ -174,18 +211,14 @@ impl<'a> SealSession<'a> {
         // or caches a success
         self.ensure_trust_base()?;
         let key = Self::key(seal, policy);
-        if self.memo.contains(&key) {
+        let hash = u64::from_le_bytes(key[..8].try_into().expect("8 bytes"));
+        if self.memo.contains(hash, |k| k == &key) {
             self.stats.memo_hits += 1;
             return Ok(());
         }
         self.stats.quorum_checks += 1;
         quorum_met(self.trust_base, seal)?;
-        if self.capacity > 0 {
-            if self.memo.len() == self.capacity {
-                self.memo.remove(0);
-            }
-            self.memo.push(key);
-        }
+        self.memo.insert(hash, key);
         Ok(())
     }
 }
@@ -223,6 +256,26 @@ impl SealAuthenticator for SealSession<'_> {
         }
         self.verify_quorum_under(seal, policy)
     }
+}
+
+/// A cheap, well-mixed fingerprint of a certificate for indexing only (FNV-1a
+/// over fields that differ between distinct bodies). Equality of the complete
+/// certificate, not this value, decides a hit.
+fn uc_fingerprint(uc: &UnicityCertificate, policy: &[u8; 32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    eat(&policy[..8]);
+    eat(&uc.unicity_seal.hash);
+    eat(&uc.shard_tree_certificate.shard.encode());
+    eat(&uc.input_record.hash);
+    eat(&uc.input_record.round_number.to_be_bytes());
+    eat(&uc.unicity_seal.root_chain_round_number.to_be_bytes());
+    h
 }
 
 /// Structural sanity of a seal, independent of any authority.
