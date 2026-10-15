@@ -388,6 +388,13 @@ fn corpus_cases_consolidate_to_the_reference_proofs() {
 
         let s = &bundle.summary;
         assert_eq!(s.outer_seals_after, 1, "{dir}");
+        // lazy derivation: certificates of the m participating shards, not of all S
+        assert_eq!(
+            s.certificates_derived,
+            1 + case.peers.len(),
+            "{dir}: m derivations"
+        );
+        assert_eq!(s.admission.steps as usize, case.items.len(), "{dir}");
         assert!(s.outer_seals_before >= 2, "{dir}");
         assert_eq!(
             s.requests,

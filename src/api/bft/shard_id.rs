@@ -97,6 +97,22 @@ impl ShardId {
         self.length.cmp(&other.length)
     }
 
+    /// Where this shard's bit prefix lies relative to the first bits of `key`:
+    /// `Equal` iff this id is a bit-prefix of `key`. Over a sorted prefix-free
+    /// scheme this is monotone, so it supports binary search.
+    pub fn cmp_prefix_of_key(&self, key: &[u8]) -> Ordering {
+        for i in 0..self.length {
+            let (a, b) = (
+                (self.bits[i / 8] >> (7 - i % 8)) & 1,
+                key.get(i / 8).map_or(0, |k| (k >> (7 - i % 8)) & 1),
+            );
+            if a != b {
+                return a.cmp(&b);
+            }
+        }
+        Ordering::Equal
+    }
+
     /// The bit string as text, e.g. `"010"` (empty for the empty id).
     pub fn to_bit_string(&self) -> String {
         (0..self.length)

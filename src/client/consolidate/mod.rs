@@ -29,7 +29,7 @@ mod run;
 mod tests;
 
 pub use error::{
-    ConsolidationError, ConsolidationOutcome, ConsolidationSummary, IntegrityError,
+    AdmissionWork, ConsolidationError, ConsolidationOutcome, ConsolidationSummary, IntegrityError,
     UnavailableReason,
 };
 pub use run::{CancelToken, Clock, SequentialExecutor, WaveExecutor};
@@ -54,8 +54,9 @@ use crate::consolidation::{
 };
 use crate::transaction::Token;
 use crate::verify::{
-    verify_membership_under, verify_token_with_seal_stats, MintJustificationRegistry,
-    SealAuthenticator, SealSession, VerificationPolicy,
+    verify_membership_in, verify_membership_under, verify_token_in_session,
+    verify_token_with_seal_stats, MintJustificationRegistry, SealAuthenticator, SealSession,
+    VerificationPolicy,
 };
 
 /// Default total deadline of one attempt.
@@ -183,6 +184,8 @@ pub struct ProofClient<C, K, X> {
     registry: MintJustificationRegistry,
     policy: VerificationPolicy,
     endpoints: Vec<(ShardId, C)>,
+    /// Index into `endpoints` of each shard (canonical order), `None` if unconfigured.
+    endpoint_by_shard: Vec<Option<usize>>,
     clock: K,
     executor: X,
 }
@@ -245,6 +248,11 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 return Err(cfg("duplicate endpoint for a shard"));
             }
         }
+        let endpoint_by_shard = router
+            .shards()
+            .iter()
+            .map(|s| endpoints.iter().position(|(e, _)| e == s))
+            .collect();
         Ok(Self {
             config,
             router,
@@ -252,6 +260,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             registry: MintJustificationRegistry::new(),
             policy: VerificationPolicy::default(),
             endpoints,
+            endpoint_by_shard,
             clock,
             executor,
         })
@@ -286,9 +295,16 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             cancel: &options.cancel,
             abort: CancelToken::new(),
         };
-        let (input_check, input_stats) =
-            verify_token_with_seal_stats(token, &self.trust_base, &self.registry, self.policy);
+        // one operation, one seal session: what the input verification authenticated is
+        // not authenticated again by the consolidation steps
+        let (input_check, mut session) = verify_token_in_session(
+            token,
+            SealSession::new(&self.trust_base),
+            &self.registry,
+            self.policy,
+        );
         input_check.map_err(ConsolidationError::InvalidToken)?;
+        let input_quorum_checks = session.stats().quorum_checks;
 
         let outer = outer_proofs(token);
         let items: Vec<ProofItem> = outer
@@ -298,7 +314,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 proof: o.proof.clone(),
             })
             .collect();
-        let bundle = match self.run(&items, options.master.as_ref(), &budget) {
+        let bundle = match self.run(&items, options.master.as_ref(), &budget, &mut session, true) {
             Ok(b) => b,
             Err(Stop::Unavailable(reason, retryable)) => {
                 return Ok(ConsolidationOutcome::Unavailable { reason, retryable })
@@ -307,8 +323,9 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         };
 
         let mut summary = bundle.summary;
+        summary.input_quorum_checks = input_quorum_checks;
         if summary.already_shared {
-            summary.verification_quorum_checks = input_stats.quorum_checks;
+            summary.verification_quorum_checks = input_quorum_checks;
             return Ok(ConsolidationOutcome::Consolidated {
                 token: token.clone(),
                 summary,
@@ -342,7 +359,8 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             cancel: &options.cancel,
             abort: CancelToken::new(),
         };
-        match self.run(items, options.master.as_ref(), &budget) {
+        let mut session = SealSession::new(&self.trust_base);
+        match self.run(items, options.master.as_ref(), &budget, &mut session, false) {
             Ok(bundle) => Ok(BundleOutcome::Consolidated(bundle)),
             Err(Stop::Unavailable(reason, retryable)) => {
                 Ok(BundleOutcome::Unavailable { reason, retryable })
@@ -351,18 +369,19 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         }
     }
 
-    /// Admit the input: bound it, deduplicate state ids through an ordered index
-    /// (O(L log L), not a rescan per item), route the distinct states and enforce
-    /// the per-shard limit as soon as it is exceeded, with periodic deadline and
+    /// Admit the input: bound it, route every input once (binary search over the
+    /// sorted scheme), deduplicate state ids through an ordered index (O(L log L),
+    /// not a rescan per item), group distinct states by shard index and enforce the
+    /// per-shard limit as soon as it is exceeded, with periodic deadline and
     /// cancellation checks. Returns the participating groups (canonical shard
-    /// order, distinct states only) and, for every input, the index of the first
-    /// input with the same state id.
+    /// order, distinct states only), for every input the index of the first input
+    /// with the same state id, and for every input its shard index.
     fn group(
         &self,
         items: &[ProofItem],
         budget: &Budget<'_, K>,
-        steps: &mut u64,
-    ) -> Res<(Vec<Group>, Vec<usize>)> {
+        work: &mut AdmissionWork,
+    ) -> Res<(Vec<Group>, Vec<usize>, Vec<usize>)> {
         let cfg = |m: &str| Stop::Error(ConsolidationError::Configuration(m.to_string()));
         if items.is_empty() {
             return Err(cfg("nothing to consolidate"));
@@ -378,12 +397,17 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         }
         let mut seen: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         let mut first_of = Vec::with_capacity(items.len());
-        let mut groups: Vec<Group> = Vec::new();
+        let mut shard_of = Vec::with_capacity(items.len());
+        let mut slots: Vec<Option<Group>> = (0..self.router.shards().len()).map(|_| None).collect();
         for (i, item) in items.iter().enumerate() {
             if i % 64 == 0 {
                 budget.check()?;
             }
-            *steps += 1;
+            work.steps += 1;
+            let si = self
+                .router
+                .route_index_counted(&item.state_id, &mut work.route_comparisons);
+            shard_of.push(si);
             if let Some(&first) = seen.get(item.state_id.bytes()) {
                 let o = &items[first].proof;
                 if o.certification_data != item.proof.certification_data
@@ -396,24 +420,18 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             }
             seen.insert(*item.state_id.bytes(), i);
             first_of.push(i);
-            let shard = self.router.route(&item.state_id);
-            let g = match groups.iter().position(|g| &g.shard == shard) {
-                Some(g) => &mut groups[g],
-                None => {
-                    let endpoint = self
-                        .endpoints
-                        .iter()
-                        .position(|(s, _)| s == shard)
-                        .ok_or_else(|| cfg("no configured endpoint serves a state of the token"))?;
-                    groups.push(Group {
-                        endpoint,
-                        shard: shard.clone(),
-                        items: Vec::new(),
-                        ids: Vec::new(),
-                    });
-                    groups.last_mut().expect("just pushed")
-                }
-            };
+            work.group_lookups += 1; // one array index per distinct state
+            if slots[si].is_none() {
+                let endpoint = self.endpoint_by_shard[si]
+                    .ok_or_else(|| cfg("no configured endpoint serves a state of the token"))?;
+                slots[si] = Some(Group {
+                    endpoint,
+                    shard: self.router.shards()[si].clone(),
+                    items: Vec::new(),
+                    ids: Vec::new(),
+                });
+            }
+            let g = slots[si].as_mut().expect("just ensured");
             g.items.push(i);
             g.ids.push(item.state_id.clone());
             if g.ids.len() > MAX_BATCH_STATE_IDS {
@@ -424,8 +442,8 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 }));
             }
         }
-        groups.sort_by(|a, b| a.shard.canonical_cmp(&b.shard));
-        Ok((groups, first_of))
+        // shard indexes are canonical order already
+        Ok((slots.into_iter().flatten().collect(), first_of, shard_of))
     }
 
     fn fetch(
@@ -518,10 +536,13 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         items: &[ProofItem],
         master: Option<&ShardId>,
         budget: &Budget<'_, K>,
+        session: &mut SealSession<'_>,
+        verified: bool,
     ) -> Res<ProofBundle> {
         let cfg = |m: &str| Stop::Error(ConsolidationError::Configuration(m.to_string()));
-        let mut admission_steps = 0;
-        let (groups, first_of) = self.group(items, budget, &mut admission_steps)?;
+        let base_quorum = session.stats().quorum_checks;
+        let mut work = AdmissionWork::default();
+        let (groups, first_of, shard_of) = self.group(items, budget, &mut work)?;
         budget.check()?;
 
         // the evidence must belong to the configured partition and shards (and match the
@@ -531,13 +552,13 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 what,
             }))
         };
-        for item in items {
+        for (item, &si) in items.iter().zip(&shard_of) {
             let uc = &item.proof.unicity_certificate;
             if uc.unicity_tree_certificate.partition_identifier != self.config.partition_id {
                 return Err(context("proof is of another partition"));
             }
             let shard = &uc.shard_tree_certificate.shard;
-            if shard != self.router.route(&item.state_id) {
+            if shard != &self.router.shards()[si] {
                 return Err(context(
                     "proof is of another shard than the state routes to",
                 ));
@@ -553,12 +574,26 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         }
 
         // the original evidence, authenticated: the only source of the bound
-        let mut session = SealSession::new(&self.trust_base);
-        let evidence: Vec<(StateId, &InclusionProof)> = items
+        let routed: Vec<(&InclusionProof, usize)> = items
             .iter()
-            .map(|i| (i.state_id.clone(), &i.proof))
+            .map(|i| &i.proof)
+            .zip(shard_of.iter().copied())
             .collect();
-        let bound = RootRoundBound::from_proofs(&mut session, &self.router, &evidence)
+        if !verified {
+            for item in items {
+                verify_membership_in(
+                    session,
+                    &item.proof,
+                    &item.state_id,
+                    item.proof.reference_time,
+                )
+                .map_err(|e| {
+                    Stop::Error(ConsolidationError::Integrity(IntegrityError::Evidence(e)))
+                })?;
+            }
+        }
+        // (a verified token's proofs were authenticated by its complete verification)
+        let bound = RootRoundBound::from_routed(&self.router, &routed)
             .map_err(|e| Stop::Error(ConsolidationError::Integrity(IntegrityError::Evidence(e))))?;
         budget.check()?;
 
@@ -573,8 +608,11 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             master: None,
             master_round: None,
             required_round: bound.round(),
-            consolidation_quorum_checks: session.stats().quorum_checks,
+            consolidation_quorum_checks: session.stats().quorum_checks - base_quorum,
+            input_quorum_checks: 0,
             verification_quorum_checks: 0,
+            certificates_derived: 0,
+            admission: work,
         };
         if before == 1 {
             // Already under one seal. Reuse is only sound when that shared seal is also
@@ -585,7 +623,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             let seal = &items[0].proof.unicity_certificate.unicity_seal;
             if session.authenticate_seal_under(seal, &policy).is_ok() {
                 summary.already_shared = true;
-                summary.consolidation_quorum_checks = session.stats().quorum_checks;
+                summary.consolidation_quorum_checks = session.stats().quorum_checks - base_quorum;
                 return Ok(ProofBundle {
                     proofs: items.iter().map(|i| i.proof.clone()).collect(),
                     summary,
@@ -616,7 +654,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 enclosing,
                 self.config.partition_id,
                 Some(&self.config.topology),
-                &mut session,
+                session,
             )
             .map_err(|e| Stop::Error(ConsolidationError::Integrity(IntegrityError::View(e))))?;
         let master_round = authenticated.seal().root_chain_round_number;
@@ -627,27 +665,26 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 true,
             ));
         }
-        let certs = authenticated
-            .certificates()
-            .map_err(|e| Stop::Error(ConsolidationError::Integrity(IntegrityError::View(e))))?;
         budget.check()?;
 
         // master first: its own leaves are verified against the authenticated target
         // before any peer is contacted, so a bad master proof is an integrity error
         // and can never hide behind a peer's unavailability
         let mut replaced: Vec<Option<InclusionProof>> = alloc::vec![None; items.len()];
+        // only the participating shards' certificates are derived (m of S, lazily)
+        let mut derived = 0usize;
         let mut place =
             |g: &Group, batch: &InclusionProofBatch, session: &mut SealSession<'_>| -> Res<()> {
-                let cert = certs
-                    .iter()
-                    .find(|c| c.shard_id == g.shard)
-                    .and_then(|c| c.certificate.as_ref())
-                    .ok_or(Stop::Error(ConsolidationError::Integrity(
-                        IntegrityError::Certificate {
-                            shard: g.shard.clone(),
-                            what: "no ordinary certificate for a shard holding proofs",
-                        },
-                    )))?;
+                derived += 1;
+                let shard_cert = authenticated.certificate_of(&g.shard).map_err(|e| {
+                    Stop::Error(ConsolidationError::Integrity(IntegrityError::View(e)))
+                })?;
+                let cert = shard_cert.certificate.as_ref().ok_or(Stop::Error(
+                    ConsolidationError::Integrity(IntegrityError::Certificate {
+                        shard: g.shard.clone(),
+                        what: "no ordinary certificate for a shard holding proofs",
+                    }),
+                ))?;
                 for (k, (&idx, served)) in g.items.iter().zip(&batch.proofs).enumerate() {
                     let p = replacement_proof(&items[idx].proof, &served.proof, cert).map_err(
                         |what| {
@@ -674,7 +711,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 }
                 Ok(())
             };
-        place(mg, &mbatch, &mut session)?;
+        place(mg, &mbatch, session)?;
 
         // wave 2: the exact roots the authenticated view names, bounded parallel
         struct Job<'g> {
@@ -687,9 +724,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 continue;
             }
             let leaf = authenticated
-                .leaves()
-                .iter()
-                .find(|l| l.shard_id == g.shard)
+                .leaf_of(&g.shard)
                 .ok_or_else(|| cfg("the authenticated view lacks a participating shard"))?;
             let root: [u8; 32] = leaf
                 .input_record
@@ -751,7 +786,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         // the peers' proofs are verified against the authenticated target as they are placed
         for (job, batch) in jobs.iter().zip(&batches) {
             Self::check_batch(job.group, items, batch, Some(&job.root))?;
-            place(job.group, batch, &mut session)?;
+            place(job.group, batch, session)?;
         }
         // every input gets the replacement of its (first) state
         let proofs: Vec<InclusionProof> = first_of
@@ -766,9 +801,10 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
 
         summary.outer_seals_after = distinct_seals(&proofs);
         summary.requests = requests.load(Ordering::SeqCst);
+        summary.certificates_derived = derived;
         summary.master = Some(mg.shard.clone());
         summary.master_round = Some(master_round);
-        summary.consolidation_quorum_checks = session.stats().quorum_checks;
+        summary.consolidation_quorum_checks = session.stats().quorum_checks - base_quorum;
         Ok(ProofBundle { proofs, summary })
     }
 }

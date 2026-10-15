@@ -10,12 +10,14 @@ use alloc::vec::Vec;
 
 use super::error::PartitionViewError;
 use super::topology::PartitionTopology;
-use crate::api::bft::{ShardId, UnicityCertificate};
+use crate::api::bft::ShardId;
+#[cfg(feature = "client")]
+use crate::api::bft::UnicityCertificate;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::StateId;
-use crate::transaction::{
-    CertifiedMintTransaction, CertifiedTransferTransaction, Token, Transaction,
-};
+#[cfg(feature = "client")]
+use crate::transaction::{CertifiedMintTransaction, CertifiedTransferTransaction};
+use crate::transaction::{Token, Transaction};
 use crate::verify::{verify_membership_in, SealSession, VerificationError};
 
 /// Routes a state id to its shard by the admitted shard-prefix topology.
@@ -40,13 +42,33 @@ impl ShardRouter {
         &self.shards
     }
 
+    /// A router over an already canonical (sorted, complete, prefix-free) scheme,
+    /// bypassing the view admission cap: for scaling tests only.
+    #[cfg(all(test, feature = "std", feature = "client"))]
+    pub(crate) fn from_canonical_unchecked(shards: Vec<ShardId>) -> Self {
+        Self { shards }
+    }
+
     /// The shard serving `state_id`.
     pub fn route(&self, state_id: &StateId) -> &ShardId {
-        // a complete prefix-free scheme: exactly one shard matches
+        &self.shards[self.route_index(state_id)]
+    }
+
+    /// Index (in canonical order) of the shard serving `state_id`: a binary
+    /// search over the sorted prefix-free scheme, O(log S) prefix comparisons.
+    pub fn route_index(&self, state_id: &StateId) -> usize {
+        self.route_index_counted(state_id, &mut 0)
+    }
+
+    /// [`route_index`](Self::route_index), counting prefix comparisons.
+    pub(crate) fn route_index_counted(&self, state_id: &StateId, comparisons: &mut u64) -> usize {
+        // a complete prefix-free scheme: exactly one shard is a prefix of the key
         self.shards
-            .iter()
-            .find(|s| s.length() == 0 || s.is_prefix_of(state_id.bytes()))
-            .unwrap_or(&self.shards[0])
+            .binary_search_by(|s| {
+                *comparisons += 1;
+                s.cmp_prefix_of_key(state_id.bytes())
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -118,21 +140,38 @@ impl RootRoundBound {
         router: &ShardRouter,
         evidence: &[(StateId, &InclusionProof)],
     ) -> Result<Self, VerificationError> {
-        let mut best: Option<(u64, ShardId)> = None;
         for (state_id, proof) in evidence {
             verify_membership_in(session, proof, state_id, proof.reference_time)?;
+        }
+        let routed: Vec<(&InclusionProof, usize)> = evidence
+            .iter()
+            .map(|(id, p)| (*p, router.route_index(id)))
+            .collect();
+        Self::from_routed(router, &routed)
+    }
+
+    /// The bound of proofs whose membership was **already verified** by the
+    /// caller (a complete token verification), each with its shard index.
+    /// Crate-private: a public constructor must authenticate what it measures.
+    pub(crate) fn from_routed(
+        router: &ShardRouter,
+        evidence: &[(&InclusionProof, usize)],
+    ) -> Result<Self, VerificationError> {
+        let mut best: Option<(u64, usize)> = None;
+        for (proof, shard) in evidence {
             let round = proof
                 .unicity_certificate
                 .unicity_seal
                 .root_chain_round_number;
-            let shard = router.route(state_id).clone();
-            let better = best.as_ref().map_or(true, |(r, _)| round > *r);
-            if better {
-                best = Some((round, shard));
+            if best.map_or(true, |(r, _)| round > r) {
+                best = Some((round, *shard));
             }
         }
         let (round, shard) = best.ok_or(VerificationError::SealMalformed)?;
-        Ok(Self { round, shard })
+        Ok(Self {
+            round,
+            shard: router.shards()[shard].clone(),
+        })
     }
 
     /// The required minimum root round.
@@ -152,6 +191,7 @@ impl RootRoundBound {
 /// served proof) and the unicity certificate (derived) are new.
 ///
 /// Fails if the served proof is not bound to the original certification.
+#[cfg(feature = "client")]
 pub(crate) fn replacement_proof(
     original: &InclusionProof,
     served: &InclusionProof,
@@ -175,6 +215,7 @@ pub(crate) fn replacement_proof(
 /// [`outer_proofs`] order. The signed transactions (and everything nested in
 /// them) are cloned unchanged. The result is **unverified**; callers verify it
 /// completely.
+#[cfg(feature = "client")]
 pub(crate) fn rebuild_token(
     token: &Token,
     proofs: Vec<InclusionProof>,

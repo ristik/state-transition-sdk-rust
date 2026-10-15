@@ -19,7 +19,7 @@ pub use batch::{
     RequestOptions, StateRoot, MAX_BATCH_STATE_IDS,
 };
 pub use consolidate::{
-    BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,
+    AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,
     ConsolidationOutcome, ConsolidationSummary, IntegrityError, ProofBundle, ProofClient,
     ProofClientConfig, ProofItem, SequentialExecutor, UnavailableReason, WaveExecutor,
     DEFAULT_TIMEOUT_MS,

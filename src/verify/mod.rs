@@ -98,6 +98,24 @@ pub fn verify_token_with_seal_stats(
     (result, context.seals().stats())
 }
 
+/// Verify `token` inside an existing operation's seal session and return the
+/// session, so that later steps of the same operation reuse what was authenticated.
+#[cfg(feature = "client")]
+pub(crate) fn verify_token_in_session<'a>(
+    token: &Token,
+    session: SealSession<'a>,
+    registry: &'a MintJustificationRegistry,
+    policy: VerificationPolicy,
+) -> (Result<(), VerificationError>, SealSession<'a>) {
+    let trust_base = session.trust_base();
+    let mut context = VerificationContext::with_session(session, registry, policy);
+    let result = trust_base
+        .validate()
+        .map_err(VerificationError::InvalidTrustBase)
+        .and_then(|()| verify_token_in_context(token, &mut context));
+    (result, context.into_session())
+}
+
 pub(crate) fn verify_token_in_context(
     token: &Token,
     context: &mut VerificationContext<'_>,

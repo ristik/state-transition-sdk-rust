@@ -1165,3 +1165,31 @@ fn custom_authenticators_cannot_mint_identified_views() {
         .unwrap();
     assert_ne!(v1.identity(), v2.identity(), "authority separation");
 }
+
+#[test]
+fn lazy_certificate_equals_the_eager_one_and_unknown_shards_are_refused() {
+    for n in CASES {
+        let c = case(n);
+        let mut s = SealSession::new(&c.trust_base);
+        let view = c
+            .view
+            .authenticate(&c.uc, c.partition, None, &mut s)
+            .unwrap();
+        let all = view.certificates().unwrap();
+        assert_eq!(all.len(), n);
+        for sc in &all {
+            assert_eq!(
+                &view.certificate_of(&sc.shard_id).unwrap(),
+                sc,
+                "{n} shards"
+            );
+            assert!(view.leaf_of(&sc.shard_id).is_some());
+        }
+        let unknown = ShardId::decode(&[0b0100_0001]).unwrap(); // shard "0000001"
+        assert!(view.leaf_of(&unknown).is_none());
+        assert!(matches!(
+            view.certificate_of(&unknown),
+            Err(PartitionViewError::LeafSetMismatch(_))
+        ));
+    }
+}

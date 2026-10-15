@@ -83,13 +83,36 @@ pub struct ConsolidationSummary {
     pub master_round: Option<u64>,
     /// Minimum root round the evidence required.
     pub required_round: u64,
-    /// Quorum-signature verifications executed to authenticate the original
-    /// evidence and the master seal.
+    /// Quorum-signature verifications executed by the consolidation itself: the
+    /// master seal (or the already-shared target) and, for loose proof bundles,
+    /// the original evidence. On the token path the input's own verification is
+    /// counted in `input_quorum_checks` and shared, never repeated.
     pub consolidation_quorum_checks: u64,
+    /// Quorum-signature verifications of the input token's complete verification
+    /// (token path only; one per distinct seal in the operation's session).
+    pub input_quorum_checks: u64,
     /// Quorum-signature verifications of the *whole recursive verification* of
     /// the output token. Nested proofs inside signed mint justifications keep
     /// their own seals and may need more than one.
     pub verification_quorum_checks: u64,
+    /// Shard certificates derived from the authenticated view: the number of
+    /// participating shards `m`, not the partition's shard count `S`.
+    pub certificates_derived: usize,
+    /// Admission work counters.
+    pub admission: AdmissionWork,
+}
+
+/// Counted operations of admission, the metric of its asymptotic bound: `steps`
+/// and `group_lookups` are exactly one per input / distinct state; routing costs
+/// O(log S) prefix comparisons per input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionWork {
+    /// Inputs processed.
+    pub steps: u64,
+    /// Shard-prefix comparisons made by routing.
+    pub route_comparisons: u64,
+    /// Group index lookups (array accesses by shard index).
+    pub group_lookups: u64,
 }
 
 /// What failed integrity.

@@ -315,32 +315,54 @@ impl AuthenticatedView {
         &self.identity
     }
 
+    /// The authenticated leaf of `shard` (binary search in canonical order).
+    pub fn leaf_of(&self, shard: &ShardId) -> Option<&PartitionViewLeaf> {
+        self.leaves
+            .binary_search_by(|l| l.shard_id.canonical_cmp(shard))
+            .ok()
+            .map(|i| &self.leaves[i])
+    }
+
     /// Derive every shard's tree path and, where the input record has a state
     /// hash and summary value, its ordinary version-1 unicity certificate, in
     /// canonical order. Each carries the identical master seal and partition
     /// path, so one quorum authentication covers all of them.
+    ///
+    /// This materializes `S` certificates (O(S·C) output). A consumer that needs
+    /// only the `m` participating shards should call
+    /// [`certificate_of`](Self::certificate_of) for those.
     pub fn certificates(&self) -> Result<Vec<ShardCertificate>, PartitionViewError> {
-        self.leaves
-            .iter()
-            .map(|leaf| {
-                let shard_tree_certificate = self.tree.certificate(&leaf.shard_id)?;
-                let certificate =
-                    leaf.input_record
-                        .to_input_record()
-                        .map(|input_record| UnicityCertificate {
-                            input_record,
-                            technical_record_hash: Some(leaf.tr_hash.clone()),
-                            shard_configuration_hash: leaf.shard_conf_hash.clone(),
-                            shard_tree_certificate: shard_tree_certificate.clone(),
-                            unicity_tree_certificate: self.unicity_tree_certificate.clone(),
-                            unicity_seal: self.seal.clone(),
-                        });
-                Ok(ShardCertificate {
-                    shard_id: leaf.shard_id.clone(),
-                    shard_tree_certificate,
-                    certificate,
-                })
-            })
-            .collect()
+        (0..self.leaves.len()).map(|i| self.derive(i)).collect()
+    }
+
+    /// Derive the certificate of one shard only: O(log S) to find the leaf plus
+    /// the O(d_S + C) path/seal/partition-path copy of that shard.
+    pub fn certificate_of(&self, shard: &ShardId) -> Result<ShardCertificate, PartitionViewError> {
+        let i = self
+            .leaves
+            .binary_search_by(|l| l.shard_id.canonical_cmp(shard))
+            .map_err(|_| PartitionViewError::LeafSetMismatch("shard is not in the view"))?;
+        self.derive(i)
+    }
+
+    fn derive(&self, index: usize) -> Result<ShardCertificate, PartitionViewError> {
+        let leaf = &self.leaves[index];
+        let shard_tree_certificate = self.tree.certificate(&leaf.shard_id)?;
+        let certificate =
+            leaf.input_record
+                .to_input_record()
+                .map(|input_record| UnicityCertificate {
+                    input_record,
+                    technical_record_hash: Some(leaf.tr_hash.clone()),
+                    shard_configuration_hash: leaf.shard_conf_hash.clone(),
+                    shard_tree_certificate: shard_tree_certificate.clone(),
+                    unicity_tree_certificate: self.unicity_tree_certificate.clone(),
+                    unicity_seal: self.seal.clone(),
+                });
+        Ok(ShardCertificate {
+            shard_id: leaf.shard_id.clone(),
+            shard_tree_certificate,
+            certificate,
+        })
     }
 }

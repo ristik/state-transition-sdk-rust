@@ -1034,30 +1034,42 @@ fn admission_work_is_linear_in_the_input_and_oversize_is_refused_first() {
     let mut counts = Vec::new();
     for n in [100usize, 200, 400, 800, 1_600] {
         let items = synthetic_items(n);
-        let mut steps = 0;
-        let (groups, first_of) = match c.group(&items, &budget, &mut steps) {
+        let mut work = AdmissionWork::default();
+        let (groups, first_of, shard_of) = match c.group(&items, &budget, &mut work) {
             Ok(x) => x,
             Err(_) => panic!("{n} distinct states fit"),
         };
         assert_eq!(first_of, (0..n).collect::<Vec<_>>());
+        assert_eq!(shard_of.len(), n);
         assert_eq!(groups.iter().map(|g| g.ids.len()).sum::<usize>(), n);
-        counts.push((n, steps));
+        counts.push((n, work));
     }
-    for (n, steps) in &counts {
+    for (n, w) in &counts {
+        let n = *n as u64;
         assert_eq!(
-            *steps, *n as u64,
+            w.steps, n,
             "one index operation per input: linear, not quadratic"
+        );
+        assert_eq!(
+            w.group_lookups, n,
+            "one array index per distinct state, not a scan of the groups"
+        );
+        // routing is a binary search over S = 8 shards: at most ceil(log2 8)+1 prefix comparisons
+        assert!(
+            w.route_comparisons <= 4 * n,
+            "{} comparisons for {n} inputs",
+            w.route_comparisons
         );
     }
 
     // beyond what 8 endpoints could ever carry: refused before any per-item work
     let items = synthetic_items(8 * MAX_BATCH_STATE_IDS + 1);
-    let mut steps = 0;
+    let mut work = AdmissionWork::default();
     assert!(matches!(
-        c.group(&items, &budget, &mut steps),
+        c.group(&items, &budget, &mut work),
         Err(Stop::Error(ConsolidationError::TooManyStates { .. }))
     ));
-    assert_eq!(steps, 0);
+    assert_eq!(work, AdmissionWork::default());
 
     // a single shard over its limit is refused as soon as it is exceeded
     let one_shard: Vec<ProofItem> = synthetic_items(4_000)
@@ -1065,21 +1077,127 @@ fn admission_work_is_linear_in_the_input_and_oversize_is_refused_first() {
         .filter(|i| i.state_id.bytes()[0] >> 5 == 0)
         .take(MAX_BATCH_STATE_IDS + 1)
         .collect();
-    let mut steps = 0;
+    let mut work = AdmissionWork::default();
     assert!(matches!(
-        c.group(&one_shard, &budget, &mut steps),
+        c.group(&one_shard, &budget, &mut work),
         Err(Stop::Error(ConsolidationError::TooManyStates { .. }))
     ));
-    assert_eq!(steps, one_shard.len() as u64, "stops at the offending item");
+    assert_eq!(
+        work.steps,
+        one_shard.len() as u64,
+        "stops at the offending item"
+    );
 
     // a cancelled attempt does no admission work
     cancel.cancel();
-    let mut steps = 0;
+    let mut work = AdmissionWork::default();
     assert!(matches!(
-        c.group(&synthetic_items(10), &budget, &mut steps),
+        c.group(&synthetic_items(10), &budget, &mut work),
         Err(Stop::Error(ConsolidationError::Cancelled))
     ));
-    assert_eq!(steps, 0);
+    assert_eq!(work, AdmissionWork::default());
+}
+
+/// Routing cost per input is logarithmic in the number of shards, and agrees with a
+/// linear scan of the scheme (the slow reference model).
+#[test]
+fn routing_is_a_binary_search_that_agrees_with_the_linear_scan() {
+    let mut per_route = Vec::new();
+    for k in 1..=10u32 {
+        let mut scheme = vec![ShardId::root()];
+        for _ in 0..k {
+            scheme = scheme
+                .iter()
+                .flat_map(|s| {
+                    let (z, o) = s.split();
+                    [z, o]
+                })
+                .collect();
+        }
+        let s = scheme.len();
+        let router = ShardRouter::from_canonical_unchecked(scheme.clone());
+        let mut comparisons = 0u64;
+        for i in 0..2_000u64 {
+            let id = StateId::from_cbor(Decoder::new(&encode_byte_string(
+                sha256(&i.to_be_bytes()).data(),
+            )))
+            .unwrap();
+            let got = router.route_index_counted(&id, &mut comparisons);
+            let expected = scheme
+                .iter()
+                .position(|sh| sh.is_prefix_of(id.bytes()))
+                .unwrap();
+            assert_eq!(got, expected, "S={s}");
+        }
+        per_route.push((s, comparisons as f64 / 2_000.0));
+    }
+    for (s, c) in &per_route {
+        assert!(
+            *c <= f64::from(s.ilog2()) + 1.0,
+            "S={s}: {c} comparisons per route"
+        );
+    }
+    // 512x the shards costs about ten times more comparisons, not 512x
+    assert!(per_route[9].1 < 12.0 * per_route[0].1);
+    // uneven scheme
+    let (a, b) = ShardId::root().split();
+    let (b0, b1) = b.split();
+    let router = ShardRouter::new(&PartitionTopology::new(vec![b1, a.clone(), b0])).unwrap();
+    let key = |first: u8| {
+        let mut x = [0u8; 32];
+        x[0] = first;
+        StateId::from_cbor(Decoder::new(&encode_byte_string(&x))).unwrap()
+    };
+    assert_eq!(router.route(&key(0x10)), &a);
+    assert_eq!(
+        router.route(&key(0x90)),
+        &ShardId::decode(&[0b1010_0000]).unwrap()
+    );
+    assert_eq!(
+        router.route(&key(0xd0)),
+        &ShardId::decode(&[0b1110_0000]).unwrap()
+    );
+}
+
+/// One operation, one session: the input's own verification authenticates each
+/// distinct evidence seal once; consolidation adds only its own target check.
+#[test]
+fn token_consolidation_checks_each_evidence_quorum_once() {
+    let (sim, token) = spread_token(3);
+    let e = distinct_seals(outer_proofs(&token).iter().map(|o| o.proof));
+    let ConsolidationOutcome::Consolidated { summary, .. } =
+        client(&sim, false).consolidate(&token, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        summary.input_quorum_checks as usize, e,
+        "E evidence seals, once each"
+    );
+    assert_eq!(
+        summary.consolidation_quorum_checks, 1,
+        "only the master seal is new"
+    );
+    assert_eq!(
+        summary.input_quorum_checks + summary.consolidation_quorum_checks,
+        e as u64 + 1
+    );
+    assert_eq!(summary.certificates_derived, 2);
+
+    // already shared: the view-policy check of the shared seal is the only extra quorum
+    let ConsolidationOutcome::Consolidated { token: shared, .. } =
+        client(&sim, false).consolidate(&token, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    let ConsolidationOutcome::Consolidated { summary, .. } =
+        client(&sim, false).consolidate(&shared, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    assert!(summary.already_shared);
+    assert_eq!(summary.input_quorum_checks, 1);
+    assert_eq!(summary.consolidation_quorum_checks, 1);
 }
 
 #[test]
