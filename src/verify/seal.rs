@@ -99,6 +99,32 @@ impl<'a> SealSession<'a> {
         Ok(())
     }
 
+    /// Content identity of the authority: a digest over the trust base's
+    /// version, network, epoch, epoch start, threshold and every validator
+    /// (id, key, stake). Two sessions with the same identity judge seals alike.
+    pub fn authority_identity(&self) -> [u8; 32] {
+        let tb = self.trust_base;
+        let mut h = DataHasher::new(HashAlgorithm::Sha256)
+            .expect("sha256")
+            .update(b"unicity-token/authority/v1")
+            .update(&tb.version.to_be_bytes())
+            .update(&tb.network_id.id().to_be_bytes())
+            .update(&tb.epoch.to_be_bytes())
+            .update(&tb.epoch_start_round.to_be_bytes())
+            .update(&tb.quorum_threshold.to_be_bytes())
+            .update(&(tb.root_nodes.len() as u64).to_be_bytes());
+        for n in &tb.root_nodes {
+            h = h
+                .update(&(n.node_id.len() as u64).to_be_bytes())
+                .update(n.node_id.as_bytes())
+                .update(n.signing_key.as_bytes())
+                .update(&n.stake.to_be_bytes());
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(h.finalize().data());
+        id
+    }
+
     fn key(seal: &UnicitySeal) -> [u8; 32] {
         let encoded = seal.to_cbor();
         let digest = DataHasher::new(HashAlgorithm::Sha256)

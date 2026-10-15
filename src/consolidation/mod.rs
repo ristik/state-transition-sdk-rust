@@ -9,14 +9,14 @@
 //! carry the identical master seal, so a verifier authenticates that seal once.
 //!
 //! Nothing here performs I/O. A decoded view or a rebuilt tree is **not**
-//! trusted: [`PartitionView::assemble_certificates`] is the only way to obtain
-//! certificates and it authenticates the seal through a [`SealAuthenticator`].
+//! trusted: [`PartitionView::authenticate`] checks it against an anchored authority
+//! and yields an immutable [`AuthenticatedView`], the only input of certificate
+//! assembly.
 //!
 //! The wire format is the frozen `PartitionViewV1` of the reference
 //! implementation (bft-go-base `types/partition_view.go`):
 //! `[1, partitionId, [[shardId, inputRecord, trHash, shardConfHash], ...]]`.
 //!
-//! [`SealAuthenticator`]: crate::verify::SealAuthenticator
 
 mod assemble;
 mod error;
@@ -24,7 +24,7 @@ mod partition_view;
 mod shard_tree;
 mod topology;
 
-pub use assemble::ShardCertificate;
+pub use assemble::{AuthenticatedView, ShardCertificate};
 pub use error::PartitionViewError;
 pub use partition_view::{
     PartitionView, PartitionViewInputRecord, PartitionViewLeaf, MAX_PARTITION_VIEW_BYTES,

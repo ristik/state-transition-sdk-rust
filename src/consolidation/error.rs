@@ -35,8 +35,6 @@ pub enum PartitionViewError {
     LeafSetMismatch(&'static str),
     /// A leaf's configuration hash differs from the admitted one.
     ConfigHashMismatch,
-    /// Assembly needs an admitted configuration hash for every shard.
-    ConfigHashRequired,
     /// The rebuilt shard tree does not hash into the enclosing seal.
     TreeRootMismatch,
     /// The enclosing certificate is inconsistent with the view.
@@ -82,12 +80,6 @@ impl fmt::Display for PartitionViewError {
                 write!(
                     f,
                     "shard configuration hash does not match the admitted configuration"
-                )
-            }
-            PartitionViewError::ConfigHashRequired => {
-                write!(
-                    f,
-                    "an admitted configuration hash is required for every shard"
                 )
             }
             PartitionViewError::TreeRootMismatch => {

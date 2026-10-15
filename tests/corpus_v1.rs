@@ -14,9 +14,22 @@ use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
 use unicity_token::api::bft::{RootTrustBase, ShardId, UnicityCertificate};
 use unicity_token::api::NetworkId;
 use unicity_token::cbor::Decoder;
-use unicity_token::consolidation::{PartitionTopology, PartitionView, PartitionViewError};
+use unicity_token::consolidation::{
+    PartitionTopology, PartitionView, PartitionViewError, ShardCertificate,
+};
 use unicity_token::crypto::signature::PublicKey;
 use unicity_token::verify::{SealSession, VerificationError};
+
+fn assemble(
+    view: &PartitionView,
+    enclosing: &UnicityCertificate,
+    partition: u32,
+    pins: Option<&PartitionTopology>,
+    session: &mut SealSession<'_>,
+) -> Result<Vec<ShardCertificate>, PartitionViewError> {
+    view.authenticate(enclosing, partition, pins, session)?
+        .certificates()
+}
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/uc-consolidation/corpus-v1")
@@ -175,9 +188,14 @@ fn positive_cases_assemble_the_reference_certificates() {
         let enclosing = enclosing(dir, &c.shards);
 
         let mut session = SealSession::new(&tb);
-        let ucs = view
-            .assemble_certificates(&enclosing, c.partition, &c.topology, &mut session)
-            .unwrap_or_else(|e| panic!("{dir}: {e}"));
+        let ucs = assemble(
+            &view,
+            &enclosing,
+            c.partition,
+            Some(&c.topology),
+            &mut session,
+        )
+        .unwrap_or_else(|e| panic!("{dir}: {e}"));
         assert_eq!(ucs.len(), expected.len(), "{dir}");
         for (got, want) in ucs.iter().zip(&expected) {
             match &got.certificate {
@@ -256,7 +274,13 @@ fn negative_view_cases_are_refused() {
         }
         if let Ok(view) = decoded {
             let mut session = SealSession::new(&tb);
-            let r = view.assemble_certificates(&enclosing, c.partition, &c.topology, &mut session);
+            let r = assemble(
+                &view,
+                &enclosing,
+                c.partition,
+                Some(&c.topology),
+                &mut session,
+            );
             assert!(r.is_err(), "{name}: assembly must be refused");
         }
         checked += 1;
@@ -287,7 +311,13 @@ fn other_authorities_do_not_authenticate_the_master_seal() {
         let enclosing = enclosing(&base, &c.shards);
         let mut session = SealSession::new(&tb);
         assert_eq!(
-            view.assemble_certificates(&enclosing, c.partition, &c.topology, &mut session),
+            assemble(
+                &view,
+                &enclosing,
+                c.partition,
+                Some(&c.topology),
+                &mut session
+            ),
             Err(PartitionViewError::Seal(want)),
             "{name}"
         );

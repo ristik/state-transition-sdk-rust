@@ -3,11 +3,15 @@
 use alloc::vec::Vec;
 
 use super::error::PartitionViewError;
-use super::partition_view::{PartitionView, PartitionViewInputRecord};
+use super::partition_view::{PartitionView, PartitionViewInputRecord, PartitionViewLeaf};
 use super::shard_tree::ShardTree;
 use super::topology::PartitionTopology;
-use crate::api::bft::{ShardId, ShardTreeCertificate, UnicityCertificate};
-use crate::verify::SealAuthenticator;
+use crate::api::bft::{
+    ShardId, ShardTreeCertificate, UnicityCertificate, UnicitySeal, UnicityTreeCertificate,
+};
+use crate::api::NetworkId;
+use crate::crypto::hash::{DataHasher, HashAlgorithm};
+use crate::verify::{SealAuthenticator, SealSession};
 
 /// One shard's result of [`PartitionView::assemble_certificates`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +82,7 @@ impl PartitionView {
     /// match the view completely.
     ///
     /// The seal's signatures are **not** checked here; see
-    /// [`assemble_certificates`](Self::assemble_certificates).
+    /// [`authenticate`](Self::authenticate).
     pub fn verify_tree(
         &self,
         enclosing: &UnicityCertificate,
@@ -129,36 +133,135 @@ impl PartitionView {
         Ok(tree)
     }
 
-    /// Derive the ordinary version-1 unicity certificate of every shard, in
-    /// canonical order.
+    /// Authenticate this candidate view against an anchored authority.
     ///
-    /// Requires every step of [`verify_tree`](Self::verify_tree), an admitted
-    /// configuration hash for every shard in `topology`, and the seal of
-    /// `enclosing` to be authenticated by `authenticator`. The derived
-    /// certificates share the partition path and carry an identical copy of the
-    /// complete master seal, so an operation-scoped authenticator pays for its
-    /// quorum check once for all of them.
-    pub fn assemble_certificates(
+    /// The view is untrusted data until every step passed, in this order:
+    /// structure and canonical order (the topology is derived from the
+    /// candidate itself, or taken from `pins` when the caller pins one), tree
+    /// rebuild and partition path to the seal hash, exact match of the enclosing
+    /// certificate's own leaf, and finally the strict authentication of the
+    /// complete enclosing seal by `authority` (network, exact epoch, round at
+    /// least the epoch start, quorum signatures). The authority comes from the
+    /// caller's installed trust base, never from the response.
+    ///
+    /// `pins` is an optional, stricter policy: the scheme must equal the pinned
+    /// one and every pinned configuration hash must match. Pins are part of the
+    /// resulting view's [`identity`](AuthenticatedView::identity).
+    ///
+    /// Not enforced: the end boundary of the authority's epoch (needs
+    /// authenticated history, which a fixed-authority session does not have).
+    pub fn authenticate(
         &self,
         enclosing: &UnicityCertificate,
         partition: u32,
-        topology: &PartitionTopology,
-        authenticator: &mut impl SealAuthenticator,
-    ) -> Result<Vec<ShardCertificate>, PartitionViewError> {
-        for id in topology.canonical_order()? {
-            if topology.shard_conf_hash(&id).is_none() {
-                return Err(PartitionViewError::ConfigHashRequired);
+        pins: Option<&PartitionTopology>,
+        authority: &mut SealSession<'_>,
+    ) -> Result<AuthenticatedView, PartitionViewError> {
+        let candidate_topology;
+        let topology = match pins {
+            Some(pinned) => pinned,
+            None => {
+                self.check_bounds()?;
+                let ids: Vec<ShardId> = self.leaves.iter().map(|l| l.shard_id.clone()).collect();
+                candidate_topology =
+                    PartitionTopology::new(if ids.len() == 1 && ids[0].length() == 0 {
+                        Vec::new()
+                    } else {
+                        ids
+                    });
+                &candidate_topology
             }
-        }
+        };
         let tree = self.verify_tree(enclosing, partition, topology)?;
-        authenticator
+        authority
             .authenticate_seal(&enclosing.unicity_seal)
             .map_err(PartitionViewError::Seal)?;
 
+        let seal = enclosing.unicity_seal.clone();
+        let mut identity = DataHasher::new(HashAlgorithm::Sha256)
+            .expect("sha256")
+            .update(b"unicity-token/authenticated-view/v1")
+            .update(&authority.authority_identity())
+            .update(&partition.to_be_bytes())
+            .update(&pins.map_or([0u8; 32], PartitionTopology::digest))
+            .update(&[u8::from(pins.is_some())]);
+        let seal_bytes = seal.to_cbor();
+        identity = identity
+            .update(&(seal_bytes.len() as u64).to_be_bytes())
+            .update(&seal_bytes);
+        let mut id = [0u8; 32];
+        id.copy_from_slice(identity.finalize().data());
+        Ok(AuthenticatedView {
+            partition_id: self.partition_id,
+            leaves: self.leaves.clone(),
+            tree,
+            unicity_tree_certificate: enclosing.unicity_tree_certificate.clone(),
+            seal,
+            identity: id,
+        })
+    }
+}
+
+/// A partition view whose commitment to its seal and whose seal itself were
+/// authenticated. It can only be produced by [`PartitionView::authenticate`];
+/// it is immutable and is the only input of certificate assembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedView {
+    partition_id: u32,
+    leaves: Vec<PartitionViewLeaf>,
+    tree: ShardTree,
+    unicity_tree_certificate: UnicityTreeCertificate,
+    seal: UnicitySeal,
+    identity: [u8; 32],
+}
+
+impl AuthenticatedView {
+    /// The partition.
+    pub fn partition_id(&self) -> u32 {
+        self.partition_id
+    }
+
+    /// The authenticated leaves, in canonical shard order.
+    pub fn leaves(&self) -> &[PartitionViewLeaf] {
+        &self.leaves
+    }
+
+    /// The complete master seal, byte-for-byte as authenticated.
+    pub fn seal(&self) -> &UnicitySeal {
+        &self.seal
+    }
+
+    /// The network of the authenticated seal.
+    pub fn network_id(&self) -> NetworkId {
+        self.seal.network_id
+    }
+
+    /// The root epoch of the authenticated seal.
+    pub fn epoch(&self) -> u64 {
+        self.seal.epoch
+    }
+
+    /// The shard tree rebuilt from the leaves.
+    pub fn shard_tree(&self) -> &ShardTree {
+        &self.tree
+    }
+
+    /// Digest identifying this authentication: authority content, partition,
+    /// pinned policy (if any) and the complete seal. Use it as (part of) any
+    /// cache key for results derived from this view.
+    pub fn identity(&self) -> &[u8; 32] {
+        &self.identity
+    }
+
+    /// Derive every shard's tree path and, where the input record has a state
+    /// hash and summary value, its ordinary version-1 unicity certificate, in
+    /// canonical order. Each carries the identical master seal and partition
+    /// path, so one quorum authentication covers all of them.
+    pub fn certificates(&self) -> Result<Vec<ShardCertificate>, PartitionViewError> {
         self.leaves
             .iter()
             .map(|leaf| {
-                let shard_tree_certificate = tree.certificate(&leaf.shard_id)?;
+                let shard_tree_certificate = self.tree.certificate(&leaf.shard_id)?;
                 let certificate =
                     leaf.input_record
                         .to_input_record()
@@ -167,8 +270,8 @@ impl PartitionView {
                             technical_record_hash: Some(leaf.tr_hash.clone()),
                             shard_configuration_hash: leaf.shard_conf_hash.clone(),
                             shard_tree_certificate: shard_tree_certificate.clone(),
-                            unicity_tree_certificate: enclosing.unicity_tree_certificate.clone(),
-                            unicity_seal: enclosing.unicity_seal.clone(),
+                            unicity_tree_certificate: self.unicity_tree_certificate.clone(),
+                            unicity_seal: self.seal.clone(),
                         });
                 Ok(ShardCertificate {
                     shard_id: leaf.shard_id.clone(),
