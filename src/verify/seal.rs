@@ -293,9 +293,36 @@ pub(crate) fn check_seal_shape(seal: &UnicitySeal) -> Result<(), VerificationErr
     Ok(())
 }
 
+/// Signature work of one quorum check (the metric of its early exit).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct QuorumWork {
+    /// Signature encodings parsed.
+    pub decodes: u64,
+    /// ECDSA verifications executed.
+    pub verifications: u64,
+}
+
 /// The count of distinct, valid root-node signatures over the seal hash must
 /// reach the trust base threshold.
+///
+/// This is the one quorum implementation of the crate. It stops as soon as the
+/// threshold is reached: later signatures are neither decoded nor verified, which
+/// cannot change the verdict because the count only grows. Entries that do not
+/// count - a repeated node id, an unknown node, a key already counted, an
+/// undecodable or invalid signature - are skipped exactly as before.
 fn quorum_met(trust_base: &RootTrustBase, seal: &UnicitySeal) -> Result<(), VerificationError> {
+    quorum_met_counted(trust_base, seal, &mut QuorumWork::default())
+}
+
+pub(crate) fn quorum_met_counted(
+    trust_base: &RootTrustBase,
+    seal: &UnicitySeal,
+    work: &mut QuorumWork,
+) -> Result<(), VerificationError> {
+    let threshold = trust_base.quorum_threshold;
+    if threshold == 0 {
+        return Ok(());
+    }
     let seal_hash = seal.calculate_hash();
     let mut counted: BTreeSet<&str> = BTreeSet::new();
     let mut counted_keys = Vec::new();
@@ -309,17 +336,264 @@ fn quorum_met(trust_base: &RootTrustBase, seal: &UnicitySeal) -> Result<(), Veri
         if counted_keys.contains(&key) {
             continue;
         }
+        work.decodes += 1;
         let Ok(sig) = Signature::decode(signature) else {
             continue;
         };
+        work.verifications += 1;
         if sig.verify(seal_hash.data(), key) {
             counted.insert(node_id.as_str());
             counted_keys.push(key);
+            if counted.len() as u64 >= threshold {
+                return Ok(());
+            }
+        }
+    }
+    Err(VerificationError::QuorumNotMet)
+}
+
+#[cfg(all(test, feature = "client"))]
+mod tests {
+    use super::*;
+    use crate::api::bft::root_trust_base::RootTrustBaseNodeInfo;
+    use crate::api::NetworkId;
+    use crate::crypto::hash::{DataHash, HashAlgorithm};
+    use crate::crypto::signer::{Secp256k1Signer, Signer};
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
         }
     }
 
-    if (counted.len() as u64) < trust_base.quorum_threshold {
-        return Err(VerificationError::QuorumNotMet);
+    fn signers(n: usize) -> Vec<Secp256k1Signer> {
+        (0..n)
+            .map(|i| Secp256k1Signer::from_bytes(&[i as u8 + 1; 32]).unwrap())
+            .collect()
     }
-    Ok(())
+
+    fn trust_base(signers: &[Secp256k1Signer], threshold: u64) -> RootTrustBase {
+        RootTrustBase::new(
+            1,
+            NetworkId::LOCAL,
+            1,
+            1,
+            signers
+                .iter()
+                .enumerate()
+                .map(|(i, s)| RootTrustBaseNodeInfo {
+                    node_id: format!("n{i}"),
+                    signing_key: s.public_key(),
+                    stake: 1,
+                })
+                .collect(),
+            threshold,
+        )
+    }
+
+    fn seal_with(signatures: Vec<(String, Vec<u8>)>) -> UnicitySeal {
+        UnicitySeal {
+            network_id: NetworkId::LOCAL,
+            root_chain_round_number: 5,
+            epoch: 1,
+            timestamp: 1_731_504_000,
+            previous_hash: None,
+            hash: vec![7; 32],
+            signatures,
+        }
+    }
+
+    fn sign(signer: &Secp256k1Signer, seal: &UnicitySeal) -> Vec<u8> {
+        let digest: DataHash = seal.calculate_hash();
+        assert_eq!(digest.algorithm(), HashAlgorithm::Sha256);
+        signer.sign(&digest).encode().to_vec()
+    }
+
+    /// The previous implementation: scans every signature (the reference model).
+    fn reference(trust_base: &RootTrustBase, seal: &UnicitySeal) -> (bool, u64) {
+        let seal_hash = seal.calculate_hash();
+        let mut counted: BTreeSet<&str> = BTreeSet::new();
+        let mut keys = Vec::new();
+        let mut verifications = 0;
+        for (node_id, signature) in &seal.signatures {
+            if counted.contains(node_id.as_str()) {
+                continue;
+            }
+            let Some(key) = trust_base.signing_key(node_id) else {
+                continue;
+            };
+            if keys.contains(&key) {
+                continue;
+            }
+            let Ok(sig) = Signature::decode(signature) else {
+                continue;
+            };
+            verifications += 1;
+            if sig.verify(seal_hash.data(), key) {
+                counted.insert(node_id.as_str());
+                keys.push(key);
+            }
+        }
+        (
+            counted.len() as u64 >= trust_base.quorum_threshold,
+            verifications,
+        )
+    }
+
+    fn verdict(tb: &RootTrustBase, seal: &UnicitySeal) -> (bool, QuorumWork) {
+        let mut work = QuorumWork::default();
+        let ok = quorum_met_counted(tb, seal, &mut work).is_ok();
+        (ok, work)
+    }
+
+    #[test]
+    fn stops_at_the_threshold_whatever_the_number_of_valid_signatures() {
+        let threshold = 5u64;
+        for n in [5usize, 6, 8, 12, 20, 40] {
+            let signers = signers(n);
+            let tb = trust_base(&signers, threshold);
+            let mut seal = seal_with(Vec::new());
+            let sigs: Vec<_> = signers
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (format!("n{i}"), sign(s, &seal)))
+                .collect();
+            seal.signatures = sigs;
+            let (ok, work) = verdict(&tb, &seal);
+            assert!(ok);
+            assert_eq!(
+                work,
+                QuorumWork {
+                    decodes: threshold,
+                    verifications: threshold
+                },
+                "N={n}: exactly the threshold, no further decode/verify"
+            );
+            // the reference scanned them all
+            assert_eq!(reference(&tb, &seal), (true, n as u64));
+            // and the public check agrees
+            let mut session = SealSession::new(&tb);
+            session.verify_quorum(&seal).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_short_of_the_threshold_verifies_everything_and_fails() {
+        let signers = signers(9);
+        let tb = trust_base(&signers, 5);
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = signers
+            .iter()
+            .take(4)
+            .enumerate()
+            .map(|(i, s)| (format!("n{i}"), sign(s, &seal)))
+            .collect();
+        let (ok, work) = verdict(&tb, &seal);
+        assert!(!ok);
+        assert_eq!(work.verifications, 4);
+        assert_eq!(quorum_met(&tb, &seal), Err(VerificationError::QuorumNotMet));
+    }
+
+    /// Junk before, between and after valid signatures never changes the verdict.
+    #[test]
+    fn invalid_duplicate_and_unknown_signers_in_any_order_give_the_reference_result() {
+        let signers = signers(8);
+        let mut rng = Rng(99);
+        let outsider = Secp256k1Signer::from_bytes(&[0xee; 32]).unwrap();
+        for case in 0..300u64 {
+            let threshold = 1 + rng.next() % 6;
+            let mut tb = trust_base(&signers, threshold);
+            if case % 5 == 0 {
+                // two node ids with one key: the key counts once (unvalidated trust base)
+                tb.root_nodes[1].signing_key = tb.root_nodes[0].signing_key.clone();
+            }
+            let mut seal = seal_with(Vec::new());
+            let mut sigs: Vec<(String, Vec<u8>)> = Vec::new();
+            for _ in 0..(rng.next() % 14) {
+                let i = (rng.next() % 8) as usize;
+                let id = format!("n{i}");
+                let valid = sign(&signers[i], &seal);
+                let entry = match rng.next() % 6 {
+                    0..=2 => (id, valid),
+                    3 => {
+                        let mut bad = valid;
+                        bad[(rng.next() % 64) as usize] ^= 1; // invalid (or non-canonical)
+                        (id, bad)
+                    }
+                    4 => (id, vec![1, 2, 3]), // undecodable
+                    _ => ("stranger".into(), sign(&outsider, &seal)), // unknown node
+                };
+                sigs.push(entry);
+                if rng.next() % 5 == 0 {
+                    sigs.push(sigs[sigs.len() - 1].clone()); // the same node twice
+                }
+            }
+            seal.signatures = sigs;
+            let (ok, work) = verdict(&tb, &seal);
+            let (ref_ok, ref_verifications) = reference(&tb, &seal);
+            assert_eq!(ok, ref_ok, "case {case}");
+            assert!(work.verifications <= ref_verifications, "case {case}");
+            assert!(work.decodes >= work.verifications);
+            if !ok {
+                // an unreachable quorum scans everything, like before
+                assert_eq!(work.verifications, ref_verifications, "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_entries_before_valid_ones_are_skipped_then_it_stops() {
+        let signers = signers(6);
+        let tb = trust_base(&signers, 3);
+        let mut seal = seal_with(Vec::new());
+        let good = |i: usize, seal: &UnicitySeal| (format!("n{i}"), sign(&signers[i], seal));
+        let mut bad = good(0, &seal);
+        bad.1[9] ^= 1;
+        seal.signatures = vec![
+            ("ghost".into(), vec![0; 65]), // unknown: not even decoded
+            ("n0".into(), vec![1, 2]),     // undecodable: decoded, not verified
+            bad,                           // verified, invalid
+            good(1, &seal),                // valid 1
+            good(1, &seal),                // the same node again: skipped
+            good(2, &seal),                // valid 2
+            good(0, &seal),                // valid 3 -> stop
+            good(3, &seal),                // never looked at
+            ("n4".into(), vec![9]),        // never looked at
+        ];
+        let (ok, work) = verdict(&tb, &seal);
+        assert!(ok);
+        // n0(undecodable) + n0(bad) + n1 + n2 + n0(valid)
+        assert_eq!(work.decodes, 5);
+        assert_eq!(work.verifications, 4);
+        assert!(reference(&tb, &seal).0);
+    }
+
+    #[test]
+    fn one_key_under_two_node_ids_counts_once() {
+        let signers = signers(3);
+        let mut tb = trust_base(&signers, 2);
+        tb.root_nodes[1].signing_key = tb.root_nodes[0].signing_key.clone();
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = vec![
+            ("n0".into(), sign(&signers[0], &seal)),
+            ("n1".into(), sign(&signers[0], &seal)), // same key, other node id
+        ];
+        let (ok, work) = verdict(&tb, &seal);
+        assert!(!ok);
+        assert_eq!(
+            work.verifications, 1,
+            "the second entry is skipped before any decode"
+        );
+        seal.signatures
+            .push(("n2".into(), sign(&signers[2], &seal)));
+        assert!(verdict(&tb, &seal).0);
+    }
 }
