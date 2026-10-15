@@ -63,11 +63,6 @@ pub trait SealAuthenticator {
         let _ = policy;
         self.authenticate_seal(seal)
     }
-
-    /// Content identity of the authority, `[0; 32]` when not available.
-    fn authority_identity(&self) -> [u8; 32] {
-        [0; 32]
-    }
 }
 
 /// One operation's seal authentication state: an authority and a bounded memo.
@@ -201,10 +196,6 @@ impl SealAuthenticator for SealSession<'_> {
     /// not predate the epoch, then pass the (memoized) quorum check.
     fn authenticate_seal(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
         self.authenticate_seal_under(seal, &[0; 32])
-    }
-
-    fn authority_identity(&self) -> [u8; 32] {
-        SealSession::authority_identity(self)
     }
 
     fn authenticate_seal_under(

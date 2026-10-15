@@ -1120,3 +1120,48 @@ fn strict_memo_is_separated_by_policy() {
         "different pins are another policy"
     );
 }
+
+/// A custom authenticator has no authority identity, so it can drive the
+/// compatibility assembly (no view is exposed) but not `authenticate`, whose
+/// views carry an authority-bound identity (`authenticate` takes a
+/// `SealSession`). Two sessions of different authorities yield different views.
+#[test]
+fn custom_authenticators_cannot_mint_identified_views() {
+    struct Delegating<'a>(SealSession<'a>);
+    impl SealAuthenticator for Delegating<'_> {
+        fn authenticate_seal(
+            &mut self,
+            seal: &unicity_token::api::bft::UnicitySeal,
+        ) -> Result<(), VerificationError> {
+            self.0.authenticate_seal(seal)
+        }
+    }
+    let c = case(4);
+    let mut custom = Delegating(SealSession::new(&c.trust_base));
+    let ucs = c
+        .view
+        .assemble_certificates(&c.uc, c.partition, &c.topology, &mut custom)
+        .unwrap();
+    assert_eq!(ucs.len(), 4);
+
+    let mut other = c.trust_base.clone();
+    other.root_nodes.push(RootTrustBaseNodeInfo {
+        node_id: "unused".into(),
+        signing_key: PublicKey::from_bytes(
+            &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        )
+        .unwrap(),
+        stake: 1,
+    });
+    let (mut s1, mut s2) = (SealSession::new(&c.trust_base), SealSession::new(&other));
+    let v1 = c
+        .view
+        .authenticate(&c.uc, c.partition, None, &mut s1)
+        .unwrap();
+    let v2 = c
+        .view
+        .authenticate(&c.uc, c.partition, None, &mut s2)
+        .unwrap();
+    assert_ne!(v1.identity(), v2.identity(), "authority separation");
+}

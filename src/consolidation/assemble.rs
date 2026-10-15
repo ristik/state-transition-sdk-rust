@@ -11,7 +11,7 @@ use crate::api::bft::{
 };
 use crate::api::NetworkId;
 use crate::crypto::hash::{DataHasher, HashAlgorithm};
-use crate::verify::SealAuthenticator;
+use crate::verify::{SealAuthenticator, SealSession};
 
 /// One shard's result of [`PartitionView::assemble_certificates`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +150,8 @@ impl PartitionView {
                 return Err(PartitionViewError::ConfigHashRequired);
             }
         }
-        self.authenticate(enclosing, partition, Some(topology), authenticator)?
+        // the view never leaves this function, so no authority identity is needed
+        self.authenticate_with(enclosing, partition, Some(topology), authenticator, [0; 32])?
             .certificates()
     }
 
@@ -176,7 +177,22 @@ impl PartitionView {
         enclosing: &UnicityCertificate,
         partition: u32,
         pins: Option<&PartitionTopology>,
+        authority: &mut SealSession<'_>,
+    ) -> Result<AuthenticatedView, PartitionViewError> {
+        let authority_identity = authority.authority_identity();
+        self.authenticate_with(enclosing, partition, pins, authority, authority_identity)
+    }
+
+    /// The shared procedure. `authority_identity` is bound into the view's
+    /// identity; only the public [`authenticate`](Self::authenticate), which
+    /// knows its session's authority, may expose the resulting view.
+    fn authenticate_with(
+        &self,
+        enclosing: &UnicityCertificate,
+        partition: u32,
+        pins: Option<&PartitionTopology>,
         authority: &mut impl SealAuthenticator,
+        authority_identity: [u8; 32],
     ) -> Result<AuthenticatedView, PartitionViewError> {
         let candidate_topology;
         let topology = match pins {
@@ -215,7 +231,7 @@ impl PartitionView {
         let mut identity = DataHasher::new(HashAlgorithm::Sha256)
             .expect("sha256")
             .update(b"unicity-token/authenticated-view/v1")
-            .update(&authority.authority_identity())
+            .update(&authority_identity)
             .update(&partition.to_be_bytes())
             .update(&pins.map_or([0u8; 32], PartitionTopology::digest))
             .update(&[u8::from(pins.is_some())]);
