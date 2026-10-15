@@ -11,7 +11,7 @@ use crate::api::bft::{
 };
 use crate::api::NetworkId;
 use crate::crypto::hash::{DataHasher, HashAlgorithm};
-use crate::verify::{SealAuthenticator, SealSession};
+use crate::verify::SealAuthenticator;
 
 /// One shard's result of [`PartitionView::assemble_certificates`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +133,27 @@ impl PartitionView {
         Ok(tree)
     }
 
+    /// Derive the ordinary certificate of every shard from an authenticated
+    /// view. Compatibility entry point: it requires an admitted configuration
+    /// hash for every shard in `topology` (complete pins), authenticates the
+    /// view with [`authenticate`](Self::authenticate) and delegates to
+    /// [`AuthenticatedView::certificates`].
+    pub fn assemble_certificates(
+        &self,
+        enclosing: &UnicityCertificate,
+        partition: u32,
+        topology: &PartitionTopology,
+        authenticator: &mut impl SealAuthenticator,
+    ) -> Result<Vec<ShardCertificate>, PartitionViewError> {
+        for id in topology.canonical_order()? {
+            if topology.shard_conf_hash(&id).is_none() {
+                return Err(PartitionViewError::ConfigHashRequired);
+            }
+        }
+        self.authenticate(enclosing, partition, Some(topology), authenticator)?
+            .certificates()
+    }
+
     /// Authenticate this candidate view against an anchored authority.
     ///
     /// The view is untrusted data until every step passed, in this order:
@@ -155,7 +176,7 @@ impl PartitionView {
         enclosing: &UnicityCertificate,
         partition: u32,
         pins: Option<&PartitionTopology>,
-        authority: &mut SealSession<'_>,
+        authority: &mut impl SealAuthenticator,
     ) -> Result<AuthenticatedView, PartitionViewError> {
         let candidate_topology;
         let topology = match pins {
@@ -173,8 +194,21 @@ impl PartitionView {
             }
         };
         let tree = self.verify_tree(enclosing, partition, topology)?;
+        // the policy this authentication is for namespaces the authority's memo
+        let policy: [u8; 32] = {
+            let d = DataHasher::new(HashAlgorithm::Sha256)
+                .expect("sha256")
+                .update(b"unicity-token/view-policy/v1")
+                .update(&partition.to_be_bytes())
+                .update(&[u8::from(pins.is_some())])
+                .update(&pins.map_or([0u8; 32], PartitionTopology::digest))
+                .finalize();
+            let mut p = [0u8; 32];
+            p.copy_from_slice(d.data());
+            p
+        };
         authority
-            .authenticate_seal(&enclosing.unicity_seal)
+            .authenticate_seal_under(&enclosing.unicity_seal, &policy)
             .map_err(PartitionViewError::Seal)?;
 
         let seal = enclosing.unicity_seal.clone();

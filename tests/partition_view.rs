@@ -469,16 +469,18 @@ fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
         // all derived certificates share the master seal: one quorum check suffices
         let stats = session.stats();
         assert_eq!(stats.quorum_checks, 1, "{n} shards");
+        // plain (policy-less) authentication is its own namespace: one more check,
+        // then every shared copy of the master seal is a hit
         for sc in &ucs {
             let uc = sc.certificate.as_ref().unwrap();
             session.authenticate_seal(&uc.unicity_seal).unwrap();
         }
         assert_eq!(
             session.stats().quorum_checks,
-            1,
-            "{n} shards: shared seal is not re-verified"
+            2,
+            "{n} shards: shared seal is verified once per policy"
         );
-        assert_eq!(session.stats().memo_hits, n as u64);
+        assert_eq!(session.stats().memo_hits, n as u64 - 1);
     }
 }
 
@@ -1047,4 +1049,74 @@ fn pins_are_a_stricter_policy() {
         Err(PartitionViewError::LeafSetMismatch(_))
     ));
     assert!(go(&PartitionTopology::single_shard()).is_err());
+}
+
+// ------------------------------------------------ review of #22 ------------
+
+/// Downstream compile/behaviour regression for the pre-1b entry point
+/// (signature and error variant of the merged R1 API).
+#[test]
+fn pinned_assembly_api_is_preserved() {
+    let c = case(4);
+    let mut s = SealSession::new(&c.trust_base);
+    let ucs: Vec<ShardCertificate> = c
+        .view
+        .assemble_certificates(&c.uc, c.partition, &c.topology, &mut s)
+        .unwrap();
+    for (sc, expected) in ucs.iter().zip(&c.expected_ucs) {
+        assert_eq!(&sc.certificate.as_ref().unwrap().to_cbor(), expected);
+    }
+    // complete pins are required on this path
+    let partial = PartitionTopology::new(c.topology.canonical_order().unwrap());
+    let mut s = SealSession::new(&c.trust_base);
+    let err = c
+        .view
+        .assemble_certificates(&c.uc, c.partition, &partial, &mut s)
+        .unwrap_err();
+    assert!(matches!(err, PartitionViewError::ConfigHashRequired));
+    assert_eq!(s.stats().quorum_checks, 0);
+    // and it still authenticates: a bad seal is refused
+    let mut bad = c.uc.clone();
+    bad.unicity_seal.signatures[0].1[5] ^= 1;
+    let mut s = SealSession::new(&c.trust_base);
+    assert_eq!(
+        c.view
+            .assemble_certificates(&bad, c.partition, &c.topology, &mut s),
+        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
+    );
+}
+
+/// The memo is namespaced by the pin/partition policy of the authentication.
+#[test]
+fn strict_memo_is_separated_by_policy() {
+    let c = case(4);
+    let mut s = SealSession::new(&c.trust_base);
+    let auth = |s: &mut SealSession<'_>, pins: Option<&PartitionTopology>| {
+        c.view.authenticate(&c.uc, c.partition, pins, s).unwrap();
+    };
+    auth(&mut s, None);
+    assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (1, 0));
+    auth(&mut s, None);
+    assert_eq!(
+        (s.stats().quorum_checks, s.stats().memo_hits),
+        (1, 1),
+        "same policy reuses"
+    );
+    auth(&mut s, Some(&c.topology));
+    assert_eq!(
+        (s.stats().quorum_checks, s.stats().memo_hits),
+        (2, 1),
+        "pinned is another policy"
+    );
+    auth(&mut s, Some(&c.topology));
+    assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (2, 2));
+    let order = c.topology.canonical_order().unwrap();
+    let partial = PartitionTopology::new(order.clone())
+        .with_shard_conf_hash(&order[0], *c.topology.shard_conf_hash(&order[0]).unwrap());
+    auth(&mut s, Some(&partial));
+    assert_eq!(
+        s.stats().quorum_checks,
+        3,
+        "different pins are another policy"
+    );
 }

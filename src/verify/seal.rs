@@ -49,6 +49,25 @@ pub trait SealAuthenticator {
     /// Succeeds only for a seal authenticated by the verifier's authority:
     /// network, epoch, position and quorum signatures.
     fn authenticate_seal(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError>;
+
+    /// [`authenticate_seal`](Self::authenticate_seal) under an immutable caller
+    /// policy (for example the partition and pinned configuration hashes a view
+    /// is authenticated for). An authenticator that remembers verdicts must
+    /// namespace them by `policy`; the default ignores it, which is only right
+    /// for authenticators that do not memoize.
+    fn authenticate_seal_under(
+        &mut self,
+        seal: &UnicitySeal,
+        policy: &[u8; 32],
+    ) -> Result<(), VerificationError> {
+        let _ = policy;
+        self.authenticate_seal(seal)
+    }
+
+    /// Content identity of the authority, `[0; 32]` when not available.
+    fn authority_identity(&self) -> [u8; 32] {
+        [0; 32]
+    }
 }
 
 /// One operation's seal authentication state: an authority and a bounded memo.
@@ -125,11 +144,12 @@ impl<'a> SealSession<'a> {
         id
     }
 
-    fn key(seal: &UnicitySeal) -> [u8; 32] {
+    fn key(seal: &UnicitySeal, policy: &[u8; 32]) -> [u8; 32] {
         let encoded = seal.to_cbor();
         let digest = DataHasher::new(HashAlgorithm::Sha256)
             .expect("sha256")
             .update(MEMO_DOMAIN)
+            .update(policy)
             .update(&(encoded.len() as u64).to_be_bytes())
             .update(&encoded)
             .finalize();
@@ -144,10 +164,21 @@ impl<'a> SealSession<'a> {
     /// This is only the signature part; callers check network, unicity-tree
     /// root and everything else themselves.
     pub fn verify_quorum(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
+        self.verify_quorum_under(seal, &[0; 32])
+    }
+
+    /// [`verify_quorum`](Self::verify_quorum) with the memo namespaced by an
+    /// immutable policy digest: a verdict reached under one policy is never
+    /// reused under another.
+    pub fn verify_quorum_under(
+        &mut self,
+        seal: &UnicitySeal,
+        policy: &[u8; 32],
+    ) -> Result<(), VerificationError> {
         // an unsafe authority (no validators, zero threshold, ...) never yields
         // or caches a success
         self.ensure_trust_base()?;
-        let key = Self::key(seal);
+        let key = Self::key(seal, policy);
         if self.memo.contains(&key) {
             self.stats.memo_hits += 1;
             return Ok(());
@@ -169,6 +200,18 @@ impl SealAuthenticator for SealSession<'_> {
     /// certificates: the seal must be of the trust base's network and epoch and
     /// not predate the epoch, then pass the (memoized) quorum check.
     fn authenticate_seal(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
+        self.authenticate_seal_under(seal, &[0; 32])
+    }
+
+    fn authority_identity(&self) -> [u8; 32] {
+        SealSession::authority_identity(self)
+    }
+
+    fn authenticate_seal_under(
+        &mut self,
+        seal: &UnicitySeal,
+        policy: &[u8; 32],
+    ) -> Result<(), VerificationError> {
         self.ensure_trust_base()?;
         // the quorum rule implemented here counts signers; a stake-weighted
         // authority would be judged by another rule, so refuse it explicitly,
@@ -187,7 +230,7 @@ impl SealAuthenticator for SealSession<'_> {
         if seal.root_chain_round_number < tb.epoch_start_round {
             return Err(VerificationError::SealBeforeEpochStart);
         }
-        self.verify_quorum(seal)
+        self.verify_quorum_under(seal, policy)
     }
 }
 
