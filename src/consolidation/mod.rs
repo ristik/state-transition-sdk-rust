@@ -24,6 +24,7 @@ mod partition_view;
 mod shard_tree;
 mod topology;
 
+pub use assemble::ShardCertificate;
 pub use error::PartitionViewError;
 pub use partition_view::{
     PartitionView, PartitionViewInputRecord, PartitionViewLeaf, MAX_PARTITION_VIEW_BYTES,

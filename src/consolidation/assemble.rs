@@ -6,8 +6,23 @@ use super::error::PartitionViewError;
 use super::partition_view::{PartitionView, PartitionViewInputRecord};
 use super::shard_tree::ShardTree;
 use super::topology::PartitionTopology;
-use crate::api::bft::UnicityCertificate;
+use crate::api::bft::{ShardId, ShardTreeCertificate, UnicityCertificate};
 use crate::verify::SealAuthenticator;
+
+/// One shard's result of [`PartitionView::assemble_certificates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardCertificate {
+    /// The shard.
+    pub shard_id: ShardId,
+    /// The shard's native tree path, available for every shard.
+    pub shard_tree_certificate: ShardTreeCertificate,
+    /// The ordinary unicity certificate; `None` when the shard's input record
+    /// has no state hash or summary value (a shard that never certified a state,
+    /// as the producer emits for non-participating shards). Such a record can
+    /// not be an [`InputRecord`](crate::api::bft::InputRecord), and the shard can
+    /// not hold token proofs; its leaf is still bound to the seal.
+    pub certificate: Option<UnicityCertificate>,
+}
 
 impl PartitionView {
     /// Check that this is a well-formed view of `partition` with exactly the
@@ -129,7 +144,7 @@ impl PartitionView {
         partition: u32,
         topology: &PartitionTopology,
         authenticator: &mut impl SealAuthenticator,
-    ) -> Result<Vec<UnicityCertificate>, PartitionViewError> {
+    ) -> Result<Vec<ShardCertificate>, PartitionViewError> {
         for id in topology.canonical_order()? {
             if topology.shard_conf_hash(&id).is_none() {
                 return Err(PartitionViewError::ConfigHashRequired);
@@ -143,16 +158,22 @@ impl PartitionView {
         self.leaves
             .iter()
             .map(|leaf| {
-                Ok(UnicityCertificate {
-                    input_record: leaf
-                        .input_record
+                let shard_tree_certificate = tree.certificate(&leaf.shard_id)?;
+                let certificate =
+                    leaf.input_record
                         .to_input_record()
-                        .ok_or(PartitionViewError::UnrepresentableInputRecord)?,
-                    technical_record_hash: Some(leaf.tr_hash.clone()),
-                    shard_configuration_hash: leaf.shard_conf_hash.clone(),
-                    shard_tree_certificate: tree.certificate(&leaf.shard_id)?,
-                    unicity_tree_certificate: enclosing.unicity_tree_certificate.clone(),
-                    unicity_seal: enclosing.unicity_seal.clone(),
+                        .map(|input_record| UnicityCertificate {
+                            input_record,
+                            technical_record_hash: Some(leaf.tr_hash.clone()),
+                            shard_configuration_hash: leaf.shard_conf_hash.clone(),
+                            shard_tree_certificate: shard_tree_certificate.clone(),
+                            unicity_tree_certificate: enclosing.unicity_tree_certificate.clone(),
+                            unicity_seal: enclosing.unicity_seal.clone(),
+                        });
+                Ok(ShardCertificate {
+                    shard_id: leaf.shard_id.clone(),
+                    shard_tree_certificate,
+                    certificate,
                 })
             })
             .collect()

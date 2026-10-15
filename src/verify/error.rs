@@ -82,6 +82,9 @@ pub enum VerificationError {
     ShardMismatch,
     /// The unicity seal's network id does not match the trust base.
     SealNetworkMismatch,
+    /// The authority uses a configuration this verifier can not judge (stake
+    /// weights other than one); not a statement about any signature.
+    UnsupportedAuthority,
     /// The unicity seal's epoch is not the epoch of the authority's trust base.
     SealEpochMismatch,
     /// The unicity seal predates the start of the trust base's epoch.
@@ -212,6 +215,9 @@ impl fmt::Display for VerificationError {
             VerificationError::ShardMismatch => write!(f, "shard does not contain state id"),
             VerificationError::SealNetworkMismatch => {
                 write!(f, "unicity seal network does not match trust base")
+            }
+            VerificationError::UnsupportedAuthority => {
+                write!(f, "unsupported authority configuration (non-unit stake)")
             }
             VerificationError::SealEpochMismatch => {
                 write!(f, "unicity seal epoch does not match trust base")

@@ -118,6 +118,9 @@ impl<'a> SealSession<'a> {
     /// This is only the signature part; callers check network, unicity-tree
     /// root and everything else themselves.
     pub fn verify_quorum(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
+        // an unsafe authority (no validators, zero threshold, ...) never yields
+        // or caches a success
+        self.ensure_trust_base()?;
         let key = Self::key(seal);
         if self.memo.contains(&key) {
             self.stats.memo_hits += 1;
@@ -141,6 +144,12 @@ impl SealAuthenticator for SealSession<'_> {
     /// not predate the epoch, then pass the (memoized) quorum check.
     fn authenticate_seal(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
         self.ensure_trust_base()?;
+        // the quorum rule implemented here counts signers; a stake-weighted
+        // authority would be judged by another rule, so refuse it explicitly,
+        // before any memo lookup or signature work
+        if self.trust_base.root_nodes.iter().any(|n| n.stake != 1) {
+            return Err(VerificationError::UnsupportedAuthority);
+        }
         check_seal_shape(seal)?;
         let tb = self.trust_base;
         if seal.network_id != tb.network_id {

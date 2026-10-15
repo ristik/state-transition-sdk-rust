@@ -440,7 +440,9 @@ fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
             .assemble_certificates(&c.uc, c.partition, &c.topology, &mut session)
             .unwrap_or_else(|e| panic!("{n} shards: {e}"));
         assert_eq!(ucs.len(), n);
-        for (i, (uc, expected)) in ucs.iter().zip(&c.expected_ucs).enumerate() {
+        for (i, (sc, expected)) in ucs.iter().zip(&c.expected_ucs).enumerate() {
+            let uc = sc.certificate.as_ref().expect("representable record");
+            assert_eq!(sc.shard_tree_certificate, uc.shard_tree_certificate);
             assert_eq!(
                 uc.to_cbor(),
                 *expected,
@@ -458,7 +460,8 @@ fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
         // all derived certificates share the master seal: one quorum check suffices
         let stats = session.stats();
         assert_eq!(stats.quorum_checks, 1, "{n} shards");
-        for uc in &ucs {
+        for sc in &ucs {
+            let uc = sc.certificate.as_ref().unwrap();
             session.authenticate_seal(&uc.unicity_seal).unwrap();
         }
         assert_eq!(
@@ -773,11 +776,133 @@ fn memo_is_bounded_and_can_be_disabled() {
 }
 
 #[test]
-fn unrepresentable_input_records_still_hash_but_do_not_assemble() {
+fn unrepresentable_input_records_still_hash_but_have_no_ordinary_certificate() {
     // a leaf whose summary value is null hashes into the tree exactly, but no
-    // ordinary certificate can carry it
+    // ordinary certificate can carry it (assembly yields `certificate: None`)
     let view = minimal_view();
     let topo = PartitionTopology::single_shard().with_shard_conf_hash(&ShardId::root(), [2; 32]);
     assert!(view.build_shard_tree(1, &topo).is_ok());
     assert!(view.leaves[0].input_record.to_input_record().is_none());
+}
+
+fn node(id: &str, key: &str, stake: u64) -> RootTrustBaseNodeInfo {
+    RootTrustBaseNodeInfo {
+        node_id: id.into(),
+        signing_key: PublicKey::from_bytes(&hex::decode(key).unwrap()).unwrap(),
+        stake,
+    }
+}
+
+/// The public session entry points refuse an unsafe authority and never cache
+/// a verdict obtained under one.
+#[test]
+fn invalid_authorities_never_succeed_or_enter_the_memo() {
+    let c = case(1);
+    let seal = c.uc.unicity_seal.clone();
+    let mut unsigned = seal.clone();
+    unsigned.signatures.clear();
+
+    let mut bad: Vec<(&str, RootTrustBase)> = Vec::new();
+    let mut empty = c.trust_base.clone();
+    empty.root_nodes.clear();
+    empty.quorum_threshold = 0;
+    bad.push(("no validators, zero threshold", empty));
+    let mut zero_threshold = c.trust_base.clone();
+    zero_threshold.quorum_threshold = 0;
+    bad.push(("zero threshold", zero_threshold));
+    let mut zero_stake = c.trust_base.clone();
+    zero_stake.root_nodes[0].stake = 0;
+    bad.push(("zero stake", zero_stake));
+    let mut dup = c.trust_base.clone();
+    dup.root_nodes.push(dup.root_nodes[0].clone());
+    bad.push(("duplicate validator", dup));
+
+    for (name, tb) in &bad {
+        assert!(tb.validate().is_err(), "{name}");
+        let mut s = SealSession::new(tb);
+        for seal in [&unsigned, &seal] {
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        s.verify_quorum(seal),
+                        Err(VerificationError::InvalidTrustBase(_))
+                    ),
+                    "{name}"
+                );
+                assert!(
+                    matches!(
+                        s.authenticate_seal(seal),
+                        Err(VerificationError::InvalidTrustBase(_))
+                    ),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(
+            (s.stats().quorum_checks, s.stats().memo_hits),
+            (0, 0),
+            "{name}"
+        );
+    }
+}
+
+/// Stake-weighted authorities are refused by the strict policy as an
+/// unsupported configuration (the Rust quorum rule counts signers), not
+/// misreported as a signature failure. The reference accepts this very seal:
+/// stakes [2,1,1], threshold 3, signed by the first two validators.
+#[test]
+fn weighted_authority_is_unsupported_not_a_bad_signature() {
+    let json = include_str!(
+        "vectors/uc-consolidation/partition-view/v1/derived/weighted-4/trust-base.json"
+    );
+    let keys: Vec<String> = json
+        .match_indices("\"sigKey\": \"")
+        .map(|(i, m)| json[i + m.len()..].trim_start_matches("0x")[..66].to_string())
+        .collect();
+    assert_eq!(keys.len(), 3);
+    let stakes = [2, 1, 1];
+    let nodes: Vec<_> = keys
+        .iter()
+        .zip(stakes)
+        .enumerate()
+        .map(|(i, (k, s))| node(&format!("n{i}"), k, s))
+        .collect();
+    let tb = RootTrustBase::try_new(1, NetworkId::MAINNET, 1, 0, nodes, 3).unwrap();
+    let uc = UnicityCertificate::from_cbor(Decoder::new(vector!(
+        "derived/weighted-4/enclosing-uc.cbor"
+    )))
+    .unwrap();
+    assert_eq!(uc.unicity_seal.signatures.len(), 2);
+
+    let c = case(4);
+    let mut s = SealSession::new(&tb);
+    assert_eq!(
+        s.authenticate_seal(&uc.unicity_seal),
+        Err(VerificationError::UnsupportedAuthority)
+    );
+    assert_eq!(
+        c.view
+            .assemble_certificates(&uc, c.partition, &c.topology, &mut s),
+        Err(PartitionViewError::Seal(
+            VerificationError::UnsupportedAuthority
+        ))
+    );
+    assert_eq!(
+        (s.stats().quorum_checks, s.stats().memo_hits),
+        (0, 0),
+        "no signature work, nothing cached"
+    );
+
+    // with unit stakes the same keys judge signatures: a bad witness is a quorum failure
+    let unit: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| node(&format!("n{i}"), k, 1))
+        .collect();
+    let tb = RootTrustBase::try_new(1, NetworkId::MAINNET, 1, 0, unit, 3).unwrap();
+    let mut s = SealSession::new(&tb);
+    assert_eq!(
+        s.authenticate_seal(&uc.unicity_seal),
+        Err(VerificationError::QuorumNotMet)
+    );
 }

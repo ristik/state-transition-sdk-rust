@@ -41,9 +41,6 @@ pub enum PartitionViewError {
     TreeRootMismatch,
     /// The enclosing certificate is inconsistent with the view.
     EnclosingCertificate(&'static str),
-    /// A leaf's input record cannot be represented as an ordinary unicity
-    /// certificate input record (absent state hash or summary value).
-    UnrepresentableInputRecord,
     /// The master seal was not authenticated by the trusted authority.
     Seal(VerificationError),
 }
@@ -98,9 +95,6 @@ impl fmt::Display for PartitionViewError {
             }
             PartitionViewError::EnclosingCertificate(m) => {
                 write!(f, "enclosing unicity certificate: {m}")
-            }
-            PartitionViewError::UnrepresentableInputRecord => {
-                write!(f, "input record has no state hash or summary value")
             }
             PartitionViewError::Seal(e) => write!(f, "unicity seal not authenticated: {e}"),
         }

@@ -109,3 +109,60 @@ func Test_GenRustVectors(t *testing.T) {
 		write(filepath.Join(out, "context.json"), cj)
 	}
 }
+
+// Test_GenRustVectorsWeighted: stake-weighted authority [2,1,1], threshold 3,
+// signed by the first two validators. The reference accepts it; it is the
+// cross-language case for "unsupported weighted authority" in the Rust SDK.
+func Test_GenRustVectorsWeighted(t *testing.T) {
+	dir := os.Getenv("GEN_RUST_VECTORS_DIR")
+	if dir == "" {
+		t.Skip("GEN_RUST_VECTORS_DIR not set")
+	}
+	var signers []abcrypto.Signer
+	var nodes []*NodeInfo
+	for i, stake := range []uint64{2, 1, 1} {
+		s, err := abcrypto.NewInMemorySecp256K1SignerFromKey(bytes.Repeat([]byte{byte(0x21 + i)}, 32))
+		require.NoError(t, err)
+		v, err := s.Verifier()
+		require.NoError(t, err)
+		pub, err := v.MarshalPublicKey()
+		require.NoError(t, err)
+		signers = append(signers, s)
+		nodes = append(nodes, &NodeInfo{NodeID: fmt.Sprintf("n%d", i), SigKey: pub, Stake: stake})
+	}
+	tb, err := NewTrustBase(NetworkMainNet, nodes, WithQuorumThreshold(3))
+	require.NoError(t, err)
+
+	scheme := pvScheme(2)
+	topo := pvTopology(scheme)
+	view := pvView(t, scheme)
+	tree, err := CreateShardTree(topo.Scheme, view.treeInputs(), crypto.SHA256)
+	require.NoError(t, err)
+	ut, err := NewUnicityTree(crypto.SHA256, []*UnicityTreeData{
+		{Partition: pvTestPartition, ShardTreeRoot: tree.RootHash()},
+		{Partition: 0x01010101, ShardTreeRoot: pvHash("other partition")},
+	})
+	require.NoError(t, err)
+	utc, err := ut.Certificate(pvTestPartition)
+	require.NoError(t, err)
+	seal := &UnicitySeal{Version: 1, NetworkID: tb.GetNetworkID(), Epoch: tb.GetEpoch(),
+		RootChainRoundNumber: tb.GetEpochStart() + 77, Timestamp: 1731504600,
+		PreviousHash: pvHash("prev root"), Hash: ut.RootHash()}
+	require.NoError(t, seal.Sign("n0", signers[0]))
+	require.NoError(t, seal.Sign("n1", signers[1]))
+	require.NoError(t, TrustBaseSealVerifier(tb).VerifySeal(seal), "reference accepts stakes 2+1 >= 3")
+
+	l := view.Leaves[0]
+	stc, err := tree.Certificate(l.ShardID)
+	require.NoError(t, err)
+	uc := &UnicityCertificate{Version: 1, InputRecord: l.InputRecord, TRHash: l.TRHash, ShardConfHash: l.ShardConfHash,
+		ShardTreeCertificate: stc, UnicityTreeCertificate: utc, UnicitySeal: seal}
+	ucBytes, err := uc.MarshalCBOR()
+	require.NoError(t, err)
+	tbJSON, err := json.MarshalIndent(tb, "", "  ")
+	require.NoError(t, err)
+	out := filepath.Join(dir, "weighted-4")
+	require.NoError(t, os.MkdirAll(out, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(out, "enclosing-uc.cbor"), ucBytes, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(out, "trust-base.json"), tbJSON, 0o644))
+}
