@@ -9,6 +9,7 @@
 //! (so the [`mint`](super::mint)/[`transfer`](super::transfer) helpers work
 //! unchanged against live infrastructure).
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
@@ -26,7 +27,7 @@ use crate::cbor::Decoder;
 use super::{
     rpc_code, AggregatorClient, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
     InclusionProofBatch, MembershipStatus, NonInclusionAggregatorClient, RequestOptions, StateRoot,
-    MAX_BATCH_STATE_IDS,
+    MAX_BATCH_STATE_IDS, UNCLASSIFIED,
 };
 use crate::consolidation::PartitionView;
 
@@ -662,7 +663,7 @@ impl BatchAggregatorClient for HttpAggregatorClient {
                 reason: Some("invalid_request".to_string()),
                 detail: Some("state_count".to_string()),
                 retryable: Some(false),
-                indexes: Vec::new(),
+                indexes: BTreeMap::new(),
             });
         }
         let state_root = match request.state_root {
@@ -717,15 +718,31 @@ fn batch_failure(failure: RawFailure) -> BatchFailure {
                 indexes: data
                     .as_ref()
                     .and_then(|d| d.get("indexes"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()))
-                            .collect()
-                    })
+                    .map(parse_indexes)
                     .unwrap_or_default(),
             }
         }
+    }
+}
+
+/// `data.indexes`: an object of per-class arrays (the contract), tolerating a bare
+/// array as one unclassified entry; anything else is ignored.
+fn parse_indexes(value: &serde_json::Value) -> BTreeMap<String, Vec<usize>> {
+    let list = |v: &serde_json::Value| -> Option<Vec<usize>> {
+        v.as_array().map(|a| {
+            a.iter()
+                .filter_map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()))
+                .collect()
+        })
+    };
+    match value {
+        serde_json::Value::Object(classes) => classes
+            .iter()
+            .filter_map(|(class, v)| list(v).map(|l| (class.clone(), l)))
+            .collect(),
+        other => list(other)
+            .map(|l| BTreeMap::from([(UNCLASSIFIED.to_string(), l)]))
+            .unwrap_or_default(),
     }
 }
 

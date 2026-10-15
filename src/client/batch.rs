@@ -6,6 +6,7 @@
 //! emulated from unrelated single-proof calls, and a decoded batch is not a
 //! verified proof.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -49,6 +50,9 @@ pub mod detail {
     /// An exact-root request whose root does not contain the state (not retryable).
     pub const STATE_NOT_IN_ROOT: &str = "state_not_in_root";
 }
+
+/// Class key under which a bare (unclassified) `data.indexes` array is reported.
+pub const UNCLASSIFIED: &str = "";
 
 /// Which view of the aggregator a batch is served against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,9 +117,12 @@ pub enum BatchFailure {
         detail: Option<String>,
         /// `data.retryable`.
         retryable: Option<bool>,
-        /// `data.indexes`: positions in the request of the states the error is about
-        /// (the status-hint details), empty when absent.
-        indexes: Vec<usize>,
+        /// `data.indexes`: positions in the request of the states the error is
+        /// about, **per class** (`pending`, `expired`, `unknown`, `not_in_root`),
+        /// e.g. `{"unknown": [0], "pending": [2, 3]}` for a mixed outcome. Empty when
+        /// absent. A server that sends a bare array gets its entries under
+        /// [`UNCLASSIFIED`].
+        indexes: BTreeMap<String, Vec<usize>>,
     },
     /// The HTTP exchange failed (connection error, TLS, I/O).
     Transport(String),

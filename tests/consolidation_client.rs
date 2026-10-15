@@ -928,7 +928,7 @@ fn a_bad_master_path_is_an_integrity_error_before_any_peer_is_asked() {
 
 // ------------------------------------------------ proof status hint details --
 
-fn hinted(detail: &str, retryable: bool, indexes: &[usize]) -> Reply {
+fn hinted(detail: &str, retryable: bool, indexes: Value) -> Reply {
     Reply::Error(
         -32008,
         json!({"reason":"proof_unavailable","detail":detail,"retryable":retryable,"indexes":indexes}),
@@ -947,7 +947,7 @@ fn status_hint_details_map_to_distinct_typed_outcomes() {
         ("state_not_in_root", false, StateNotInRoot, false),
     ];
     for (detail, server_retryable, reason, retryable) in cases {
-        match run_with_master(hinted(detail, server_retryable, &[0])).unwrap() {
+        match run_with_master(hinted(detail, server_retryable, json!({"pending": [0]}))).unwrap() {
             BundleOutcome::Unavailable {
                 reason: got,
                 retryable: r,
@@ -959,7 +959,7 @@ fn status_hint_details_map_to_distinct_typed_outcomes() {
         }
     }
     // the server's retryable flag cannot make a non-retryable hint retryable
-    match run_with_master(hinted("state_unknown", true, &[1])).unwrap() {
+    match run_with_master(hinted("state_unknown", true, json!({"unknown": [1]}))).unwrap() {
         BundleOutcome::Unavailable { retryable, .. } => assert!(!retryable),
         other => panic!("{other:?}"),
     }
@@ -980,7 +980,7 @@ fn a_peer_reports_a_leaf_missing_from_the_exact_root() {
     let run = start(
         &case,
         move |_| Reply::Result(master.clone()),
-        |_, _| hinted("state_not_in_root", false, &[0, 2]),
+        |_, _| hinted("state_not_in_root", false, json!({"not_in_root": [0, 2]})),
         Duration::ZERO,
         4,
         Arc::new(Gauge::default()),
@@ -994,34 +994,68 @@ fn a_peer_reports_a_leaf_missing_from_the_exact_root() {
     }
 }
 
-/// The transport keeps the offending request indexes of a hint error.
+/// The transport keeps the offending request indexes per class, as the server
+/// sends them (`{"pending":[1]}`, mixed: `{"unknown":[0],"pending":[2,3]}`,
+/// exact root: `{"not_in_root":[...]}`).
 #[test]
-fn the_transport_exposes_the_offending_indexes() {
+fn the_transport_exposes_the_offending_indexes_per_class() {
+    use std::collections::BTreeMap;
     use unicity_token::client::{
-        BatchAggregatorClient, BatchFailure, BatchRequest, RequestOptions, StateRoot,
+        BatchAggregatorClient, BatchFailure, BatchRequest, RequestOptions, StateRoot, UNCLASSIFIED,
     };
     let case = load("shards-4");
-    let shard = Shard::start(
-        |_| hinted("state_expired", false, &[0, 3]),
-        Duration::ZERO,
-        Arc::new(Gauge::default()),
-    );
     let ids: Vec<_> = case
         .items
         .iter()
         .take(4)
         .map(|i| i.state_id.clone())
         .collect();
-    let err = HttpAggregatorClient::new_insecure_http(&shard.url)
-        .get_inclusion_proofs(
-            &BatchRequest {
-                state_ids: &ids,
-                state_root: StateRoot::Latest,
-            },
-            &RequestOptions { timeout_ms: 2_000 },
-        )
-        .unwrap_err();
-    match err {
+    let fetch = |reply: Reply| {
+        let shard = Shard::start(
+            move |_| reply.clone(),
+            Duration::ZERO,
+            Arc::new(Gauge::default()),
+        );
+        HttpAggregatorClient::new_insecure_http(&shard.url)
+            .get_inclusion_proofs(
+                &BatchRequest {
+                    state_ids: &ids,
+                    state_root: StateRoot::Latest,
+                },
+                &RequestOptions { timeout_ms: 2_000 },
+            )
+            .unwrap_err()
+    };
+    let indexes = |reply: Reply| match fetch(reply) {
+        BatchFailure::Rpc { indexes, .. } => indexes,
+        other => panic!("{other:?}"),
+    };
+    let map = |entries: &[(&str, &[usize])]| -> BTreeMap<String, Vec<usize>> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .collect()
+    };
+
+    // the server's golden shapes
+    assert_eq!(
+        indexes(hinted("state_pending", true, json!({"pending": [1]}))),
+        map(&[("pending", &[1])])
+    );
+    assert_eq!(
+        indexes(hinted(
+            "state_not_in_root",
+            false,
+            json!({"not_in_root": [0, 2]})
+        )),
+        map(&[("not_in_root", &[0, 2])])
+    );
+    // a mixed outcome keeps every class (the detail carries the precedence winner)
+    match fetch(hinted(
+        "state_unknown",
+        false,
+        json!({"unknown": [0], "pending": [2, 3]}),
+    )) {
         BatchFailure::Rpc {
             code,
             detail,
@@ -1030,29 +1064,27 @@ fn the_transport_exposes_the_offending_indexes() {
             ..
         } => {
             assert_eq!(code, -32008);
-            assert_eq!(detail.as_deref(), Some("state_expired"));
+            assert_eq!(detail.as_deref(), Some("state_unknown"));
             assert_eq!(retryable, Some(false));
-            assert_eq!(indexes, vec![0, 3]);
+            assert_eq!(indexes, map(&[("unknown", &[0]), ("pending", &[2, 3])]));
         }
         other => panic!("{other:?}"),
     }
-    // absent indexes are an empty list
-    let shard = Shard::start(
-        |_| rpc_error(-32008, "view_not_retained", true),
-        Duration::ZERO,
-        Arc::new(Gauge::default()),
+    // a bare array is tolerated as one unclassified entry
+    assert_eq!(
+        indexes(hinted("state_expired", false, json!([0, 3]))),
+        map(&[(UNCLASSIFIED, &[0, 3])])
     );
-    match HttpAggregatorClient::new_insecure_http(&shard.url)
-        .get_inclusion_proofs(
-            &BatchRequest {
-                state_ids: &ids,
-                state_root: StateRoot::Latest,
-            },
-            &RequestOptions { timeout_ms: 2_000 },
-        )
-        .unwrap_err()
-    {
-        BatchFailure::Rpc { indexes, .. } => assert!(indexes.is_empty()),
-        other => panic!("{other:?}"),
-    }
+    // absent, null, wrongly typed or non-numeric entries never fail the call
+    assert!(indexes(rpc_error(-32008, "view_not_retained", true)).is_empty());
+    assert!(indexes(hinted("state_pending", true, Value::Null)).is_empty());
+    assert!(indexes(hinted("state_pending", true, json!("1,2"))).is_empty());
+    assert_eq!(
+        indexes(hinted(
+            "state_pending",
+            true,
+            json!({"pending": [1, "x", -2, 3], "junk": 5})
+        )),
+        map(&[("pending", &[1, 3])])
+    );
 }
