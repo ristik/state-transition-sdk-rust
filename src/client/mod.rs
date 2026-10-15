@@ -15,8 +15,8 @@ mod http;
 pub use http::{HttpAggregatorClient, HttpError};
 
 pub use batch::{
-    rpc_code, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest, InclusionProofBatch,
-    RequestOptions, StateRoot, MAX_BATCH_STATE_IDS,
+    detail, rpc_code, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
+    InclusionProofBatch, RequestOptions, StateRoot, MAX_BATCH_STATE_IDS,
 };
 pub use consolidate::{
     AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,

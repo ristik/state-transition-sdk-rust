@@ -36,6 +36,20 @@ pub mod rpc_code {
     pub const PROOF_UNAVAILABLE: i64 = -32008;
 }
 
+/// `data.detail` values of a `proof_unavailable` (-32008) batch error that carry
+/// the aggregator's per-state status hints. Like all statuses they are
+/// **unauthenticated hints**, never evidence about the state itself.
+pub mod detail {
+    /// Accepted, not yet in a published certified state (retryable).
+    pub const STATE_PENDING: &str = "state_pending";
+    /// Admitted, then dropped as expired (not retryable; the same signed request may be resubmitted).
+    pub const STATE_EXPIRED: &str = "state_expired";
+    /// Not seen at this node: a routing or input error, not retryable unavailability.
+    pub const STATE_UNKNOWN: &str = "state_unknown";
+    /// An exact-root request whose root does not contain the state (not retryable).
+    pub const STATE_NOT_IN_ROOT: &str = "state_not_in_root";
+}
+
 /// Which view of the aggregator a batch is served against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateRoot {
@@ -99,6 +113,9 @@ pub enum BatchFailure {
         detail: Option<String>,
         /// `data.retryable`.
         retryable: Option<bool>,
+        /// `data.indexes`: positions in the request of the states the error is about
+        /// (the status-hint details), empty when absent.
+        indexes: Vec<usize>,
     },
     /// The HTTP exchange failed (connection error, TLS, I/O).
     Transport(String),

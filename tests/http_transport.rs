@@ -16,7 +16,7 @@ use std::time::Duration;
 use unicity_token::api::inclusion_proof::INCLUSION_PROOF_TAG;
 use unicity_token::api::{
     CertificationData, InclusionProof, InclusionProofResponse, NonInclusionCertificate,
-    NonInclusionProof, StateId,
+    NonInclusionProof, ProofStatus, StateId,
 };
 use unicity_token::cbor::{encode_array, encode_null, encode_tag, encode_uint};
 use unicity_token::client::{
@@ -596,4 +596,214 @@ fn oversized_error_response_is_rejected() {
         client(&server.url).submit_certification_request(&data),
         Err(HttpError::ResponseTooLarge { limit: 65_536 })
     ));
+}
+
+// --- proof status hints (opt-in includeStatus) ------------------------------
+
+/// A `{proof, status}` result as returned when `includeStatus` is set.
+fn status_json(proof_hex: &str, status: &str) -> Vec<u8> {
+    ok_json(&format!(r#"{{"proof":"{proof_hex}","status":"{status}"}}"#))
+}
+
+fn pending_hex() -> (InclusionProof, String, String) {
+    let (proof, _) = fixture_proof_and_data();
+    let empty = empty_proof_response_hex(&proof);
+    let full = proof_response_hex(&proof);
+    (proof, empty, full)
+}
+
+fn fixture_state_id() -> StateId {
+    let (_, data) = fixture_proof_and_data();
+    StateId::derive(data.lock_script(), data.source_state_hash())
+}
+
+#[test]
+fn the_request_opts_into_the_status_hint() {
+    let (proof, _, full) = pending_hex();
+    let server = MockServer::start(vec![ok_json(&format!("\"{full}\""))]);
+    assert_eq!(
+        client(&server.url)
+            .get_inclusion_proof(&fixture_state_id())
+            .unwrap(),
+        proof
+    );
+    let request = server.last_request();
+    assert!(request.contains("get_inclusion_proof.v2"), "{request}");
+    assert!(request.contains(r#""includeStatus":true"#), "{request}");
+}
+
+#[test]
+fn both_result_shapes_return_the_identical_proof() {
+    let (proof, _, full) = pending_hex();
+    for result in [
+        ok_json(&format!("\"{full}\"")), // legacy server: plain string
+        status_json(&full, "included"),  // status-aware server
+        status_json(&full, "pending"),   // a hint never overrides a certified proof
+        status_json(&full, "expired"),   // ... in either direction
+        status_json(&full, "unknown"),
+        status_json(&full, "some-future-value"), // unknown values are no status
+    ] {
+        let server = MockServer::start(vec![result]);
+        let got = client(&server.url)
+            .get_inclusion_proof(&fixture_state_id())
+            .unwrap();
+        assert_eq!(got, proof);
+        assert_eq!(server.request_count(), 1);
+    }
+}
+
+#[test]
+fn pending_keeps_waiting_until_the_proof_arrives() {
+    let (proof, empty, full) = pending_hex();
+    let pending = status_json(&empty, "pending");
+    let server = MockServer::start(vec![
+        pending.clone(),
+        pending,
+        status_json(&full, "included"),
+    ]);
+    let got = client(&server.url)
+        .get_inclusion_proof(&fixture_state_id())
+        .unwrap();
+    assert_eq!(got, proof);
+    assert_eq!(server.request_count(), 3);
+}
+
+#[test]
+fn expired_stops_at_once_with_a_typed_error() {
+    let (_, empty, _) = pending_hex();
+    let server = MockServer::start(vec![status_json(&empty, "expired")]);
+    let err = client(&server.url)
+        .get_inclusion_proof(&fixture_state_id())
+        .unwrap_err();
+    assert!(matches!(err, HttpError::StateExpired), "{err}");
+    assert_eq!(server.request_count(), 1, "no waiting out the timeout");
+}
+
+#[test]
+fn unknown_fails_after_the_grace_and_the_grace_is_configurable() {
+    let (proof, empty, full) = pending_hex();
+    let unknown = status_json(&empty, "unknown");
+
+    // default grace (2): the third consecutive unknown fails, without waiting for the timeout
+    let server = MockServer::start(vec![unknown.clone()]);
+    let c = HttpAggregatorClient::new_insecure_http(&server.url)
+        .with_polling(Duration::from_millis(1), 50);
+    assert!(matches!(
+        c.get_inclusion_proof(&fixture_state_id()),
+        Err(HttpError::StateUnknown)
+    ));
+    assert_eq!(server.request_count(), 3);
+
+    // an HA instance that has not seen the request yet: unknown, unknown, then the proof
+    let server = MockServer::start(vec![
+        unknown.clone(),
+        unknown.clone(),
+        status_json(&full, "included"),
+    ]);
+    assert_eq!(
+        client(&server.url)
+            .get_inclusion_proof(&fixture_state_id())
+            .unwrap(),
+        proof
+    );
+
+    // no grace: the first unknown fails
+    let server = MockServer::start(vec![unknown.clone()]);
+    let c = client(&server.url).with_unknown_grace(0);
+    assert!(matches!(
+        c.get_inclusion_proof(&fixture_state_id()),
+        Err(HttpError::StateUnknown)
+    ));
+    assert_eq!(server.request_count(), 1);
+
+    // `pending` resets the grace: unknown, unknown, pending, unknown, unknown, proof
+    let pending = status_json(&empty, "pending");
+    let server = MockServer::start(vec![
+        unknown.clone(),
+        unknown.clone(),
+        pending,
+        unknown.clone(),
+        unknown,
+        status_json(&full, "included"),
+    ]);
+    let c = HttpAggregatorClient::new_insecure_http(&server.url)
+        .with_polling(Duration::from_millis(1), 10);
+    assert_eq!(c.get_inclusion_proof(&fixture_state_id()).unwrap(), proof);
+    assert_eq!(server.request_count(), 6);
+}
+
+#[test]
+fn without_a_usable_status_the_legacy_behavior_is_unchanged() {
+    let (_, empty, _) = pending_hex();
+    // legacy string, a status this version does not know, and an `included` hint without a
+    // proof are all just "not certified yet": poll until the configured attempts run out
+    for result in [
+        ok_json(&format!("\"{empty}\"")),
+        status_json(&empty, "failed"),
+        status_json(&empty, "included"),
+    ] {
+        let server = MockServer::start(vec![result]);
+        let err = client(&server.url)
+            .get_inclusion_proof(&fixture_state_id())
+            .unwrap_err();
+        assert!(matches!(err, HttpError::Timeout), "{err}");
+        assert_eq!(server.request_count(), 3);
+    }
+}
+
+#[test]
+fn malformed_status_results_are_decode_errors() {
+    for body in [
+        r#"{"status":"pending"}"#,             // no proof
+        r#"{"proof":123,"status":"pending"}"#, // proof is not a string
+        r#"[]"#,
+    ] {
+        let server = MockServer::start(vec![ok_json(body)]);
+        let err = client(&server.url)
+            .get_inclusion_proof(&fixture_state_id())
+            .unwrap_err();
+        assert!(matches!(err, HttpError::Decode(_)), "{body}: {err}");
+    }
+}
+
+#[test]
+fn a_single_lookup_exposes_the_status_hint() {
+    let (proof, empty, full) = pending_hex();
+    let cases = [
+        (
+            status_json(&empty, "pending"),
+            Some(ProofStatus::Pending),
+            false,
+        ),
+        (
+            status_json(&empty, "expired"),
+            Some(ProofStatus::Expired),
+            false,
+        ),
+        (
+            status_json(&empty, "unknown"),
+            Some(ProofStatus::Unknown),
+            false,
+        ),
+        (
+            status_json(&full, "included"),
+            Some(ProofStatus::Included),
+            true,
+        ),
+        (ok_json(&format!("\"{full}\"")), None, true),
+        (ok_json(&format!("\"{empty}\"")), None, false),
+        (status_json(&empty, "novel"), None, false),
+    ];
+    for (body, status, certified) in cases {
+        let server = MockServer::start(vec![body]);
+        let (response, got) = client(&server.url)
+            .lookup_inclusion_proof(&fixture_state_id())
+            .unwrap();
+        assert_eq!(got, status);
+        assert_eq!(response.inclusion_proof().is_some(), certified);
+        if certified {
+            assert_eq!(response.inclusion_proof(), Some(&proof));
+        }
+        assert_eq!(server.request_count(), 1, "a lookup never waits");
+    }
 }

@@ -925,3 +925,134 @@ fn a_bad_master_path_is_an_integrity_error_before_any_peer_is_asked() {
     ));
     assert_eq!(run.shard("11").params.lock().unwrap().len(), 1);
 }
+
+// ------------------------------------------------ proof status hint details --
+
+fn hinted(detail: &str, retryable: bool, indexes: &[usize]) -> Reply {
+    Reply::Error(
+        -32008,
+        json!({"reason":"proof_unavailable","detail":detail,"retryable":retryable,"indexes":indexes}),
+    )
+}
+
+/// `state_pending` is retryable unavailability; the other hints are non-retryable
+/// unavailability with their own reasons: a routing or input problem, never "retry".
+#[test]
+fn status_hint_details_map_to_distinct_typed_outcomes() {
+    use UnavailableReason::*;
+    let cases = [
+        ("state_pending", true, StatePending, true),
+        ("state_expired", false, StateExpired, false),
+        ("state_unknown", false, StateUnknown, false),
+        ("state_not_in_root", false, StateNotInRoot, false),
+    ];
+    for (detail, server_retryable, reason, retryable) in cases {
+        match run_with_master(hinted(detail, server_retryable, &[0])).unwrap() {
+            BundleOutcome::Unavailable {
+                reason: got,
+                retryable: r,
+            } => {
+                assert_eq!(got, reason, "{detail}");
+                assert_eq!(r, retryable, "{detail}");
+            }
+            other => panic!("{detail}: {other:?}"),
+        }
+    }
+    // the server's retryable flag cannot make a non-retryable hint retryable
+    match run_with_master(hinted("state_unknown", true, &[1])).unwrap() {
+        BundleOutcome::Unavailable { retryable, .. } => assert!(!retryable),
+        other => panic!("{other:?}"),
+    }
+    // the older details keep their mapping
+    assert!(matches!(
+        run_with_master(rpc_error(-32008, "state_not_included", true)).unwrap(),
+        BundleOutcome::Unavailable {
+            reason: UnavailableReason::TargetNotYetAvailable,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_peer_reports_a_leaf_missing_from_the_exact_root() {
+    let case = load("shards-4");
+    let master = case.master_reply.clone();
+    let run = start(
+        &case,
+        move |_| Reply::Result(master.clone()),
+        |_, _| hinted("state_not_in_root", false, &[0, 2]),
+        Duration::ZERO,
+        4,
+        Arc::new(Gauge::default()),
+    );
+    match run.client.consolidate_proofs(&case.items, &opts()).unwrap() {
+        BundleOutcome::Unavailable { reason, retryable } => {
+            assert_eq!(reason, UnavailableReason::StateNotInRoot);
+            assert!(!retryable);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The transport keeps the offending request indexes of a hint error.
+#[test]
+fn the_transport_exposes_the_offending_indexes() {
+    use unicity_token::client::{
+        BatchAggregatorClient, BatchFailure, BatchRequest, RequestOptions, StateRoot,
+    };
+    let case = load("shards-4");
+    let shard = Shard::start(
+        |_| hinted("state_expired", false, &[0, 3]),
+        Duration::ZERO,
+        Arc::new(Gauge::default()),
+    );
+    let ids: Vec<_> = case
+        .items
+        .iter()
+        .take(4)
+        .map(|i| i.state_id.clone())
+        .collect();
+    let err = HttpAggregatorClient::new_insecure_http(&shard.url)
+        .get_inclusion_proofs(
+            &BatchRequest {
+                state_ids: &ids,
+                state_root: StateRoot::Latest,
+            },
+            &RequestOptions { timeout_ms: 2_000 },
+        )
+        .unwrap_err();
+    match err {
+        BatchFailure::Rpc {
+            code,
+            detail,
+            retryable,
+            indexes,
+            ..
+        } => {
+            assert_eq!(code, -32008);
+            assert_eq!(detail.as_deref(), Some("state_expired"));
+            assert_eq!(retryable, Some(false));
+            assert_eq!(indexes, vec![0, 3]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // absent indexes are an empty list
+    let shard = Shard::start(
+        |_| rpc_error(-32008, "view_not_retained", true),
+        Duration::ZERO,
+        Arc::new(Gauge::default()),
+    );
+    match HttpAggregatorClient::new_insecure_http(&shard.url)
+        .get_inclusion_proofs(
+            &BatchRequest {
+                state_ids: &ids,
+                state_root: StateRoot::Latest,
+            },
+            &RequestOptions { timeout_ms: 2_000 },
+        )
+        .unwrap_err()
+    {
+        BatchFailure::Rpc { indexes, .. } => assert!(indexes.is_empty()),
+        other => panic!("{other:?}"),
+    }
+}

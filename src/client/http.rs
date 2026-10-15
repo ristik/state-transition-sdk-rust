@@ -18,7 +18,9 @@ use zeroize::Zeroize;
 
 use crate::api::certification_request::CertificationRequest;
 use crate::api::inclusion_proof::InclusionProof;
-use crate::api::{CertificationData, InclusionProofResponse, NonInclusionProof, StateId};
+use crate::api::{
+    CertificationData, InclusionProofResponse, NonInclusionProof, ProofStatus, StateId,
+};
 use crate::cbor::Decoder;
 
 use super::{
@@ -40,8 +42,17 @@ const RPC_STATE_NOT_FOUND: i64 = -32020;
 const RPC_INCLUSION_PENDING: i64 = -32021;
 const RPC_STATE_INCLUDED: i64 = -32022;
 
+/// Default number of `unknown` status answers tolerated while waiting for a proof
+/// before failing: right after a submission an HA instance that did not admit the
+/// request may not have seen it yet.
+pub const DEFAULT_UNKNOWN_GRACE: u32 = 2;
+
 /// Errors from the HTTP aggregator client.
+///
+/// Non-exhaustive: variants are added as the aggregator API grows (for example
+/// the proof status hints); match with a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HttpError {
     /// Unsafe or invalid client configuration.
     Configuration(String),
@@ -74,6 +85,15 @@ pub enum HttpError {
     Timeout,
     /// The aggregator has no certified or pending record for this state id.
     StateNotFound,
+    /// The aggregator reports (an unauthenticated hint, see [`ProofStatus`]) that
+    /// the request was admitted but dropped before inclusion, because its timeout
+    /// passed. Waiting can not help; the caller may resubmit the same signed request.
+    StateExpired,
+    /// The aggregator reports (an unauthenticated hint, see [`ProofStatus`]) that
+    /// it does not know the state id, beyond the configured grace period. This is
+    /// not proof of absence or of non-spending: the request may have been lost,
+    /// misrouted, forgotten by a restart, or be known to another instance.
+    StateUnknown,
     /// No certified state is available from which to prove absence.
     CertifiedStateUnavailable,
     /// The requested state is present at the certified root.
@@ -96,6 +116,15 @@ impl fmt::Display for HttpError {
             HttpError::Rejected(s) => write!(f, "certification rejected: {s:?}"),
             HttpError::Timeout => write!(f, "timed out waiting for inclusion proof"),
             HttpError::StateNotFound => write!(f, "state is not known to the aggregator"),
+            HttpError::StateExpired => {
+                write!(f, "aggregator reports the request expired before inclusion")
+            }
+            HttpError::StateUnknown => {
+                write!(
+                    f,
+                    "aggregator reports the state id as unknown (hint, not proof of absence)"
+                )
+            }
             HttpError::CertifiedStateUnavailable => {
                 write!(f, "no certified state is available")
             }
@@ -116,6 +145,7 @@ pub struct HttpAggregatorClient {
     agent: ureq::Agent,
     poll_interval: Duration,
     poll_attempts: u32,
+    unknown_grace: u32,
     allow_insecure_http: bool,
 }
 
@@ -141,6 +171,7 @@ impl fmt::Debug for HttpAggregatorClient {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("poll_interval", &self.poll_interval)
             .field("poll_attempts", &self.poll_attempts)
+            .field("unknown_grace", &self.unknown_grace)
             .field("allow_insecure_http", &self.allow_insecure_http)
             .finish_non_exhaustive()
     }
@@ -159,6 +190,7 @@ impl HttpAggregatorClient {
                 .build(),
             poll_interval: Duration::from_secs(1),
             poll_attempts: 60,
+            unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: false,
         }
     }
@@ -182,6 +214,7 @@ impl HttpAggregatorClient {
                 .build(),
             poll_interval: Duration::from_secs(1),
             poll_attempts: 60,
+            unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: true,
         }
     }
@@ -198,6 +231,45 @@ impl HttpAggregatorClient {
         self.poll_interval = interval;
         self.poll_attempts = attempts;
         self
+    }
+
+    /// How many `unknown` status answers [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
+    /// tolerates before failing with [`HttpError::StateUnknown`] (default
+    /// [`DEFAULT_UNKNOWN_GRACE`]; `0` fails on the first one).
+    ///
+    /// Right after a submission the aggregator that serves the lookup may not have
+    /// seen the request yet (a replica behind a load balancer, a queue not yet
+    /// drained), so a short grace avoids reporting a transient `unknown`. The
+    /// counter resets whenever the aggregator answers `pending`. A lookup of an id
+    /// that was never submitted therefore costs `grace + 1` polls before it fails.
+    pub fn with_unknown_grace(mut self, polls: u32) -> Self {
+        self.unknown_grace = polls;
+        self
+    }
+
+    /// One proof lookup, without waiting, returning the aggregator's status hint
+    /// next to the response. The status is `None` for servers that do not support
+    /// it (and for values this version does not know).
+    ///
+    /// The hint is **unauthenticated**: use it for control flow and user feedback
+    /// only. It never replaces verification of the returned proof.
+    pub fn lookup_inclusion_proof(
+        &self,
+        state_id: &StateId,
+    ) -> Result<(InclusionProofResponse, Option<ProofStatus>), HttpError> {
+        let params = serde_json::json!({
+            "stateId": hex::encode(state_id.bytes()),
+            "includeStatus": true,
+        });
+        let result = self.rpc("get_inclusion_proof.v2", params, &[])?;
+        let (encoded, status) = split_status_result(&result)?;
+        if encoded.len() > MAX_PROOF_HEX_CHARS {
+            return Err(HttpError::ResponseTooLarge {
+                limit: MAX_PROOF_HEX_CHARS,
+            });
+        }
+        let bytes = hex::decode(encoded).map_err(|e| HttpError::Decode(e.to_string()))?;
+        Ok((decode_inclusion_proof_response(&bytes)?, status))
     }
 
     /// Determine whether `state_id` is included or absent at a certified root.
@@ -453,8 +525,24 @@ impl AggregatorClient for HttpAggregatorClient {
         Ok(())
     }
 
+    /// Wait for the certified proof of `state_id`.
+    ///
+    /// Asks for the aggregator's status hint (`includeStatus`) and accepts both
+    /// result shapes: a plain string (legacy server) behaves exactly as before.
+    /// While the response is not a certified proof: `pending` (or no status)
+    /// keeps polling, `expired` fails at once with [`HttpError::StateExpired`] and
+    /// `unknown` fails with [`HttpError::StateUnknown`] after the configured
+    /// grace ([`with_unknown_grace`](HttpAggregatorClient::with_unknown_grace)),
+    /// so lost or expired submissions are reported instead of waited out.
+    ///
+    /// The status is an unauthenticated hint: a certified proof is returned
+    /// whatever the status says, and the caller must still verify it.
     fn get_inclusion_proof(&self, state_id: &StateId) -> Result<InclusionProof, HttpError> {
-        let params = serde_json::json!({ "stateId": hex::encode(state_id.bytes()) });
+        let params = serde_json::json!({
+            "stateId": hex::encode(state_id.bytes()),
+            "includeStatus": true,
+        });
+        let mut unknown_seen = 0u32;
 
         for attempt in 0..self.poll_attempts {
             let result = match self.rpc("get_inclusion_proof.v2", params.clone(), &[]) {
@@ -473,9 +561,7 @@ impl AggregatorClient for HttpAggregatorClient {
                 }
                 Err(error) => return Err(error),
             };
-            let encoded = result
-                .as_str()
-                .ok_or_else(|| HttpError::Decode("expected hex string".to_string()))?;
+            let (encoded, status) = split_status_result(&result)?;
             if encoded.len() > MAX_PROOF_HEX_CHARS {
                 return Err(HttpError::ResponseTooLarge {
                     limit: MAX_PROOF_HEX_CHARS,
@@ -487,21 +573,51 @@ impl AggregatorClient for HttpAggregatorClient {
             // certified yet. `get_inclusion_proof.v2` never answers with a
             // non-inclusion proof (that is `get_non_inclusion_proof.v1`), so the
             // uncertified response is unambiguous and is aggregator-go's way of
-            // reporting pending. An aggregator that sends the explicit
-            // INCLUSION_PENDING code above never reaches this branch, and only
-            // that one lets the client tell "not yet" apart from "no such state".
+            // reporting pending. The status hint, when present, refines that into
+            // "keep waiting" / "will never be certified here".
             match decode_inclusion_proof_response(&bytes)? {
                 InclusionProofResponse::Certified { proof, .. } => return Ok(proof),
-                InclusionProofResponse::NotCertified { .. } => {
-                    if attempt + 1 < self.poll_attempts {
-                        std::thread::sleep(self.poll_interval);
+                InclusionProofResponse::NotCertified { .. } => match status {
+                    Some(ProofStatus::Expired) => return Err(HttpError::StateExpired),
+                    Some(ProofStatus::Unknown) => {
+                        unknown_seen += 1;
+                        if unknown_seen > self.unknown_grace {
+                            return Err(HttpError::StateUnknown);
+                        }
                     }
-                    continue;
-                }
+                    // pending, an `included` hint without a proof, no status, or a
+                    // status this version does not know: the legacy behavior
+                    _ => unknown_seen = 0,
+                },
+            }
+            if attempt + 1 < self.poll_attempts {
+                std::thread::sleep(self.poll_interval);
             }
         }
         Err(HttpError::Timeout)
     }
+}
+
+/// Split a `get_inclusion_proof.v2` result into the proof hex and the optional
+/// status hint: a string is the legacy result, an object is `{proof, status}`.
+fn split_status_result(
+    result: &serde_json::Value,
+) -> Result<(&str, Option<ProofStatus>), HttpError> {
+    if let Some(s) = result.as_str() {
+        return Ok((s, None));
+    }
+    let object = result
+        .as_object()
+        .ok_or_else(|| HttpError::Decode("expected hex string".to_string()))?;
+    let proof = object
+        .get("proof")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| HttpError::Decode("status result lacks a proof string".to_string()))?;
+    let status = object
+        .get("status")
+        .and_then(|v| v.as_str())
+        .and_then(ProofStatus::from_wire);
+    Ok((proof, status))
 }
 
 impl NonInclusionAggregatorClient for HttpAggregatorClient {
@@ -546,6 +662,7 @@ impl BatchAggregatorClient for HttpAggregatorClient {
                 reason: Some("invalid_request".to_string()),
                 detail: Some("state_count".to_string()),
                 retryable: Some(false),
+                indexes: Vec::new(),
             });
         }
         let state_root = match request.state_root {
@@ -597,6 +714,16 @@ fn batch_failure(failure: RawFailure) -> BatchFailure {
                     .as_ref()
                     .and_then(|d| d.get("retryable"))
                     .and_then(|v| v.as_bool()),
+                indexes: data
+                    .as_ref()
+                    .and_then(|d| d.get("indexes"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }
         }
     }

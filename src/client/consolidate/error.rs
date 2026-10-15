@@ -39,6 +39,18 @@ pub enum UnavailableReason {
     PartitionViewUnavailable,
     /// The aggregator is under pressure.
     Busy,
+    /// A requested state is accepted but not yet certified (`state_pending`):
+    /// retry at round cadence. An unauthenticated hint.
+    StatePending,
+    /// A requested state was dropped as expired (`state_expired`): not retryable
+    /// as a consolidation; the same signed request may be resubmitted. A hint.
+    StateExpired,
+    /// A requested state is not known to the queried shard (`state_unknown`): a
+    /// routing or input problem, not retryable unavailability. Not proof of absence.
+    StateUnknown,
+    /// An exact-root request whose root does not contain a requested state
+    /// (`state_not_in_root`): not retryable.
+    StateNotInRoot,
 }
 
 /// Result of an explicit consolidation that did not fail.
