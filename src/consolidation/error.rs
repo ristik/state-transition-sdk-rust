@@ -35,7 +35,8 @@ pub enum PartitionViewError {
     LeafSetMismatch(&'static str),
     /// A leaf's configuration hash differs from the admitted one.
     ConfigHashMismatch,
-    /// Assembly needs an admitted configuration hash for every shard.
+    /// Assembly with pinned topology needs an admitted configuration hash for
+    /// every shard.
     ConfigHashRequired,
     /// The rebuilt shard tree does not hash into the enclosing seal.
     TreeRootMismatch,

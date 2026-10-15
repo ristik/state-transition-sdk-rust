@@ -13,7 +13,7 @@ use unicity_token::api::NetworkId;
 use unicity_token::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
 use unicity_token::consolidation::{
     PartitionTopology, PartitionView, PartitionViewError, PartitionViewInputRecord,
-    PartitionViewLeaf, MAX_PARTITION_VIEW_BYTES, MAX_PARTITION_VIEW_LEAVES,
+    PartitionViewLeaf, ShardCertificate, MAX_PARTITION_VIEW_BYTES, MAX_PARTITION_VIEW_LEAVES,
 };
 use unicity_token::crypto::hash::sha256;
 use unicity_token::crypto::signature::PublicKey;
@@ -174,6 +174,17 @@ fn case(n: usize) -> Case {
         expected_ucs,
         tree_root: hex::decode(field(context, "shardTreeRoot")).unwrap(),
     }
+}
+
+fn assemble(
+    view: &PartitionView,
+    enclosing: &UnicityCertificate,
+    partition: u32,
+    pins: Option<&PartitionTopology>,
+    session: &mut SealSession<'_>,
+) -> Result<Vec<ShardCertificate>, PartitionViewError> {
+    view.authenticate(enclosing, partition, pins, session)?
+        .certificates()
 }
 
 const CASES: [usize; 3] = [1, 4, 8];
@@ -435,9 +446,7 @@ fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
         );
 
         let mut session = SealSession::new(&c.trust_base);
-        let ucs = c
-            .view
-            .assemble_certificates(&c.uc, c.partition, &c.topology, &mut session)
+        let ucs = assemble(&c.view, &c.uc, c.partition, Some(&c.topology), &mut session)
             .unwrap_or_else(|e| panic!("{n} shards: {e}"));
         assert_eq!(ucs.len(), n);
         for (i, (sc, expected)) in ucs.iter().zip(&c.expected_ucs).enumerate() {
@@ -460,16 +469,18 @@ fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
         // all derived certificates share the master seal: one quorum check suffices
         let stats = session.stats();
         assert_eq!(stats.quorum_checks, 1, "{n} shards");
+        // plain (policy-less) authentication is its own namespace: one more check,
+        // then every shared copy of the master seal is a hit
         for sc in &ucs {
             let uc = sc.certificate.as_ref().unwrap();
             session.authenticate_seal(&uc.unicity_seal).unwrap();
         }
         assert_eq!(
             session.stats().quorum_checks,
-            1,
-            "{n} shards: shared seal is not re-verified"
+            2,
+            "{n} shards: shared seal is verified once per policy"
         );
-        assert_eq!(session.stats().memo_hits, n as u64);
+        assert_eq!(session.stats().memo_hits, n as u64 - 1);
     }
 }
 
@@ -660,8 +671,7 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     let c = case(4);
     let assemble = |uc: &UnicityCertificate, tb: &RootTrustBase| {
         let mut s = SealSession::new(tb);
-        c.view
-            .assemble_certificates(uc, c.partition, &c.topology, &mut s)
+        assemble(&c.view, uc, c.partition, Some(&c.topology), &mut s)
     };
     assert!(assemble(&c.uc, &c.trust_base).is_ok());
 
@@ -719,20 +729,6 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     assert_eq!(
         assemble(&empty_sig, &c.trust_base),
         Err(PartitionViewError::Seal(VerificationError::SealMalformed))
-    );
-
-    // an admitted configuration hash is required for every shard
-    let partial = PartitionTopology::new(c.topology.canonical_order().unwrap());
-    let mut s = SealSession::new(&c.trust_base);
-    assert_eq!(
-        c.view
-            .assemble_certificates(&c.uc, c.partition, &partial, &mut s),
-        Err(PartitionViewError::ConfigHashRequired)
-    );
-    assert_eq!(
-        s.stats().quorum_checks,
-        0,
-        "nothing authenticated before the cheap checks"
     );
 
     // a verdict is bound to the complete seal encoding, including the witness
@@ -881,8 +877,7 @@ fn weighted_authority_is_unsupported_not_a_bad_signature() {
         Err(VerificationError::UnsupportedAuthority)
     );
     assert_eq!(
-        c.view
-            .assemble_certificates(&uc, c.partition, &c.topology, &mut s),
+        assemble(&c.view, &uc, c.partition, Some(&c.topology), &mut s),
         Err(PartitionViewError::Seal(
             VerificationError::UnsupportedAuthority
         ))
@@ -905,4 +900,268 @@ fn weighted_authority_is_unsupported_not_a_bad_signature() {
         s.authenticate_seal(&uc.unicity_seal),
         Err(VerificationError::QuorumNotMet)
     );
+}
+
+// ------------------------------------------- authenticated view (1b) ------
+
+#[test]
+fn unpinned_authentication_needs_no_peer_configuration() {
+    for n in CASES {
+        let c = case(n);
+        let mut session = SealSession::new(&c.trust_base);
+        let view = c
+            .view
+            .authenticate(&c.uc, c.partition, None, &mut session)
+            .unwrap_or_else(|e| panic!("{n} shards: {e}"));
+        assert_eq!(view.partition_id(), c.partition);
+        assert_eq!(view.network_id(), c.trust_base.network_id);
+        assert_eq!(view.epoch(), c.trust_base.epoch);
+        assert_eq!(view.leaves().len(), n);
+        assert_eq!(view.seal(), &c.uc.unicity_seal);
+        assert_eq!(view.shard_tree().root_hash(), c.tree_root.as_slice());
+        let ucs = view.certificates().unwrap();
+        for (sc, expected) in ucs.iter().zip(&c.expected_ucs) {
+            assert_eq!(&sc.certificate.as_ref().unwrap().to_cbor(), expected);
+        }
+        assert_eq!(session.stats().quorum_checks, 1);
+    }
+}
+
+#[test]
+fn view_identity_binds_authority_partition_pins_and_seal() {
+    let c = case(4);
+    let id = |tb: &RootTrustBase, uc: &UnicityCertificate, pins: Option<&PartitionTopology>| {
+        let mut s = SealSession::new(tb);
+        *c.view
+            .authenticate(uc, c.partition, pins, &mut s)
+            .unwrap()
+            .identity()
+    };
+    let base = id(&c.trust_base, &c.uc, None);
+    assert_eq!(base, id(&c.trust_base, &c.uc, None), "deterministic");
+    assert_ne!(
+        base,
+        id(&c.trust_base, &c.uc, Some(&c.topology)),
+        "pins are part of the identity"
+    );
+
+    // another admitted authority (same keys, different threshold/stake layout is
+    // rejected elsewhere; use an extra, unused validator)
+    let mut other = c.trust_base.clone();
+    other.root_nodes.push(RootTrustBaseNodeInfo {
+        node_id: "unused".into(),
+        signing_key: PublicKey::from_bytes(
+            &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        )
+        .unwrap(),
+        stake: 1,
+    });
+    assert_ne!(
+        base,
+        id(&other, &c.uc, None),
+        "authority content is part of the identity"
+    );
+
+    // a different valid witness of the same unsigned seal is a different identity
+    let mut witness = c.uc.clone();
+    witness
+        .unicity_seal
+        .signatures
+        .push(("extra".into(), vec![1; 65]));
+    assert_ne!(base, id(&c.trust_base, &witness, None));
+
+    // pins on different shards differ
+    let mut partial = PartitionTopology::new(c.topology.canonical_order().unwrap());
+    let first = c.topology.canonical_order().unwrap()[0].clone();
+    partial = partial.with_shard_conf_hash(&first, *c.topology.shard_conf_hash(&first).unwrap());
+    assert_ne!(
+        id(&c.trust_base, &c.uc, Some(&partial)),
+        id(&c.trust_base, &c.uc, Some(&c.topology))
+    );
+}
+
+#[test]
+fn candidate_data_is_never_authority() {
+    let c = case(4);
+    let go = |view: &PartitionView, uc: &UnicityCertificate, part: u32| {
+        let mut s = SealSession::new(&c.trust_base);
+        let r = view.authenticate(uc, part, None, &mut s).map(|_| ());
+        (r, s.stats().quorum_checks)
+    };
+    // the wrong expected partition
+    let (r, checks) = go(&c.view, &c.uc, c.partition + 1);
+    assert_eq!(r, Err(PartitionViewError::PartitionMismatch));
+    assert_eq!(checks, 0);
+
+    // a changed candidate leaf, including its configuration hash, does not hash into the seal
+    let mut v = c.view.clone();
+    v.leaves[3].shard_conf_hash[0] ^= 1;
+    let (r, checks) = go(&v, &c.uc, c.partition);
+    assert_eq!(r, Err(PartitionViewError::TreeRootMismatch));
+    assert_eq!(checks, 0, "no signature work for an unbound view");
+
+    // candidate structure: order, coverage, duplicates
+    let mut v = c.view.clone();
+    v.leaves.swap(1, 2);
+    assert!(matches!(
+        go(&v, &c.uc, c.partition).0,
+        Err(PartitionViewError::LeafSetMismatch(_))
+    ));
+    let mut v = c.view.clone();
+    v.leaves.pop();
+    assert!(go(&v, &c.uc, c.partition).0.is_err());
+    let mut v = c.view.clone();
+    v.leaves[1] = v.leaves[0].clone();
+    assert!(go(&v, &c.uc, c.partition).0.is_err());
+
+    // a perfect view under a seal the anchor does not authenticate yields no object
+    let mut bad = c.uc.clone();
+    bad.unicity_seal.signatures[0].1[5] ^= 1;
+    let (r, checks) = go(&c.view, &bad, c.partition);
+    assert_eq!(
+        r,
+        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
+    );
+    assert_eq!(checks, 1);
+}
+
+#[test]
+fn pins_are_a_stricter_policy() {
+    let c = case(4);
+    let go = |pins: &PartitionTopology| {
+        let mut s = SealSession::new(&c.trust_base);
+        c.view
+            .authenticate(&c.uc, c.partition, Some(pins), &mut s)
+            .map(|_| ())
+    };
+    assert!(go(&c.topology).is_ok());
+    let order = c.topology.canonical_order().unwrap();
+    // partial pins: only one shard's hash
+    let partial = PartitionTopology::new(order.clone())
+        .with_shard_conf_hash(&order[2], *c.topology.shard_conf_hash(&order[2]).unwrap());
+    assert!(go(&partial).is_ok());
+    let wrong = PartitionTopology::new(order.clone()).with_shard_conf_hash(&order[2], [7; 32]);
+    assert_eq!(go(&wrong), Err(PartitionViewError::ConfigHashMismatch));
+    // pinned scheme differs from the view's
+    assert!(matches!(
+        go(&case(8).topology),
+        Err(PartitionViewError::LeafSetMismatch(_))
+    ));
+    assert!(go(&PartitionTopology::single_shard()).is_err());
+}
+
+// ------------------------------------------------ review of #22 ------------
+
+/// Downstream compile/behaviour regression for the pre-1b entry point
+/// (signature and error variant of the merged R1 API).
+#[test]
+fn pinned_assembly_api_is_preserved() {
+    let c = case(4);
+    let mut s = SealSession::new(&c.trust_base);
+    let ucs: Vec<ShardCertificate> = c
+        .view
+        .assemble_certificates(&c.uc, c.partition, &c.topology, &mut s)
+        .unwrap();
+    for (sc, expected) in ucs.iter().zip(&c.expected_ucs) {
+        assert_eq!(&sc.certificate.as_ref().unwrap().to_cbor(), expected);
+    }
+    // complete pins are required on this path
+    let partial = PartitionTopology::new(c.topology.canonical_order().unwrap());
+    let mut s = SealSession::new(&c.trust_base);
+    let err = c
+        .view
+        .assemble_certificates(&c.uc, c.partition, &partial, &mut s)
+        .unwrap_err();
+    assert!(matches!(err, PartitionViewError::ConfigHashRequired));
+    assert_eq!(s.stats().quorum_checks, 0);
+    // and it still authenticates: a bad seal is refused
+    let mut bad = c.uc.clone();
+    bad.unicity_seal.signatures[0].1[5] ^= 1;
+    let mut s = SealSession::new(&c.trust_base);
+    assert_eq!(
+        c.view
+            .assemble_certificates(&bad, c.partition, &c.topology, &mut s),
+        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
+    );
+}
+
+/// The memo is namespaced by the pin/partition policy of the authentication.
+#[test]
+fn strict_memo_is_separated_by_policy() {
+    let c = case(4);
+    let mut s = SealSession::new(&c.trust_base);
+    let auth = |s: &mut SealSession<'_>, pins: Option<&PartitionTopology>| {
+        c.view.authenticate(&c.uc, c.partition, pins, s).unwrap();
+    };
+    auth(&mut s, None);
+    assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (1, 0));
+    auth(&mut s, None);
+    assert_eq!(
+        (s.stats().quorum_checks, s.stats().memo_hits),
+        (1, 1),
+        "same policy reuses"
+    );
+    auth(&mut s, Some(&c.topology));
+    assert_eq!(
+        (s.stats().quorum_checks, s.stats().memo_hits),
+        (2, 1),
+        "pinned is another policy"
+    );
+    auth(&mut s, Some(&c.topology));
+    assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (2, 2));
+    let order = c.topology.canonical_order().unwrap();
+    let partial = PartitionTopology::new(order.clone())
+        .with_shard_conf_hash(&order[0], *c.topology.shard_conf_hash(&order[0]).unwrap());
+    auth(&mut s, Some(&partial));
+    assert_eq!(
+        s.stats().quorum_checks,
+        3,
+        "different pins are another policy"
+    );
+}
+
+/// A custom authenticator has no authority identity, so it can drive the
+/// compatibility assembly (no view is exposed) but not `authenticate`, whose
+/// views carry an authority-bound identity (`authenticate` takes a
+/// `SealSession`). Two sessions of different authorities yield different views.
+#[test]
+fn custom_authenticators_cannot_mint_identified_views() {
+    struct Delegating<'a>(SealSession<'a>);
+    impl SealAuthenticator for Delegating<'_> {
+        fn authenticate_seal(
+            &mut self,
+            seal: &unicity_token::api::bft::UnicitySeal,
+        ) -> Result<(), VerificationError> {
+            self.0.authenticate_seal(seal)
+        }
+    }
+    let c = case(4);
+    let mut custom = Delegating(SealSession::new(&c.trust_base));
+    let ucs = c
+        .view
+        .assemble_certificates(&c.uc, c.partition, &c.topology, &mut custom)
+        .unwrap();
+    assert_eq!(ucs.len(), 4);
+
+    let mut other = c.trust_base.clone();
+    other.root_nodes.push(RootTrustBaseNodeInfo {
+        node_id: "unused".into(),
+        signing_key: PublicKey::from_bytes(
+            &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        )
+        .unwrap(),
+        stake: 1,
+    });
+    let (mut s1, mut s2) = (SealSession::new(&c.trust_base), SealSession::new(&other));
+    let v1 = c
+        .view
+        .authenticate(&c.uc, c.partition, None, &mut s1)
+        .unwrap();
+    let v2 = c
+        .view
+        .authenticate(&c.uc, c.partition, None, &mut s2)
+        .unwrap();
+    assert_ne!(v1.identity(), v2.identity(), "authority separation");
 }

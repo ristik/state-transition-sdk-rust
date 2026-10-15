@@ -47,6 +47,31 @@ impl PartitionTopology {
         self.conf_hashes.get(&shard.encode())
     }
 
+    /// Digest of the scheme and pinned hashes, for inclusion in cache/session
+    /// identities of anything derived under this policy.
+    pub fn digest(&self) -> [u8; 32] {
+        use crate::crypto::hash::{DataHasher, HashAlgorithm};
+        let mut h = DataHasher::new(HashAlgorithm::Sha256)
+            .expect("sha256")
+            .update(b"unicity-token/topology/v1")
+            .update(&(self.scheme.len() as u64).to_be_bytes());
+        let mut scheme: Vec<Vec<u8>> = self.scheme.iter().map(ShardId::encode).collect();
+        scheme.sort();
+        for id in &scheme {
+            h = h.update(&(id.len() as u64).to_be_bytes()).update(id);
+        }
+        h = h.update(&(self.conf_hashes.len() as u64).to_be_bytes());
+        for (id, hash) in &self.conf_hashes {
+            h = h
+                .update(&(id.len() as u64).to_be_bytes())
+                .update(id)
+                .update(hash);
+        }
+        let mut d = [0u8; 32];
+        d.copy_from_slice(h.finalize().data());
+        d
+    }
+
     /// The shard ids of the (complete, prefix-free) scheme in binary tree
     /// left-to-right order: lexicographic bit strings, `0` before `1`. The empty
     /// scheme yields the single empty shard id.
