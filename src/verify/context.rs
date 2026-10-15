@@ -1,6 +1,6 @@
 //! Shared state and cumulative limits for recursive token verification.
 
-use crate::api::bft::RootTrustBase;
+use crate::api::bft::{RootTrustBase, UcInterner};
 use crate::cbor::DecodeLimits;
 use crate::transaction::Token;
 
@@ -50,6 +50,7 @@ pub struct VerificationContext<'a> {
     registry: &'a MintJustificationRegistry,
     policy: VerificationPolicy,
     seals: SealSession<'a>,
+    interner: UcInterner,
     embedded_token_depth: usize,
     total_embedded_token_bytes: usize,
 }
@@ -81,6 +82,7 @@ impl<'a> VerificationContext<'a> {
             registry,
             policy,
             seals: SealSession::with_capacity(trust_base, capacity),
+            interner: UcInterner::with_capacity(capacity),
             embedded_token_depth: 0,
             total_embedded_token_bytes: 0,
         }
@@ -99,6 +101,7 @@ impl<'a> VerificationContext<'a> {
             registry,
             policy,
             seals,
+            interner: UcInterner::new(),
             embedded_token_depth: 0,
             total_embedded_token_bytes: 0,
         }
@@ -119,6 +122,12 @@ impl<'a> VerificationContext<'a> {
     /// verification: repeated seals are checked against the quorum once.
     pub fn seals(&mut self) -> &mut SealSession<'a> {
         &mut self.seals
+    }
+
+    /// The operation's certificate interner: decode embedded tokens through it
+    /// so identical certificates are parsed once per verification.
+    pub fn interner(&mut self) -> &mut UcInterner {
+        &mut self.interner
     }
 
     /// Active verification policy and limits.

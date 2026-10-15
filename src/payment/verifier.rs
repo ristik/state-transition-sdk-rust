@@ -170,9 +170,12 @@ impl MintJustificationVerifier for SplitMintJustificationVerifier {
         let justification_bytes = mint
             .justification()
             .ok_or(VerificationError::MalformedMintJustification)?;
-        let justification =
-            SplitMintJustification::from_cbor_with_limits(justification_bytes, limits)
-                .map_err(|_| VerificationError::MalformedMintJustification)?;
+        let justification = SplitMintJustification::from_cbor_interned(
+            justification_bytes,
+            limits,
+            context.interner(),
+        )
+        .map_err(|_| VerificationError::MalformedMintJustification)?;
 
         // (1) The minted token must declare a non-empty canonical asset payload.
         let output_payment_bytes = mint.data().ok_or(VerificationError::PaymentDataMissing)?;

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use crate::api::bft::root_trust_base::RootTrustBaseNodeInfo;
 use crate::api::bft::unicity_tree::HashStep;
+use crate::api::bft::UcInterner;
 use crate::api::bft::{UnicityCertificate, UnicitySeal, UnicityTreeCertificate};
 use crate::api::inclusion_certificate::InclusionCertificate;
 use crate::api::leaf_value::calculate_leaf_value;
@@ -1461,4 +1462,182 @@ fn nested_proofs_share_the_operation_memo() {
     );
     assert_eq!(off.body_hits, 0);
     assert_eq!(off.body_checks as usize, proofs);
+}
+
+// --------------------------------------------- certificate decode work ----
+
+fn distinct_ucs(t: &Token) -> usize {
+    distinct_certificates(t)
+}
+
+/// Each distinct complete certificate encoding of a token is parsed once, however
+/// many proofs carry it: decodes = distinct certificates, hits = the repeats.
+#[test]
+fn certificate_decodes_equal_the_distinct_certificates() {
+    let mut flat = Vec::new();
+    let mut raw = Vec::new();
+    for transfers in [1usize, 2, 4, 6, 9] {
+        let (sim, token) = spread_token(transfers);
+        let l = 1 + transfers;
+        let ConsolidationOutcome::Consolidated { token: out, .. } =
+            client(&sim, false).consolidate(&token, &quick()).unwrap()
+        else {
+            panic!()
+        };
+        // consolidated: m distinct certificates for L proofs
+        let (decoded, st) = Token::from_cbor_stats(&out.to_cbor()).unwrap();
+        assert_eq!(decoded, out);
+        let m = distinct_ucs(&out);
+        assert_eq!(st.uc_decodes as usize, m, "L={l}");
+        assert_eq!(st.uc_hits as usize, l - m, "L={l}");
+        flat.push((l, st.uc_decodes));
+        // original: every proof has its own certificate, nothing to share
+        let (_, st) = Token::from_cbor_stats(&token.to_cbor()).unwrap();
+        assert_eq!(st.uc_decodes as usize, l);
+        assert_eq!(st.uc_hits, 0);
+        raw.push((l, st.uc_decodes));
+    }
+    assert!(
+        flat.iter().all(|(_, d)| *d <= 2),
+        "flat in L after consolidation: {flat:?}"
+    );
+    assert!(
+        raw.windows(2).all(|w| w[1].1 > w[0].1),
+        "grows with L without sharing: {raw:?}"
+    );
+}
+
+/// Interning decodes exactly like the plain decoder, never remembers failures, and a
+/// different witness is a different encoding.
+#[test]
+fn interned_decoding_equals_plain_decoding() {
+    let (sim, token) = spread_token(3);
+    let ConsolidationOutcome::Consolidated { token: shared, .. } =
+        client(&sim, false).consolidate(&token, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    for t in [&token, &shared] {
+        let bytes = t.to_cbor();
+        let plain =
+            Token::from_cbor_with_limits(&bytes, crate::cbor::DecodeLimits::DEFAULT).unwrap();
+        let (interned, _) = Token::from_cbor_stats(&bytes).unwrap();
+        assert_eq!(plain, interned);
+        assert_eq!(interned.to_cbor(), bytes);
+    }
+    // one interner across two decodes (as for a token and its embedded source token)
+    let bytes = shared.to_cbor();
+    let mut interner = UcInterner::new();
+    let a = Token::from_cbor_interned(&bytes, crate::cbor::DecodeLimits::DEFAULT, &mut interner)
+        .unwrap();
+    let after_first = interner.stats();
+    let b = Token::from_cbor_interned(&bytes, crate::cbor::DecodeLimits::DEFAULT, &mut interner)
+        .unwrap();
+    assert_eq!(a, b);
+    assert_eq!(
+        interner.stats().uc_decodes,
+        after_first.uc_decodes,
+        "second token decodes nothing"
+    );
+
+    // a tampered encoding is its own entry; failed decodes are not remembered
+    let mut witness = shared.clone();
+    let mut proofs: Vec<_> = outer_proofs(&witness)
+        .iter()
+        .map(|o| o.proof.clone())
+        .collect();
+    proofs[0]
+        .unicity_certificate
+        .unicity_seal
+        .signatures
+        .push(("x".into(), vec![1; 65]));
+    witness = rebuild_token(&witness, proofs).unwrap();
+    let mut interner = UcInterner::new();
+    Token::from_cbor_interned(
+        &witness.to_cbor(),
+        crate::cbor::DecodeLimits::DEFAULT,
+        &mut interner,
+    )
+    .unwrap();
+    assert_eq!(
+        interner.stats().uc_decodes as usize,
+        distinct_ucs(&witness),
+        "the extra witness is a distinct certificate"
+    );
+    let mut broken = bytes.clone();
+    let last = broken.len() - 1;
+    broken[last] ^= 0xff;
+    let mut interner = UcInterner::new();
+    let _ = Token::from_cbor_interned(&broken, crate::cbor::DecodeLimits::DEFAULT, &mut interner);
+    let before = interner.stats();
+    let _ = Token::from_cbor_interned(&broken, crate::cbor::DecodeLimits::DEFAULT, &mut interner);
+    // a failure caused a re-decode attempt, it was never served from the memo
+    assert!(interner.stats().uc_decodes >= before.uc_decodes);
+    // capacity 0 disables interning: the reference behavior
+    let mut off = UcInterner::with_capacity(0);
+    Token::from_cbor_interned(&bytes, crate::cbor::DecodeLimits::DEFAULT, &mut off).unwrap();
+    assert_eq!(off.stats().uc_hits, 0);
+    assert_eq!(off.stats().uc_decodes as usize, outer_proofs(&shared).len());
+}
+
+/// Nested tokens decode through the verification operation's interner.
+struct EmbedsTokenCounting(Arc<Mutex<crate::api::bft::DecodeStats>>);
+
+impl MintJustificationVerifier for EmbedsTokenCounting {
+    fn tag(&self) -> u64 {
+        WRAP_TAG
+    }
+    fn verify(
+        &self,
+        genesis: &crate::transaction::CertifiedMintTransaction,
+        context: &mut VerificationContext<'_>,
+    ) -> Result<(), crate::verify::VerificationError> {
+        let bad = || crate::verify::VerificationError::MalformedMintJustification;
+        let bytes = genesis.transaction().justification().ok_or_else(bad)?;
+        let inner = Decoder::new(bytes)
+            .expect_tag(WRAP_TAG)
+            .and_then(|d| d.bytes_value().map(<[u8]>::to_vec))
+            .map_err(|_| bad())?;
+        let limits = context.policy().limits.decode;
+        let source =
+            Token::from_cbor_interned(&inner, limits, context.interner()).map_err(|_| bad())?;
+        *self.0.lock().unwrap() = context.interner().stats();
+        context.verify_embedded_token(&source, inner.len())
+    }
+}
+
+#[test]
+fn embedded_tokens_decode_through_the_operation_interner() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    let source = make_token(&sim, 3, None, 3);
+    let ConsolidationOutcome::Consolidated { token: source, .. } =
+        client(&sim, false).consolidate(&source, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    let l = outer_proofs(&source).len();
+    let m = distinct_ucs(&source);
+    assert!(m < l, "the embedded token shares certificates");
+    let justification = encode_tag(WRAP_TAG, &encode_byte_string(&source.to_cbor()));
+    let wrapper = mint_justified(&sim, 9, justification, 0);
+    let seen = Arc::new(Mutex::new(crate::api::bft::DecodeStats::default()));
+    let mut registry = MintJustificationRegistry::new();
+    registry
+        .register(Box::new(EmbedsTokenCounting(seen.clone())))
+        .unwrap();
+    let tb = sim.lock().unwrap().trust_base.clone();
+    let (r, _) = crate::verify::verify_token_with_memo_capacity(
+        &wrapper,
+        &tb,
+        &registry,
+        VerificationPolicy::default(),
+        DEFAULT_SEAL_MEMO_CAPACITY,
+    );
+    r.unwrap();
+    let st = *seen.lock().unwrap();
+    assert_eq!(
+        st.uc_decodes as usize, m,
+        "each distinct embedded certificate parsed once"
+    );
+    assert_eq!(st.uc_hits as usize, l - m);
 }

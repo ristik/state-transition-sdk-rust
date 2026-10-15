@@ -10,6 +10,7 @@
 use super::mint::MintTransaction;
 use super::transfer::TransferTransaction;
 use super::Transaction;
+use crate::api::bft::UcInterner;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::cbor::{encode_array, Decoder};
 use crate::crypto::hash::DataHash;
@@ -64,6 +65,15 @@ impl CertifiedMintTransaction {
         Ok(CertifiedMintTransaction {
             transaction: MintTransaction::from_cbor(items[0])?,
             inclusion_proof: InclusionProof::from_cbor(items[1])?,
+        })
+    }
+
+    /// Like [`from_cbor`](Self::from_cbor), interning the proof's certificate.
+    pub fn from_cbor_interned(d: Decoder<'_>, interner: &mut UcInterner) -> Result<Self, Error> {
+        let items = d.array(Some(2))?;
+        Ok(CertifiedMintTransaction {
+            transaction: MintTransaction::from_cbor(items[0])?,
+            inclusion_proof: InclusionProof::from_cbor_interned(items[1], interner)?,
         })
     }
 
@@ -123,6 +133,20 @@ impl CertifiedTransferTransaction {
         Ok(CertifiedTransferTransaction {
             transaction: TransferTransaction::from_cbor(items[0], source_state_hash, lock_script)?,
             inclusion_proof: InclusionProof::from_cbor(items[1])?,
+        })
+    }
+
+    /// Like [`from_cbor`](Self::from_cbor), interning the proof's certificate.
+    pub fn from_cbor_interned(
+        d: Decoder<'_>,
+        source_state_hash: DataHash,
+        lock_script: EncodedPredicate,
+        interner: &mut UcInterner,
+    ) -> Result<Self, Error> {
+        let items = d.array(Some(2))?;
+        Ok(CertifiedTransferTransaction {
+            transaction: TransferTransaction::from_cbor(items[0], source_state_hash, lock_script)?,
+            inclusion_proof: InclusionProof::from_cbor_interned(items[1], interner)?,
         })
     }
 

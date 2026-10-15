@@ -37,5 +37,5 @@ pub use partition_view::{
 pub use plan::{distinct_seals, outer_proofs, OuterProof, RootRoundBound, ShardRouter};
 #[cfg(feature = "client")]
 pub(crate) use plan::{rebuild_token, replacement_proof};
-pub use shard_tree::ShardTree;
+pub use shard_tree::{ShardTree, ShardTreeWork};
 pub use topology::PartitionTopology;
