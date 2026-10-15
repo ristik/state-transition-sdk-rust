@@ -122,6 +122,12 @@ unicity-token = { version = "0.1", default-features = false, features = ["alloc"
 
 Token and payment verification remain available in this configuration. Construct the trust base with `RootTrustBase::try_new`; JSON parsing requires `std`.
 
+## Partition views and seal reuse (building blocks)
+
+`unicity_token::consolidation` (pure `no_std + alloc`, no network) decodes the frozen `PartitionViewV1` — the complete shard-leaf vector of a partition under one unicity seal — rebuilds the native shard tree and, given one enclosing certificate, the trusted topology and an authority, derives the ordinary unicity certificate of every shard (`PartitionView::assemble_certificates`). The derived certificates carry the identical master seal. A decoded view is never trusted by itself; the topology and trust base come from your configuration, not from a response.
+
+Verification of tokens authenticates each distinct complete seal once per operation (`verify::SealSession`, a bounded memo of successful quorum checks bound to one trust base). Only the quorum-signature check is reused; paths, reference times, predicates and application rules run for every proof. `verify::verify_token_with_seal_stats` reports the signature work performed. This does not shrink tokens or change their format, and nested proofs that carry other seals still need their own check. Nothing here contacts an aggregator or consolidates a token automatically.
+
 ## Development
 
 ```bash

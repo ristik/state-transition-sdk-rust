@@ -1,0 +1,111 @@
+package types
+
+// Generator of the derived cross-implementation vectors consumed by the Rust SDK
+// (state-transition-sdk-rust tests/vectors/uc-consolidation/partition-view/v1/derived).
+//
+// Drop this file into bft-go-base `types/` at the commit recorded in the vector
+// manifest and run:
+//
+//	GEN_RUST_VECTORS_DIR=/some/dir go test ./types -run Test_GenRustVectors
+//
+// All inputs are deterministic (fixed signing key, fixed seal time); the test
+// helpers pvView/pvScheme/pvTopology of partition_view_test.go are reused.
+
+import (
+	"bytes"
+	"crypto"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	abcrypto "github.com/unicitynetwork/bft-go-base/crypto"
+)
+
+func Test_GenRustVectors(t *testing.T) {
+	dir := os.Getenv("GEN_RUST_VECTORS_DIR")
+	if dir == "" {
+		t.Skip("GEN_RUST_VECTORS_DIR not set")
+	}
+	key := bytes.Repeat([]byte{0x11}, 32)
+	signer, err := abcrypto.NewInMemorySecp256K1SignerFromKey(key)
+	require.NoError(t, err)
+	verifier, err := signer.Verifier()
+	require.NoError(t, err)
+	pub, err := verifier.MarshalPublicKey()
+	require.NoError(t, err)
+	tb, err := NewTrustBase(NetworkMainNet, []*NodeInfo{{NodeID: "test", SigKey: pub, Stake: 1}})
+	require.NoError(t, err)
+
+	write := func(path string, data []byte) {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, data, 0o644))
+	}
+	tbJSON, err := json.MarshalIndent(tb, "", "  ")
+	require.NoError(t, err)
+
+	for _, bits := range []int{0, 2, 3} {
+		n := 1 << bits
+		scheme := pvScheme(bits)
+		topo := pvTopology(scheme)
+		view := pvView(t, scheme)
+		out := filepath.Join(dir, fmt.Sprintf("shards-%d", n))
+
+		viewBytes, err := view.MarshalCBOR()
+		require.NoError(t, err)
+		golden, err := os.ReadFile(filepath.Join("testdata", "partition-view", "v1", fmt.Sprintf("shards-%d.cbor", n)))
+		require.NoError(t, err)
+		require.Equal(t, golden, viewBytes, "view must equal the frozen golden file")
+
+		tree, err := CreateShardTree(topo.Scheme, view.treeInputs(), crypto.SHA256)
+		require.NoError(t, err)
+		ut, err := NewUnicityTree(crypto.SHA256, []*UnicityTreeData{
+			{Partition: pvTestPartition, ShardTreeRoot: tree.RootHash()},
+			{Partition: 0x01010101, ShardTreeRoot: pvHash("other partition")},
+		})
+		require.NoError(t, err)
+		utc, err := ut.Certificate(pvTestPartition)
+		require.NoError(t, err)
+		seal := &UnicitySeal{Version: 1, NetworkID: tb.GetNetworkID(), Epoch: tb.GetEpoch(),
+			RootChainRoundNumber: tb.GetEpochStart() + 77, Timestamp: 1731504600,
+			PreviousHash: pvHash("prev root"), Hash: ut.RootHash()}
+		require.NoError(t, seal.Sign("test", signer))
+
+		l := view.Leaves[0]
+		stc, err := tree.Certificate(l.ShardID)
+		require.NoError(t, err)
+		uc := &UnicityCertificate{Version: 1, InputRecord: l.InputRecord, TRHash: l.TRHash, ShardConfHash: l.ShardConfHash,
+			ShardTreeCertificate: stc, UnicityTreeCertificate: utc, UnicitySeal: seal}
+		ucBytes, err := uc.MarshalCBOR()
+		require.NoError(t, err)
+
+		ucs, err := view.AssembleCertificates(uc, pvTestPartition, topo, TrustBaseSealVerifier(tb), crypto.SHA256)
+		require.NoError(t, err)
+
+		write(filepath.Join(out, "view.cbor"), viewBytes)
+		write(filepath.Join(out, "enclosing-uc.cbor"), ucBytes)
+		write(filepath.Join(out, "trust-base.json"), tbJSON)
+		type ctx struct {
+			PartitionID   uint32   `json:"partitionId"`
+			ShardIDs      []string `json:"shardIds"` // hex of the end-marker bitstring, canonical order
+			ShardConfHash []string `json:"shardConfHashes"`
+			ShardTreeRoot string   `json:"shardTreeRoot"`
+			SealHash      string   `json:"sealHash"`
+		}
+		c := ctx{PartitionID: uint32(pvTestPartition), ShardTreeRoot: hex.EncodeToString(tree.RootHash()), SealHash: hex.EncodeToString(seal.Hash)}
+		for i, uc := range ucs {
+			c.ShardIDs = append(c.ShardIDs, hex.EncodeToString(view.Leaves[i].ShardID.Bytes()))
+			c.ShardConfHash = append(c.ShardConfHash, hex.EncodeToString(topo.ShardConfHashes[view.Leaves[i].ShardID.Key()]))
+			b, err := uc.MarshalCBOR()
+			require.NoError(t, err)
+			write(filepath.Join(out, "ucs", fmt.Sprintf("%02d.cbor", i)), b)
+		}
+		cj, err := json.MarshalIndent(c, "", "  ")
+		require.NoError(t, err)
+		write(filepath.Join(out, "context.json"), cj)
+	}
+}

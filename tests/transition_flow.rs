@@ -302,3 +302,48 @@ fn inclusion_proof_response_round_trips_both_shapes() {
     let items = Decoder::new(&bytes).array(Some(2)).unwrap();
     assert!(unicity_token::api::InclusionProof::from_cbor(items[1]).is_err());
 }
+
+/// Verification authenticates each distinct seal once per operation: the
+/// number of quorum-signature checks equals the number of distinct complete
+/// seals among the token's proofs, however many proofs share them.
+#[test]
+fn verification_checks_each_distinct_seal_once() {
+    use std::collections::BTreeSet;
+    use unicity_token::verify::{
+        verify_token_with_seal_stats, MintJustificationRegistry, VerificationPolicy,
+    };
+
+    let tb = trust_base();
+    for name in ["aliceToken", "bobToken", "carolToken"] {
+        let (_, token) = token(name);
+        let mut seals = vec![token
+            .genesis()
+            .inclusion_proof()
+            .unicity_certificate
+            .unicity_seal
+            .to_cbor()];
+        for t in token.transactions() {
+            seals.push(
+                t.inclusion_proof()
+                    .unicity_certificate
+                    .unicity_seal
+                    .to_cbor(),
+            );
+        }
+        let distinct: BTreeSet<_> = seals.iter().collect();
+
+        let (result, stats) = verify_token_with_seal_stats(
+            &token,
+            &tb,
+            &MintJustificationRegistry::new(),
+            VerificationPolicy::default(),
+        );
+        result.unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(stats.quorum_checks as usize, distinct.len(), "{name}");
+        assert_eq!(
+            (stats.quorum_checks + stats.memo_hits) as usize,
+            seals.len(),
+            "{name}"
+        );
+    }
+}

@@ -39,6 +39,7 @@ pub use error::VerificationError;
 pub use mint_justification::{
     MintJustificationRegistry, MintJustificationVerifier, TokenDataVerifier,
 };
+pub(crate) use seal::check_seal_shape;
 pub use seal::{SealAuthenticator, SealSession, SealStats, DEFAULT_SEAL_MEMO_CAPACITY};
 
 use crate::api::bft::{RootTrustBase, UnicityCertificate};
