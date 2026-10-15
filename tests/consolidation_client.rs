@@ -1088,3 +1088,130 @@ fn the_transport_exposes_the_offending_indexes_per_class() {
         map(&[("pending", &[1, 3])])
     );
 }
+
+// ------------------------------------- the real server's status errors (#210) --
+
+fn batch_fixture(name: &str) -> (i64, Value) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/vectors/uc-consolidation/proof-status/v1")
+        .join(format!("batch-{name}.json"));
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    (
+        v["error"]["code"].as_i64().unwrap(),
+        v["error"]["data"].clone(),
+    )
+}
+
+fn served_error(name: &str) -> Reply {
+    let (code, data) = batch_fixture(name);
+    Reply::Error(code, data)
+}
+
+/// Every status error of the real server maps to its typed outcome, and the mixed outcome
+/// follows the server's precedence (unknown over expired over pending), while the
+/// transport keeps every class of offending indexes.
+#[test]
+fn the_real_servers_status_errors_map_to_typed_outcomes() {
+    use std::collections::BTreeMap;
+    use unicity_token::client::{
+        BatchAggregatorClient, BatchFailure, BatchRequest, RequestOptions, StateRoot,
+    };
+    use UnavailableReason::*;
+    let case = load("shards-4");
+    let ids: Vec<_> = case
+        .items
+        .iter()
+        .take(4)
+        .map(|i| i.state_id.clone())
+        .collect();
+    let classes = |m: &[(&str, &[usize])]| -> BTreeMap<String, Vec<usize>> {
+        m.iter().map(|(k, v)| (k.to_string(), v.to_vec())).collect()
+    };
+    type Expect = (
+        &'static str,
+        UnavailableReason,
+        bool,
+        &'static str,
+        BTreeMap<String, Vec<usize>>,
+    );
+    let expected: [Expect; 5] = [
+        (
+            "pending",
+            StatePending,
+            true,
+            "state_pending",
+            classes(&[("pending", &[1, 3])]),
+        ),
+        (
+            "expired",
+            StateExpired,
+            false,
+            "state_expired",
+            classes(&[("expired", &[0])]),
+        ),
+        (
+            "unknown",
+            StateUnknown,
+            false,
+            "state_unknown",
+            classes(&[("unknown", &[1])]),
+        ),
+        (
+            "mixed",
+            StateUnknown,
+            false,
+            "state_unknown",
+            classes(&[("expired", &[2]), ("pending", &[0]), ("unknown", &[3])]),
+        ),
+        (
+            "not-in-root",
+            StateNotInRoot,
+            false,
+            "state_not_in_root",
+            classes(&[("not_in_root", &[1, 3])]),
+        ),
+    ];
+    for (name, reason, retryable, detail, indexes) in expected {
+        // the typed transport error
+        let shard = Shard::start(
+            move |_| served_error(name),
+            Duration::ZERO,
+            Arc::new(Gauge::default()),
+        );
+        match HttpAggregatorClient::new_insecure_http(&shard.url)
+            .get_inclusion_proofs(
+                &BatchRequest {
+                    state_ids: &ids,
+                    state_root: StateRoot::Latest,
+                },
+                &RequestOptions { timeout_ms: 2_000 },
+            )
+            .unwrap_err()
+        {
+            BatchFailure::Rpc {
+                code,
+                detail: d,
+                retryable: r,
+                indexes: i,
+                ..
+            } => {
+                assert_eq!(code, -32008, "{name}");
+                assert_eq!(d.as_deref(), Some(detail), "{name}");
+                assert_eq!(r, Some(retryable), "{name}");
+                assert_eq!(i, indexes, "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        // the consolidation outcome (as the master's answer)
+        match run_with_master(served_error(name)).unwrap() {
+            BundleOutcome::Unavailable {
+                reason: got,
+                retryable: got_retryable,
+            } => {
+                assert_eq!(got, reason, "{name}");
+                assert_eq!(got_retryable, retryable, "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}

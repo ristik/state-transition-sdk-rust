@@ -1,0 +1,51 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/unicitynetwork/aggregator-go/internal/proofview"
+	"github.com/unicitynetwork/aggregator-go/pkg/api"
+)
+
+// Dumps the get_inclusion_proofs.v1 status errors, as the JSON-RPC server writes them
+// ({"jsonrpc":"2.0","id":N,"error":<*jsonrpc.Error>}).
+func TestDumpRustBatchStatusErrors(t *testing.T) {
+	dir := os.Getenv("DUMP_DIR")
+	if dir == "" {
+		t.Skip("DUMP_DIR not set")
+	}
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	write := func(name string, err *BatchError) {
+		require.NotNil(t, err, name)
+		raw, jerr := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 7, "error": err.RPCError()})
+		require.NoError(t, jerr)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "batch-"+name+".json"), append(raw, '\n'), 0o644))
+	}
+	e, ids, st := statusEnv(t)
+	g := unseen(e, 3)
+	st.m[g[0].String()], st.m[g[1].String()] = api.ProofStatusPending, api.ProofStatusExpired // g[2] unknown
+
+	_, err := e.svc.GetInclusionProofsV1(context.Background(), e.request([]api.StateID{ids[0], g[0], ids[1], g[0]}, nil))
+	write("pending", err)
+	_, err = e.svc.GetInclusionProofsV1(context.Background(), e.request([]api.StateID{g[1], ids[0]}, nil))
+	write("expired", err)
+	_, err = e.svc.GetInclusionProofsV1(context.Background(), e.request([]api.StateID{ids[0], g[2]}, nil))
+	write("unknown", err)
+	_, err = e.svc.GetInclusionProofsV1(context.Background(), e.request([]api.StateID{g[0], ids[0], g[1], g[2]}, nil))
+	write("mixed", err)
+
+	e2 := newBatchEnv(t, proofview.DefaultLimits())
+	old := e2.addRecords(4, 1000)
+	oldRoot := e2.finalize([]byte("pv1"))
+	more := e2.addRecords(2, 1000)
+	e2.finalize([]byte("pv2"))
+	e2.svc.status = mapStatus{m: map[string]api.ProofStatus{more[0].String(): api.ProofStatusPending}}
+	_, err = e2.svc.GetInclusionProofsV1(context.Background(), e2.request([]api.StateID{old[0], more[0], old[1], more[1]}, oldRoot))
+	write("not-in-root", err)
+}

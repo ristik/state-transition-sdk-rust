@@ -21,7 +21,7 @@ use unicity_token::api::{
 use unicity_token::cbor::{encode_array, encode_null, encode_tag, encode_uint};
 use unicity_token::client::{
     AggregatorClient, HttpAggregatorClient, HttpError, MembershipStatus,
-    NonInclusionAggregatorClient,
+    NonInclusionAggregatorClient, SubmitOutcome,
 };
 use unicity_token::transaction::Token;
 
@@ -806,4 +806,268 @@ fn a_single_lookup_exposes_the_status_hint() {
         }
         assert_eq!(server.request_count(), 1, "a lookup never waits");
     }
+}
+
+// --- the real server's proof-status output (aggregator-go PR 210) -----------
+
+fn server_fixture(name: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/vectors/uc-consolidation/proof-status/v1")
+            .join(name),
+    )
+    .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// A fixture body as an HTTP response (the mock answers with the request's id).
+fn served(name: &str) -> Vec<u8> {
+    http_response("200 OK", server_fixture(name).trim())
+}
+
+/// The response decoded from the legacy (string) result of the same server.
+fn legacy_response(name: &str) -> InclusionProofResponse {
+    let v: serde_json::Value = serde_json::from_str(&server_fixture(name)).unwrap();
+    let hex = v["result"].as_str().expect("legacy string result");
+    InclusionProofResponse::from_cbor(unicity_token::cbor::Decoder::new(
+        &hex::decode(hex).unwrap(),
+    ))
+    .unwrap()
+}
+
+#[test]
+fn the_real_server_status_results_decode_and_match_the_legacy_result() {
+    for (name, status, certified) in [
+        ("included", Some(ProofStatus::Included), true),
+        // a stale pending mark: the real server lets the proof win and reports included
+        ("stale-pending-mark", Some(ProofStatus::Included), true),
+        ("pending", Some(ProofStatus::Pending), false),
+        ("expired", Some(ProofStatus::Expired), false),
+        ("unknown", Some(ProofStatus::Unknown), false),
+    ] {
+        let server = MockServer::start(vec![served(&format!("v2-status-{name}.json"))]);
+        let (response, got) = client(&server.url)
+            .lookup_inclusion_proof(&fixture_state_id())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(got, status, "{name}");
+        assert_eq!(response.inclusion_proof().is_some(), certified, "{name}");
+        // the proof inside the status result is the default result, byte for byte
+        assert_eq!(
+            response,
+            legacy_response(&format!("v2-default-{name}.json")),
+            "{name}"
+        );
+        assert!(server.last_request().contains(r#""includeStatus":true"#));
+    }
+    // a server without a status source answers unknown
+    let server = MockServer::start(vec![served("v2-status-no-provider.json")]);
+    let (_, got) = client(&server.url)
+        .lookup_inclusion_proof(&fixture_state_id())
+        .unwrap();
+    assert_eq!(got, Some(ProofStatus::Unknown));
+}
+
+#[test]
+fn waiting_against_the_real_server_output() {
+    let id = fixture_state_id();
+    // a certified proof wins over a stale pending mark
+    let server = MockServer::start(vec![served("v2-status-stale-pending-mark.json")]);
+    assert!(client(&server.url).get_inclusion_proof(&id).is_ok());
+    let server = MockServer::start(vec![served("v2-status-included.json")]);
+    assert!(client(&server.url).get_inclusion_proof(&id).is_ok());
+
+    let server = MockServer::start(vec![served("v2-status-expired.json")]);
+    assert!(matches!(
+        client(&server.url).get_inclusion_proof(&id),
+        Err(HttpError::StateExpired)
+    ));
+    assert_eq!(server.request_count(), 1);
+
+    let server = MockServer::start(vec![served("v2-status-unknown.json")]);
+    assert!(matches!(
+        client(&server.url).get_inclusion_proof(&id),
+        Err(HttpError::StateUnknown)
+    ));
+    assert_eq!(
+        server.request_count(),
+        3,
+        "the default grace of two unknown answers"
+    );
+
+    // pending keeps polling until the attempts run out, then the proof arrives
+    let server = MockServer::start(vec![
+        served("v2-status-pending.json"),
+        served("v2-status-pending.json"),
+        served("v2-status-included.json"),
+    ]);
+    assert!(client(&server.url).get_inclusion_proof(&id).is_ok());
+    assert_eq!(server.request_count(), 3);
+
+    // a status-unaware (legacy) result of the same server keeps the old behavior
+    let server = MockServer::start(vec![served("v2-default-included.json")]);
+    assert!(client(&server.url).get_inclusion_proof(&id).is_ok());
+    let server = MockServer::start(vec![served("v2-default-unknown.json")]);
+    assert!(matches!(
+        client(&server.url).get_inclusion_proof(&id),
+        Err(HttpError::Timeout)
+    ));
+}
+
+// --- idempotent resubmission --------------------------------------------------
+
+const QUEUE_DUPLICATE: &str = r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"Failed to submit certification request","data":"failed to store certificationRequest: multiple write errors: [{write errors: [{E11000 duplicate key error collection: aggregator.certification_requests index: stateId_1 dup key: { stateId: \"abab\" }}]}, {<nil>}]"}}"#;
+
+fn status_reply(status: &str) -> Vec<u8> {
+    ok_json(&format!(r#"{{"status":"{status}"}}"#))
+}
+
+#[test]
+fn resubmitting_a_pending_request_is_not_a_failure() {
+    let (_, data) = fixture_proof_and_data();
+    let dup = http_response("200 OK", QUEUE_DUPLICATE);
+
+    // the plain submit keeps reporting the duplicate as the error it always was
+    let server = MockServer::start(vec![dup.clone()]);
+    let err = client(&server.url)
+        .submit_certification_request(&data)
+        .unwrap_err();
+    assert!(matches!(err, HttpError::Rpc { code: -32603, .. }), "{err}");
+
+    // the idempotent resubmission treats it as already submitted
+    let server = MockServer::start(vec![dup]);
+    assert_eq!(
+        client(&server.url)
+            .resubmit_certification_request(&data)
+            .unwrap(),
+        SubmitOutcome::AlreadySubmitted
+    );
+
+    // already certified
+    let server = MockServer::start(vec![status_reply("STATE_ID_EXISTS")]);
+    assert!(matches!(
+        client(&server.url).submit_certification_request(&data),
+        Err(HttpError::Rejected(ref s)) if s == "STATE_ID_EXISTS"
+    ));
+    let server = MockServer::start(vec![status_reply("STATE_ID_EXISTS")]);
+    assert_eq!(
+        client(&server.url)
+            .resubmit_certification_request(&data)
+            .unwrap(),
+        SubmitOutcome::AlreadySubmitted
+    );
+
+    // a fresh queueing is Accepted; every other rejection and failure stays an error
+    let server = MockServer::start(vec![status_reply("SUCCESS")]);
+    assert_eq!(
+        client(&server.url)
+            .resubmit_certification_request(&data)
+            .unwrap(),
+        SubmitOutcome::Accepted
+    );
+    for reply in [
+        status_reply("REQUEST_EXPIRED"),
+        status_reply("SIGNATURE_VERIFICATION_FAILED"),
+        // an internal error that is not a duplicate key
+        http_response(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"Failed","data":"failed to store certificationRequest: connection reset"}}"#,
+        ),
+        // duplicate-key text under another code is not the queue's refusal
+        http_response(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32004,"message":"db","data":"duplicate key"}}"#,
+        ),
+        // a duplicate-key error without data
+        http_response(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"duplicate key"}}"#,
+        ),
+    ] {
+        let server = MockServer::start(vec![reply]);
+        assert!(client(&server.url)
+            .resubmit_certification_request(&data)
+            .is_err());
+    }
+}
+
+#[test]
+fn submit_and_wait_resubmits_the_same_request_when_it_is_reported_lost() {
+    let (proof, data) = fixture_proof_and_data();
+    let unknown = served("v2-status-unknown.json");
+    let found = served("v2-status-included.json");
+    let dup = http_response("200 OK", QUEUE_DUPLICATE);
+
+    // submit, three unknown answers (grace 2), resubmit (still held elsewhere), the proof
+    let server = MockServer::start(vec![
+        status_reply("SUCCESS"),
+        unknown.clone(),
+        unknown.clone(),
+        unknown.clone(),
+        dup,
+        found.clone(),
+    ]);
+    let got = client(&server.url).submit_and_wait(&data, 1).unwrap();
+    assert_eq!(
+        got,
+        legacy_response("v2-default-included.json")
+            .inclusion_proof()
+            .unwrap()
+            .clone()
+    );
+    let _ = proof;
+    assert_eq!(server.request_count(), 6);
+
+    // the resubmission is the identical signed request
+    let requests: Vec<String> = server.requests.lock().unwrap().clone();
+    let submitted: Vec<_> = requests
+        .iter()
+        .filter(|r| r.contains("certification_request"))
+        .collect();
+    assert_eq!(submitted.len(), 2);
+    let body = |r: &str| r.split_once("\r\n\r\n").unwrap().1.to_string();
+    let (a, b) = (
+        serde_json::from_str::<serde_json::Value>(&body(submitted[0])).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&body(submitted[1])).unwrap(),
+    );
+    assert_eq!(a["params"], b["params"]);
+
+    // no resubmission allowed: the typed error comes back
+    let server = MockServer::start(vec![status_reply("SUCCESS"), unknown.clone()]);
+    assert!(matches!(
+        client(&server.url).submit_and_wait(&data, 0),
+        Err(HttpError::StateUnknown)
+    ));
+
+    // expired is resubmitted too; a persistent loss stops after the allowed resubmissions
+    let expired = served("v2-status-expired.json");
+    let server = MockServer::start(vec![
+        status_reply("SUCCESS"),
+        expired.clone(),
+        status_reply("SUCCESS"),
+        found,
+    ]);
+    assert!(client(&server.url).submit_and_wait(&data, 1).is_ok());
+    let server = MockServer::start(vec![
+        status_reply("SUCCESS"),
+        expired.clone(),
+        status_reply("SUCCESS"),
+        expired,
+    ]);
+    assert!(matches!(
+        client(&server.url).submit_and_wait(&data, 1),
+        Err(HttpError::StateExpired)
+    ));
+    assert_eq!(server.request_count(), 4);
+
+    // a real rejection of the resubmission is reported, not swallowed
+    let server = MockServer::start(vec![
+        status_reply("SUCCESS"),
+        unknown.clone(),
+        unknown.clone(),
+        unknown,
+        status_reply("REQUEST_EXPIRED"),
+    ]);
+    assert!(matches!(
+        client(&server.url).submit_and_wait(&data, 1),
+        Err(HttpError::Rejected(ref s)) if s == "REQUEST_EXPIRED"
+    ));
 }

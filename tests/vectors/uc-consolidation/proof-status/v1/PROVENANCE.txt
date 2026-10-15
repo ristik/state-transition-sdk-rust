@@ -1,0 +1,9 @@
+Real output of aggregator-go PR #210 (uc/proof-status) @ d6d8fad4b76d6c436b1a86d7fd962e62d0ef337e:
+- v2-*.json: bodies written by the real get_inclusion_proof.v2 handler (JSON-RPC server, golden-tested
+  there) with and without includeStatus, for every status, with the unicity certificate replaced by a
+  decodable one (shards-4/ucs/00.cbor of the F1 corpus) because the server's own test fixture has none.
+- batch-*.json: the get_inclusion_proofs.v1 status errors of the real service code
+  ({"jsonrpc":"2.0","id":7,"error":<*jsonrpc.Error>} as the JSON-RPC server marshals it).
+- generator/*.txt: the throwaway Go tests that dumped them (drop into internal/gateway and internal/service
+  of that commit; DUMP_DIR=<dir> UC_HEX=<hex of the UC>).
+The "id" in the bodies is 7; the consumer tests answer with the request's id.

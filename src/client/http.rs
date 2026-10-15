@@ -248,6 +248,99 @@ impl HttpAggregatorClient {
         self
     }
 
+    fn submit_inner(&self, data: &CertificationData) -> Result<SubmitReply, HttpError> {
+        let request = CertificationRequest::new(data);
+        let state_id_hex = hex::encode(request.state_id().bytes());
+        let params = serde_json::Value::String(hex::encode(request.to_cbor()));
+
+        let mut headers: Vec<(&str, &str)> = alloc::vec![("X-State-ID", state_id_hex.as_str())];
+        if let Some(key) = &self.api_key {
+            headers.push(("X-API-Key", key.expose()));
+        }
+
+        let result = match self.rpc_raw("certification_request", params, &headers, None) {
+            Ok(result) => result,
+            Err(RawFailure::Envelope(EnvelopeError::Rpc {
+                code,
+                message,
+                data,
+            })) if is_queue_duplicate(code, &data) => {
+                return Ok(SubmitReply::QueueDuplicate(HttpError::Rpc {
+                    code,
+                    message,
+                }));
+            }
+            Err(e) => return Err(raw_to_http(e)),
+        };
+        match result
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+        {
+            "SUCCESS" => Ok(SubmitReply::Accepted),
+            "STATE_ID_EXISTS" => Ok(SubmitReply::StateIdExists),
+            other => Err(HttpError::Rejected(other.to_string())),
+        }
+    }
+
+    /// Submit a certification request **idempotently**: re-sending a request the
+    /// aggregator already holds is not a failure.
+    ///
+    /// The request is signed and carries no fresh randomness, so a resubmission is
+    /// the same request and never produces a second leaf. When the aggregator already
+    /// has it the call returns [`SubmitOutcome::AlreadySubmitted`] and the caller
+    /// should just wait for the proof. That covers: the Mongo-backed queue refusing the
+    /// copy of a still-pending request (reported as an internal error whose data names a
+    /// duplicate key; the Redis-backed queue silently accepts and drops it) and
+    /// `STATE_ID_EXISTS` (already certified). Every other rejection (invalid signature,
+    /// `REQUEST_EXPIRED`, ...) is still an error. The plain
+    /// [`submit_certification_request`](AggregatorClient::submit_certification_request)
+    /// keeps reporting both duplicate responses as errors.
+    ///
+    /// The duplicate-key case is recognized from the aggregator's error text, which
+    /// the server gives no machine code for.
+    pub fn resubmit_certification_request(
+        &self,
+        data: &CertificationData,
+    ) -> Result<SubmitOutcome, HttpError> {
+        match self.submit_inner(data)? {
+            SubmitReply::Accepted => Ok(SubmitOutcome::Accepted),
+            SubmitReply::StateIdExists | SubmitReply::QueueDuplicate(_) => {
+                Ok(SubmitOutcome::AlreadySubmitted)
+            }
+        }
+    }
+
+    /// Submit (idempotently) and wait for the proof, resubmitting the same signed
+    /// request when the aggregator reports it lost or expired.
+    ///
+    /// When waiting ends with [`HttpError::StateUnknown`] (lost, misrouted, forgotten
+    /// by a restart) or [`HttpError::StateExpired`] (dropped before inclusion) the
+    /// identical request is sent again, at most `max_resubmits` times, and the wait
+    /// restarts. A resubmission that meets a request still held elsewhere is
+    /// [`AlreadySubmitted`](SubmitOutcome::AlreadySubmitted), not an error. The status
+    /// is an unauthenticated hint: the returned proof still has to be verified.
+    pub fn submit_and_wait(
+        &self,
+        data: &CertificationData,
+        max_resubmits: u32,
+    ) -> Result<InclusionProof, HttpError> {
+        let state_id = StateId::derive(data.lock_script(), data.source_state_hash());
+        self.resubmit_certification_request(data)?;
+        let mut resubmits = 0;
+        loop {
+            match AggregatorClient::get_inclusion_proof(self, &state_id) {
+                Err(HttpError::StateUnknown | HttpError::StateExpired)
+                    if resubmits < max_resubmits =>
+                {
+                    resubmits += 1;
+                    self.resubmit_certification_request(data)?;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// One proof lookup, without waiting, returning the aggregator's status hint
     /// next to the response. The status is `None` for servers that do not support
     /// it (and for values this version does not know).
@@ -328,16 +421,7 @@ impl HttpAggregatorClient {
         headers: &[(&str, &str)],
     ) -> Result<serde_json::Value, HttpError> {
         self.rpc_raw(method, params, headers, None)
-            .map_err(|e| match e {
-                RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
-                RawFailure::Transport(m) => HttpError::Transport(m),
-                RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
-                RawFailure::Envelope(EnvelopeError::Rpc { code, message, .. }) => {
-                    HttpError::Rpc { code, message }
-                }
-                RawFailure::TooLarge(limit) => HttpError::ResponseTooLarge { limit },
-                RawFailure::Config(e) => e,
-            })
+            .map_err(raw_to_http)
     }
 
     /// One JSON-RPC call with an optional per-request timeout, keeping the
@@ -394,6 +478,55 @@ impl HttpAggregatorClient {
         let text = read_response_raw(response, MAX_RESPONSE_BODY_BYTES)?;
         decode_rpc_envelope(&text, &id).map_err(RawFailure::Envelope)
     }
+}
+
+fn raw_to_http(e: RawFailure) -> HttpError {
+    match e {
+        RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
+        RawFailure::Transport(m) => HttpError::Transport(m),
+        RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
+        RawFailure::Envelope(EnvelopeError::Rpc { code, message, .. }) => {
+            HttpError::Rpc { code, message }
+        }
+        RawFailure::TooLarge(limit) => HttpError::ResponseTooLarge { limit },
+        RawFailure::Config(e) => e,
+    }
+}
+
+/// JSON-RPC "internal error": how the aggregator reports a failure to queue a request.
+const RPC_INTERNAL_ERROR: i64 = -32603;
+
+/// Whether an RPC error is the queue refusing a copy of a request it already holds:
+/// the Mongo commitment queue's unique `stateId` index, surfaced as an internal error
+/// whose data carries the driver's "duplicate key" text. (The Redis queue accepts the
+/// copy silently.) Recognized by text because the server gives no machine code for it.
+fn is_queue_duplicate(code: i64, data: &Option<serde_json::Value>) -> bool {
+    code == RPC_INTERNAL_ERROR
+        && data
+            .as_ref()
+            .and_then(|d| d.as_str())
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|d| d.contains("duplicate key") || d.contains("e11000"))
+}
+
+/// The aggregator's reply to a certification request, as far as resubmission cares.
+enum SubmitReply {
+    Accepted,
+    /// A record for the state id already exists (`STATE_ID_EXISTS`).
+    StateIdExists,
+    /// The queue refused a copy of a request it still holds (original error kept).
+    QueueDuplicate(HttpError),
+}
+
+/// What an idempotent (re)submission achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubmitOutcome {
+    /// The request was queued.
+    Accepted,
+    /// The aggregator already holds this request - still queued, or already
+    /// certified - and did not queue a second copy. Not a failure: wait for the proof.
+    AlreadySubmitted,
 }
 
 /// Failure of one raw JSON-RPC exchange.
@@ -506,24 +639,11 @@ impl AggregatorClient for HttpAggregatorClient {
     type Error = HttpError;
 
     fn submit_certification_request(&self, data: &CertificationData) -> Result<(), HttpError> {
-        let request = CertificationRequest::new(data);
-        let state_id_hex = hex::encode(request.state_id().bytes());
-        let params = serde_json::Value::String(hex::encode(request.to_cbor()));
-
-        let mut headers: Vec<(&str, &str)> = alloc::vec![("X-State-ID", state_id_hex.as_str())];
-        if let Some(key) = &self.api_key {
-            headers.push(("X-API-Key", key.expose()));
+        match self.submit_inner(data)? {
+            SubmitReply::Accepted => Ok(()),
+            SubmitReply::StateIdExists => Err(HttpError::Rejected("STATE_ID_EXISTS".to_string())),
+            SubmitReply::QueueDuplicate(error) => Err(error),
         }
-
-        let result = self.rpc("certification_request", params, &headers)?;
-        let status = result
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default();
-        if status != "SUCCESS" {
-            return Err(HttpError::Rejected(status.to_string()));
-        }
-        Ok(())
     }
 
     /// Wait for the certified proof of `state_id`.
