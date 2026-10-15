@@ -7,6 +7,7 @@
 //! [`ProofClient::consolidate_proofs`]; token semantics are covered by the
 //! in-crate simulation tests.
 #![cfg(feature = "http")]
+#![allow(clippy::result_large_err)]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

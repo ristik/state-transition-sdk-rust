@@ -198,6 +198,7 @@ pub fn rebuild_token(token: &Token, proofs: Vec<InclusionProof>) -> Result<Token
 mod tests {
     use super::*;
     use crate::cbor::{encode_byte_string, Decoder};
+    use alloc::vec;
 
     fn state_id(first: u8) -> StateId {
         let mut b = [0u8; 32];

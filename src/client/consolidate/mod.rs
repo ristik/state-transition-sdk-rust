@@ -19,6 +19,10 @@
 //! whole-verification seal work separately. The token format and its size are
 //! unchanged.
 
+// Errors carry typed context and sit on the cold path; boxing them would only
+// obscure the public error enum that callers match on.
+#![allow(clippy::result_large_err)]
+
 mod error;
 mod run;
 #[cfg(all(test, feature = "std"))]
