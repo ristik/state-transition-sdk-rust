@@ -4,7 +4,7 @@ use crate::api::bft::RootTrustBase;
 use crate::cbor::DecodeLimits;
 use crate::transaction::Token;
 
-use super::{verify_token_in_context, MintJustificationRegistry, VerificationError};
+use super::{verify_token_in_context, MintJustificationRegistry, SealSession, VerificationError};
 
 /// Resource limits applied across one complete, possibly recursive verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,7 @@ pub struct VerificationContext<'a> {
     trust_base: &'a RootTrustBase,
     registry: &'a MintJustificationRegistry,
     policy: VerificationPolicy,
+    seals: SealSession<'a>,
     embedded_token_depth: usize,
     total_embedded_token_bytes: usize,
 }
@@ -76,6 +77,7 @@ impl<'a> VerificationContext<'a> {
             trust_base,
             registry,
             policy,
+            seals: SealSession::new(trust_base),
             embedded_token_depth: 0,
             total_embedded_token_bytes: 0,
         }
@@ -84,6 +86,12 @@ impl<'a> VerificationContext<'a> {
     /// Root of trust used by the entire recursive verification chain.
     pub fn trust_base(&self) -> &RootTrustBase {
         self.trust_base
+    }
+
+    /// The seal authentication session shared by the whole recursive
+    /// verification: repeated seals are checked against the quorum once.
+    pub fn seals(&mut self) -> &mut SealSession<'a> {
+        &mut self.seals
     }
 
     /// Active verification policy and limits.

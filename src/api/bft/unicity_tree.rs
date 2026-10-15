@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 
 use crate::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
+use crate::crypto::hash::{sha256, DataHash, DataHasher, HashAlgorithm};
 use crate::error::Error;
 
 /// CBOR tag for [`UnicityTreeCertificate`].
@@ -65,6 +66,38 @@ impl UnicityTreeCertificate {
             partition_identifier,
             steps,
         })
+    }
+
+    /// Fold the shard-tree root of this partition up the steps to the
+    /// unicity-tree root (the value the unicity seal commits to).
+    pub fn compute_root_hash(&self, shard_tree_root: &[u8]) -> DataHash {
+        let key = self.partition_identifier.to_be_bytes();
+
+        let unicity_tree_hash = sha256(&encode_byte_string(shard_tree_root));
+        // LEAF
+        let mut result = DataHasher::new(HashAlgorithm::Sha256)
+            .expect("sha256")
+            .update(&encode_byte_string(&[0x01]))
+            .update(&encode_byte_string(&key))
+            .update(&encode_byte_string(unicity_tree_hash.data()))
+            .finalize();
+
+        for step in &self.steps {
+            let step_key = step.key.to_be_bytes();
+            let h = DataHasher::new(HashAlgorithm::Sha256)
+                .expect("sha256")
+                .update(&encode_byte_string(&[0x00])) // NODE
+                .update(&encode_byte_string(&step_key));
+            result = if key[..] > step_key[..] {
+                h.update(&encode_byte_string(&step.hash))
+                    .update(&encode_byte_string(result.data()))
+            } else {
+                h.update(&encode_byte_string(result.data()))
+                    .update(&encode_byte_string(&step.hash))
+            }
+            .finalize();
+        }
+        result
     }
 
     /// Encode to CBOR (tagged).

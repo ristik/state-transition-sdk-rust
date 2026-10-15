@@ -10,7 +10,7 @@ use super::unicity_tree::UnicityTreeCertificate;
 use crate::cbor::{
     encode_array, encode_byte_string, encode_nullable, encode_tag, encode_uint, Decoder,
 };
-use crate::crypto::hash::{sha256, DataHash, DataHasher, HashAlgorithm};
+use crate::crypto::hash::{DataHash, DataHasher, HashAlgorithm};
 use crate::error::Error;
 
 /// CBOR tag for [`UnicityCertificate`].
@@ -114,33 +114,8 @@ impl UnicityCertificate {
     /// Recompute the unicity-tree root hash (which must equal the seal hash).
     pub fn computed_seal_hash(&self) -> Result<DataHash, Error> {
         let shard_root = self.shard_tree_root_hash()?;
-        let utc = &self.unicity_tree_certificate;
-        let key = utc.partition_identifier.to_be_bytes();
-
-        let unicity_tree_hash = sha256(&encode_byte_string(shard_root.data()));
-        // LEAF
-        let mut result = DataHasher::new(HashAlgorithm::Sha256)
-            .expect("sha256")
-            .update(&encode_byte_string(&[0x01]))
-            .update(&encode_byte_string(&key))
-            .update(&encode_byte_string(unicity_tree_hash.data()))
-            .finalize();
-
-        for step in &utc.steps {
-            let step_key = step.key.to_be_bytes();
-            let h = DataHasher::new(HashAlgorithm::Sha256)
-                .expect("sha256")
-                .update(&encode_byte_string(&[0x00])) // NODE
-                .update(&encode_byte_string(&step_key));
-            result = if key[..] > step_key[..] {
-                h.update(&encode_byte_string(&step.hash))
-                    .update(&encode_byte_string(result.data()))
-            } else {
-                h.update(&encode_byte_string(result.data()))
-                    .update(&encode_byte_string(&step.hash))
-            }
-            .finalize();
-        }
-        Ok(result)
+        Ok(self
+            .unicity_tree_certificate
+            .compute_root_hash(shard_root.data()))
     }
 }

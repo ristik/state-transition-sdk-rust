@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "networkId": 1,
+  "epoch": 1,
+  "epochStartRound": 0,
+  "rootNodes": [
+    {
+      "nodeId": "test",
+      "sigKey": "0x034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+      "stake": 1
+    }
+  ],
+  "quorumThreshold": 1,
+  "stateHash": "",
+  "changeRecordHash": "",
+  "previousEntryHash": "",
+  "signatures": {}
+}

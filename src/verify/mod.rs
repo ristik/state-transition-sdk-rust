@@ -32,15 +32,15 @@
 mod context;
 mod error;
 mod mint_justification;
+mod seal;
 
 pub use context::{VerificationContext, VerificationLimits, VerificationPolicy};
 pub use error::VerificationError;
 pub use mint_justification::{
     MintJustificationRegistry, MintJustificationVerifier, TokenDataVerifier,
 };
-
-use alloc::collections::BTreeSet;
-use alloc::vec::Vec;
+pub(crate) use seal::check_seal_shape;
+pub use seal::{SealAuthenticator, SealSession, SealStats, DEFAULT_SEAL_MEMO_CAPACITY};
 
 use crate::api::bft::{RootTrustBase, UnicityCertificate};
 use crate::api::inclusion_proof::InclusionProof;
@@ -77,11 +77,25 @@ pub fn verify_token_with_policy(
     registry: &MintJustificationRegistry,
     policy: VerificationPolicy,
 ) -> Result<(), VerificationError> {
-    trust_base
-        .validate()
-        .map_err(VerificationError::InvalidTrustBase)?;
+    verify_token_with_seal_stats(token, trust_base, registry, policy).0
+}
+
+/// Like [`verify_token_with_policy`], additionally reporting how much quorum
+/// signature work the (operation-scoped) seal session performed. Seals shared
+/// by several proofs of the token, including nested source tokens, are
+/// authenticated once while they remain in the session's bounded memo.
+pub fn verify_token_with_seal_stats(
+    token: &Token,
+    trust_base: &RootTrustBase,
+    registry: &MintJustificationRegistry,
+    policy: VerificationPolicy,
+) -> (Result<(), VerificationError>, SealStats) {
     let mut context = VerificationContext::new(trust_base, registry, policy);
-    verify_token_in_context(token, &mut context)
+    let result = trust_base
+        .validate()
+        .map_err(VerificationError::InvalidTrustBase)
+        .and_then(|()| verify_token_in_context(token, &mut context));
+    (result, context.seals().stats())
 }
 
 pub(crate) fn verify_token_in_context(
@@ -97,7 +111,7 @@ pub(crate) fn verify_token_in_context(
 
     for (i, transfer) in token.transactions().iter().enumerate() {
         verify_inclusion_proof(
-            context.trust_base(),
+            context.seals(),
             transfer.inclusion_proof(),
             transfer.transaction(),
             transfer.reference_time(),
@@ -137,7 +151,7 @@ fn verify_genesis(
     }
 
     verify_inclusion_proof(
-        trust_base,
+        context.seals(),
         genesis.inclusion_proof(),
         mint,
         genesis.reference_time(),
@@ -156,7 +170,7 @@ fn verify_genesis(
 
 /// Verify a single inclusion proof for `transaction`.
 fn verify_inclusion_proof(
-    trust_base: &RootTrustBase,
+    seals: &mut SealSession<'_>,
     proof: &InclusionProof,
     transaction: &impl Transaction,
     reference_time: u64,
@@ -180,7 +194,7 @@ fn verify_inclusion_proof(
     // delegate the relation, shard, UC, and witness checks to the public
     // state-membership verifier.
     let state_id = StateId::derive(transaction.lock_script(), transaction.source_state_hash());
-    verify_inclusion_proof_for(trust_base, proof, &state_id, reference_time)
+    verify_inclusion_proof_in(seals, proof, &state_id, reference_time)
 }
 
 /// Verify that `state_id` is included at the certified root carried by `proof`.
@@ -193,9 +207,23 @@ pub fn verify_inclusion_proof_for(
     state_id: &StateId,
     reference_time: u64,
 ) -> Result<(), VerificationError> {
-    trust_base
-        .validate()
-        .map_err(VerificationError::InvalidTrustBase)?;
+    verify_inclusion_proof_in(
+        &mut SealSession::new(trust_base),
+        proof,
+        state_id,
+        reference_time,
+    )
+}
+
+/// [`verify_inclusion_proof_for`] within a caller-owned seal session, so that
+/// several proofs under one seal share a single signature check.
+pub fn verify_inclusion_proof_in(
+    seals: &mut SealSession<'_>,
+    proof: &InclusionProof,
+    state_id: &StateId,
+    reference_time: u64,
+) -> Result<(), VerificationError> {
+    seals.ensure_trust_base()?;
     let inclusion_certificate = &proof.inclusion_certificate;
     let certification_data = &proof.certification_data;
 
@@ -239,7 +267,7 @@ pub fn verify_inclusion_proof_for(
     }
 
     // The unicity certificate must chain to a quorum-signed seal on our network.
-    verify_unicity_certificate(trust_base, &proof.unicity_certificate)?;
+    verify_unicity_certificate(seals, &proof.unicity_certificate)?;
 
     // Finally, the unlock script must satisfy the (reconstructed) lock script.
     verify_predicate(
@@ -254,12 +282,12 @@ pub fn verify_inclusion_proof_for(
 }
 
 fn verify_unicity_certificate(
-    trust_base: &RootTrustBase,
+    seals: &mut SealSession<'_>,
     uc: &UnicityCertificate,
 ) -> Result<(), VerificationError> {
     let seal = &uc.unicity_seal;
 
-    if seal.network_id != trust_base.network_id {
+    if seal.network_id != seals.trust_base().network_id {
         return Err(VerificationError::SealNetworkMismatch);
     }
 
@@ -271,33 +299,9 @@ fn verify_unicity_certificate(
         return Err(VerificationError::SealRootMismatch);
     }
 
-    // Count distinct, valid root-node signatures over the seal hash.
-    let seal_hash = seal.calculate_hash();
-    let mut counted: BTreeSet<&str> = BTreeSet::new();
-    let mut counted_keys = Vec::new();
-    for (node_id, signature) in &seal.signatures {
-        if counted.contains(node_id.as_str()) {
-            continue;
-        }
-        let Some(key) = trust_base.signing_key(node_id) else {
-            continue;
-        };
-        if counted_keys.contains(&key) {
-            continue;
-        }
-        let Ok(sig) = crate::crypto::signature::Signature::decode(signature) else {
-            continue;
-        };
-        if sig.verify(seal_hash.data(), key) {
-            counted.insert(node_id.as_str());
-            counted_keys.push(key);
-        }
-    }
-
-    if (counted.len() as u64) < trust_base.quorum_threshold {
-        return Err(VerificationError::QuorumNotMet);
-    }
-    Ok(())
+    // The root must be signed by a quorum of the trusted validators; an
+    // identical seal already authenticated in this session is not re-checked.
+    seals.verify_quorum(seal)
 }
 
 /// Verify that `target` was absent at the certified root carried by `proof`.
@@ -309,9 +313,8 @@ pub fn verify_non_inclusion_proof(
     proof: &NonInclusionProof,
     target: &StateId,
 ) -> Result<(), VerificationError> {
-    trust_base
-        .validate()
-        .map_err(VerificationError::InvalidTrustBase)?;
+    let mut seals = SealSession::new(trust_base);
+    seals.ensure_trust_base()?;
 
     let uc = proof.unicity_certificate();
     let expected_root = match uc.input_record.hash.as_slice() {
@@ -343,7 +346,7 @@ pub fn verify_non_inclusion_proof(
 
     // Authenticate the root before reporting whether the terminal is the
     // requested state. An untrusted certificate must never yield StateIncluded.
-    verify_unicity_certificate(trust_base, uc)?;
+    verify_unicity_certificate(&mut seals, uc)?;
 
     if proof.certificate().terminal_matches(target) {
         return Err(VerificationError::StateIncluded);
@@ -382,6 +385,21 @@ fn verify_predicate(
 #[cfg(all(test, feature = "client"))]
 mod tests {
     use super::*;
+
+    /// Verify with a fresh seal session per call (the pre-session behavior).
+    fn verify_inclusion_proof(
+        trust_base: &RootTrustBase,
+        proof: &InclusionProof,
+        transaction: &impl Transaction,
+        reference_time: u64,
+    ) -> Result<(), VerificationError> {
+        super::verify_inclusion_proof(
+            &mut SealSession::new(trust_base),
+            proof,
+            transaction,
+            reference_time,
+        )
+    }
 
     /// Reference time every fixture in this module certifies under.
     const REFERENCE_TIME: u64 = 1755000000;

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "networkId": 1,
+  "epoch": 1,
+  "epochStartRound": 0,
+  "rootNodes": [
+    {
+      "nodeId": "n0",
+      "sigKey": "0x028d7500dd4c12685d1f568b4c2b5048e8534b873319f3a8daa612b469132ec7f7",
+      "stake": 2
+    },
+    {
+      "nodeId": "n1",
+      "sigKey": "0x02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+      "stake": 1
+    },
+    {
+      "nodeId": "n2",
+      "sigKey": "0x03e11f40af6b41f494bfbc27c47a178ce572e8b8ca687cc67e1298514861ac5e48",
+      "stake": 1
+    }
+  ],
+  "quorumThreshold": 3,
+  "stateHash": "",
+  "changeRecordHash": "",
+  "previousEntryHash": "",
+  "signatures": {}
+}
