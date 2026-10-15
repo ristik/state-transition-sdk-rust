@@ -21,6 +21,8 @@
 
 mod error;
 mod run;
+#[cfg(all(test, feature = "std"))]
+mod tests;
 
 pub use error::{
     ConsolidationError, ConsolidationOutcome, ConsolidationSummary, IntegrityError,

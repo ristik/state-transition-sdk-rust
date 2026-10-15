@@ -193,3 +193,52 @@ pub fn rebuild_token(token: &Token, proofs: Vec<InclusionProof>) -> Result<Token
         .collect();
     Ok(Token::new(genesis, transfers))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cbor::{encode_byte_string, Decoder};
+
+    fn state_id(first: u8) -> StateId {
+        let mut b = [0u8; 32];
+        b[0] = first;
+        StateId::from_cbor(Decoder::new(&encode_byte_string(&b))).unwrap()
+    }
+
+    fn id(bits: &str) -> ShardId {
+        bits.chars().fold(ShardId::root(), |id, c| {
+            let (z, o) = id.split();
+            if c == '0' {
+                z
+            } else {
+                o
+            }
+        })
+    }
+
+    #[test]
+    fn routes_by_admitted_prefix_only() {
+        let router = ShardRouter::new(&PartitionTopology::new(
+            ["00", "01", "10", "11"].iter().map(|s| id(s)).collect(),
+        ))
+        .unwrap();
+        assert_eq!(router.route(&state_id(0b0010_0000)), &id("00"));
+        assert_eq!(router.route(&state_id(0b0110_0000)), &id("01"));
+        assert_eq!(router.route(&state_id(0b1010_0000)), &id("10"));
+        assert_eq!(router.route(&state_id(0b1110_0000)), &id("11"));
+        // an uneven but complete scheme
+        let router = ShardRouter::new(&PartitionTopology::new(
+            ["0", "10", "11"].iter().map(|s| id(s)).collect(),
+        ))
+        .unwrap();
+        assert_eq!(router.route(&state_id(0x7f)), &id("0"));
+        assert_eq!(router.route(&state_id(0x80)), &id("10"));
+        assert_eq!(router.route(&state_id(0xc0)), &id("11"));
+        // the unsharded partition routes everything to the empty shard
+        let router = ShardRouter::new(&PartitionTopology::single_shard()).unwrap();
+        assert_eq!(router.route(&state_id(0xff)), &ShardId::root());
+        // invalid configuration is rejected, never guessed
+        assert!(ShardRouter::new(&PartitionTopology::new(vec![id("0"), id("00")])).is_err());
+        assert!(ShardRouter::new(&PartitionTopology::new(vec![id("0"), id("10")])).is_err());
+    }
+}

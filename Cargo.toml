@@ -59,6 +59,14 @@ required-features = ["http"]
 name = "split"
 required-features = ["http"]
 
+[[example]]
+name = "consolidate_for_bridge"
+required-features = ["http"]
+
+[[example]]
+name = "consolidate_for_zkvm"
+required-features = ["http"]
+
 [profile.release]
 opt-level = 3
 lto = true
