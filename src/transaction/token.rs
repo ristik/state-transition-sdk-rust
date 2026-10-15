@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use super::certified::{CertifiedMintTransaction, CertifiedTransferTransaction};
 use super::ids::{TokenId, TokenType};
-use crate::api::bft::RootTrustBase;
+use crate::api::bft::{DecodeStats, RootTrustBase, UcInterner};
 use crate::cbor::{encode_array, encode_uint, DecodeLimits, Decoder};
 use crate::error::Error;
 use crate::verify::VerificationError;
@@ -81,6 +81,25 @@ impl Token {
 
     /// Decode a token with explicit resource limits.
     pub fn from_cbor_with_limits(bytes: &[u8], limits: DecodeLimits) -> Result<Self, Error> {
+        Self::from_cbor_interned(bytes, limits, &mut UcInterner::new())
+    }
+
+    /// Decode a token and report the certificate decode work: each distinct
+    /// complete certificate encoding is parsed once, however many proofs carry it.
+    pub fn from_cbor_stats(bytes: &[u8]) -> Result<(Self, DecodeStats), Error> {
+        let mut interner = UcInterner::new();
+        let token = Self::from_cbor_interned(bytes, DecodeLimits::DEFAULT, &mut interner)?;
+        Ok((token, interner.stats()))
+    }
+
+    /// Decode a token through a caller-owned interner, so several tokens decoded
+    /// in one operation (for example a token and the source token embedded in its
+    /// mint justification) share certificate decodes.
+    pub fn from_cbor_interned(
+        bytes: &[u8],
+        limits: DecodeLimits,
+        interner: &mut UcInterner,
+    ) -> Result<Self, Error> {
         let d = Decoder::with_limits(bytes, limits);
         d.finish()?;
         let inner = d.expect_tag(TOKEN_TAG)?;
@@ -89,17 +108,18 @@ impl Token {
             return Err(Error::UnexpectedValue("unsupported Token version"));
         }
 
-        let genesis = CertifiedMintTransaction::from_cbor(items[1])?;
+        let genesis = CertifiedMintTransaction::from_cbor_interned(items[1], interner)?;
 
         let mut prev_state_hash = genesis.result_state_hash();
         let mut prev_lock_script = genesis.recipient().clone();
 
         let mut transactions = Vec::new();
         for t in items[2].array(None)? {
-            let ct = CertifiedTransferTransaction::from_cbor(
+            let ct = CertifiedTransferTransaction::from_cbor_interned(
                 t,
                 prev_state_hash.clone(),
                 prev_lock_script.clone(),
+                interner,
             )?;
             prev_state_hash = ct.result_state_hash();
             prev_lock_script = ct.recipient().clone();

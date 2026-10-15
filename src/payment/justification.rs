@@ -11,6 +11,7 @@
 use alloc::vec::Vec;
 
 use super::asset::MAX_PAYMENT_ASSETS;
+use crate::api::bft::UcInterner;
 use crate::cbor::{encode_array, encode_tag, DecodeLimits, Decoder};
 use crate::error::Error;
 use crate::rsmst::RsmstInclusionProof;
@@ -71,10 +72,20 @@ impl SplitMintJustification {
 
     /// Decode with explicit limits, including the embedded source token.
     pub fn from_cbor_with_limits(bytes: &[u8], limits: DecodeLimits) -> Result<Self, Error> {
+        Self::from_cbor_interned(bytes, limits, &mut UcInterner::new())
+    }
+
+    /// Decode through a caller-owned interner (the verification operation's), so the
+    /// embedded source token shares certificate decodes with the token embedding it.
+    pub fn from_cbor_interned(
+        bytes: &[u8],
+        limits: DecodeLimits,
+        interner: &mut UcInterner,
+    ) -> Result<Self, Error> {
         let inner = Decoder::with_limits(bytes, limits).expect_tag(SPLIT_MINT_JUSTIFICATION_TAG)?;
         let items = inner.array(Some(2))?;
         let encoded_token_len = items[0].bytes().len();
-        let token = Token::from_cbor_with_limits(items[0].bytes(), limits)?;
+        let token = Token::from_cbor_interned(items[0].bytes(), limits, interner)?;
         let encoded_proofs = items[1].array(None)?;
         if encoded_proofs.len() > MAX_PAYMENT_ASSETS {
             return Err(Error::OutOfRange(

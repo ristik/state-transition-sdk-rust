@@ -71,7 +71,7 @@ impl<T> FifoIndex<T> {
     }
 
     /// Whether an entry with this hash satisfies `eq`.
-    pub(crate) fn contains(&mut self, hash: u64, eq: impl Fn(&T) -> bool) -> bool {
+    pub(crate) fn contains(&mut self, hash: u64, mut eq: impl FnMut(&T) -> bool) -> bool {
         if self.capacity == 0 {
             return false;
         }

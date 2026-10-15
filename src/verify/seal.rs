@@ -24,9 +24,9 @@ use crate::api::bft::{RootTrustBase, UnicitySeal};
 use crate::crypto::hash::{DataHasher, HashAlgorithm};
 use crate::crypto::signature::Signature;
 
-use super::memo::FifoIndex;
 use super::VerificationError;
 use crate::api::bft::UnicityCertificate;
+use crate::fifo_index::FifoIndex;
 
 /// Default number of successful seals remembered by a session.
 pub const DEFAULT_SEAL_MEMO_CAPACITY: usize = 64;

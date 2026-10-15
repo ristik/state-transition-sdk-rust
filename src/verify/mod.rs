@@ -31,7 +31,6 @@
 
 mod context;
 mod error;
-mod memo;
 mod mint_justification;
 mod seal;
 
