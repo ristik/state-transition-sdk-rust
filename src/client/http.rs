@@ -256,7 +256,7 @@ impl HttpAggregatorClient {
     ) -> Result<serde_json::Value, HttpError> {
         self.rpc_raw(method, params, headers, None)
             .map_err(|e| match e {
-                RawFailure::Http { status, body } => HttpError::Http { status, body },
+                RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
                 RawFailure::Transport(m) => HttpError::Transport(m),
                 RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
                 RawFailure::Envelope(EnvelopeError::Rpc { code, message, .. }) => {
@@ -302,10 +302,11 @@ impl HttpAggregatorClient {
             Err(ureq::Error::Status(status, r)) => {
                 let body = read_response_raw(r, MAX_ERROR_BODY_BYTES)?;
                 // a JSON-RPC error may ride on a non-2xx status: keep it typed
-                if let Err(e @ EnvelopeError::Rpc { .. }) = decode_rpc_envelope(&body, &id) {
-                    return Err(RawFailure::Envelope(e));
-                }
-                return Err(RawFailure::Http { status, body });
+                let rpc = match decode_rpc_envelope(&body, &id) {
+                    Err(e @ EnvelopeError::Rpc { .. }) => Some(e),
+                    _ => None,
+                };
+                return Err(RawFailure::Http { status, body, rpc });
             }
             Err(e) => return Err(RawFailure::Transport(e.to_string())),
         };
@@ -313,6 +314,7 @@ impl HttpAggregatorClient {
             return Err(RawFailure::Http {
                 status: response.status(),
                 body: read_response_raw(response, MAX_ERROR_BODY_BYTES)?,
+                rpc: None,
             });
         }
 
@@ -323,7 +325,11 @@ impl HttpAggregatorClient {
 
 /// Failure of one raw JSON-RPC exchange.
 enum RawFailure {
-    Http { status: u16, body: String },
+    Http {
+        status: u16,
+        body: String,
+        rpc: Option<EnvelopeError>,
+    },
     Transport(String),
     Envelope(EnvelopeError),
     TooLarge(usize),
@@ -564,6 +570,7 @@ impl BatchAggregatorClient for HttpAggregatorClient {
 
 fn batch_failure(failure: RawFailure) -> BatchFailure {
     match failure {
+        RawFailure::Http { rpc: Some(e), .. } => batch_failure(RawFailure::Envelope(e)),
         RawFailure::Http { status, .. } => BatchFailure::Http { status },
         RawFailure::Transport(m) if m.contains("timed out") => BatchFailure::Timeout,
         RawFailure::Transport(m) => BatchFailure::Transport(m),

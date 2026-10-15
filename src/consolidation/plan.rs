@@ -15,7 +15,7 @@ use crate::api::StateId;
 use crate::transaction::{
     CertifiedMintTransaction, CertifiedTransferTransaction, Token, Transaction,
 };
-use crate::verify::{verify_inclusion_proof_in, SealSession, VerificationError};
+use crate::verify::{verify_membership_in, SealSession, VerificationError};
 
 /// Routes a state id to its shard by the admitted shard-prefix topology.
 ///
@@ -112,7 +112,8 @@ impl RootRoundBound {
     /// Authenticate every `(state, original proof)` under the session's trust
     /// base (including its quorum signatures) and take the newest seal round
     /// (`RootChainRoundNumber`, the native position within one network's
-    /// history). Ties choose the first shard in canonical order.
+    /// history). Ties choose the shard of the first evidence in input order (the
+    /// reference implementation's rule).
     pub fn from_proofs(
         session: &mut SealSession<'_>,
         router: &ShardRouter,
@@ -120,16 +121,13 @@ impl RootRoundBound {
     ) -> Result<Self, VerificationError> {
         let mut best: Option<(u64, ShardId)> = None;
         for (state_id, proof) in evidence {
-            verify_inclusion_proof_in(session, proof, state_id, proof.reference_time)?;
+            verify_membership_in(session, proof, state_id, proof.reference_time)?;
             let round = proof
                 .unicity_certificate
                 .unicity_seal
                 .root_chain_round_number;
             let shard = router.route(state_id).clone();
-            let better = match &best {
-                None => true,
-                Some((r, s)) => round > *r || (round == *r && shard.canonical_cmp(s).is_lt()),
-            };
+            let better = best.as_ref().map_or(true, |(r, _)| round > *r);
             if better {
                 best = Some((round, shard));
             }

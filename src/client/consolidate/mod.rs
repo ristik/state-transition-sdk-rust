@@ -47,8 +47,8 @@ use crate::consolidation::{
 };
 use crate::transaction::Token;
 use crate::verify::{
-    verify_inclusion_proof_in, verify_token_with_seal_stats, MintJustificationRegistry,
-    SealSession, VerificationPolicy,
+    verify_membership_under, verify_token_with_seal_stats, MintJustificationRegistry, SealSession,
+    VerificationPolicy,
 };
 
 /// Default total deadline of one attempt.
@@ -661,13 +661,18 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             .map(|p| p.expect("every item belongs to exactly one participating shard"))
             .collect();
         for (item, p) in items.iter().zip(&proofs) {
-            verify_inclusion_proof_in(&mut session, p, &item.state_id, p.reference_time).map_err(
-                |e| {
-                    Stop::Error(ConsolidationError::Integrity(IntegrityError::Verification(
-                        e,
-                    )))
-                },
-            )?;
+            verify_membership_under(
+                &mut session,
+                p,
+                &item.state_id,
+                p.reference_time,
+                authenticated.policy(),
+            )
+            .map_err(|e| {
+                Stop::Error(ConsolidationError::Integrity(IntegrityError::Verification(
+                    e,
+                )))
+            })?;
         }
         budget.check()?;
 

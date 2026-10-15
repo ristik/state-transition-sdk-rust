@@ -247,6 +247,7 @@ impl PartitionView {
             tree,
             unicity_tree_certificate: enclosing.unicity_tree_certificate.clone(),
             seal,
+            policy,
             identity: id,
         })
     }
@@ -262,6 +263,7 @@ pub struct AuthenticatedView {
     tree: ShardTree,
     unicity_tree_certificate: UnicityTreeCertificate,
     seal: UnicitySeal,
+    policy: [u8; 32],
     identity: [u8; 32],
 }
 
@@ -289,6 +291,12 @@ impl AuthenticatedView {
     /// The root epoch of the authenticated seal.
     pub fn epoch(&self) -> u64 {
         self.seal.epoch
+    }
+
+    /// The policy digest (partition and pins) this view was authenticated
+    /// under: the seal-memo namespace in which its master seal was verified.
+    pub fn policy(&self) -> &[u8; 32] {
+        &self.policy
     }
 
     /// The shard tree rebuilt from the leaves.
