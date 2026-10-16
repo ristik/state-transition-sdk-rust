@@ -5,9 +5,11 @@
 //! * mode 1 - a native unicity certificate: tree path to the seal hash plus the
 //!   strict seal authentication (network, epoch, quorum signatures).
 //!
-//! Signature verification is `Signature::verify`: the O3 strict rule (65 bytes, low-S,
-//! key recovered with `v` equals the trusted key) implemented with `k256` entry points
-//! only (`VerifyingKey::recover_from_prehash`), which the SP1 k256 patch accelerates.
+//! Signature verification is `Signature::verify`: the O3 strict rule (65 bytes, low-S, key
+//! recovered with `v` equals the trusted key) implemented as one recover-and-compare from
+//! k256 primitives (`AffinePoint::decompress`, `Scalar::invert`, one
+//! `ProjectivePoint::lincomb`), all accelerated by the SP1 k256 patch; no
+//! `recover_from_prehash` and no separate ECDSA verification.
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 

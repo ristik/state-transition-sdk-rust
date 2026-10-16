@@ -26,6 +26,16 @@ sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sh
 k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-6.0.0" }
 ```
 
+Tags are mutable: for a verifier's crypto backend pin the resolved commits as well (the
+ones used here, also recorded in the committed `guest/Cargo.lock`), or commit your guest's
+`Cargo.lock`:
+
+```toml
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-6.0.0", rev = "e48b656ebc806117554bb33c2f8687e4637e37ff" }
+k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-6.0.0", rev = "476243d31d3ffd9d882d0e5da1f6adaa2a204b62" }
+# patched ecdsa (pulled in by the patched k256): sp1-patches/signatures tag sp1-skip-verify-on-recovery @ 1880299a
+```
+
 The SDK code is identical on every target; precompiles come only from these patched
 libraries. Version coupling: the lock must resolve `k256 0.13.4` and `sha2 0.10.9`
 (the SDK requires `k256 0.13`, `sha2 0.10`); newer SP1 releases publish tags with the
