@@ -600,3 +600,20 @@ fn frozen_capability_table_drives_exactly_the_specified_retries() {
         }
     }
 }
+
+#[test]
+fn negotiation_does_not_retry_when_the_rejection_echoes_the_wait() {
+    // The server understood waitMs (it echoed it): malformed_params is about the
+    // request itself, so no retry without the wait.
+    let server = Scripted::start(|_, _| {
+        Reply::error(
+            r#"{"code":-32602,"message":"Invalid params","data":{"reason":"invalid_request","detail":"malformed_params","retryable":false,"waitedMs":0}}"#,
+        )
+    });
+    let ids = batch_ids();
+    let now = clock();
+    let out = get_latest_negotiating_wait(&client(&server.url), &ids, &opts(5_000), 3_000, &now);
+    assert_eq!((out.requests, out.retried_without_wait), (1, false));
+    assert_eq!(server.count(), 1);
+    assert_eq!(out.result.unwrap_err().waited_ms, Some(0));
+}

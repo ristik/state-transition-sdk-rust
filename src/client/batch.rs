@@ -286,7 +286,7 @@ pub struct NegotiatedBatch {
 ///
 /// If the endpoint answers with the generic `-32602 invalid_request
 /// malformed_params` error (a strict batch parser that does not know `waitMs`),
-/// the identical request is repeated once without the wait; its outcome, success
+/// (and carries no `waitedMs` echo) the identical request is repeated once without the wait; its outcome, success
 /// or error, is final. No other failure is retried, and other parameters are
 /// untouched. `options.timeout_ms` is the caller's remaining deadline: the retry
 /// gets what is left of it by `elapsed_ms`, never a fresh budget. When nothing is
@@ -307,7 +307,10 @@ pub fn get_latest_negotiating_wait<C: BatchAggregatorClient + ?Sized>(
     };
     let started = now_ms();
     let first = client.get_inclusion_proofs_with_wait(&request, options, wait_ms);
-    let rejected = matches!(&first, Err(e) if is_malformed_params(&e.failure));
+    // A `waitedMs` echo on the error means the server understood `waitMs`: the
+    // rejection is about something else and a retry without the wait can not help.
+    let rejected =
+        matches!(&first, Err(e) if is_malformed_params(&e.failure) && e.waited_ms.is_none());
     if !rejected {
         return NegotiatedBatch {
             result: first,
