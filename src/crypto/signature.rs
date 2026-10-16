@@ -123,19 +123,25 @@ impl Signature {
     /// Returns `false` for any failure, including a non-canonical high-`s` encoding.
     /// (Recovering the trusted key implies the ECDSA equation holds for it.)
     pub fn verify(&self, digest: &[u8], public_key: &PublicKey) -> bool {
-        match self.recover(digest) {
-            Ok(recovered) => recovered == *public_key,
+        // compare the compressed encoding of the recovered point with the trusted key's
+        // stored bytes: no re-parsing (point decompression) of either key
+        match self.recover_verifying_key(digest) {
+            Ok(vk) => vk.to_encoded_point(true).as_bytes() == public_key.as_bytes().as_slice(),
             Err(_) => false,
         }
     }
 
-    /// Recover the signer's public key from `digest` using the recovery id.
-    pub fn recover(&self, digest: &[u8]) -> Result<PublicKey, Error> {
+    fn recover_verifying_key(&self, digest: &[u8]) -> Result<VerifyingKey, Error> {
         let sig = self.canonical()?;
         let rid =
             RecoveryId::from_byte(self.recovery).ok_or(Error::Crypto("invalid recovery id"))?;
-        let vk = VerifyingKey::recover_from_prehash(digest, &sig, rid)
-            .map_err(|_| Error::Crypto("key recovery failed"))?;
+        VerifyingKey::recover_from_prehash(digest, &sig, rid)
+            .map_err(|_| Error::Crypto("key recovery failed"))
+    }
+
+    /// Recover the signer's public key from `digest` using the recovery id.
+    pub fn recover(&self, digest: &[u8]) -> Result<PublicKey, Error> {
+        let vk = self.recover_verifying_key(digest)?;
         let enc = vk.to_encoded_point(true);
         PublicKey::from_bytes(enc.as_bytes())
     }
@@ -157,6 +163,39 @@ mod recovery_tests {
     use super::*;
     use crate::crypto::hash::sha256;
     use crate::crypto::signer::{Secp256k1Signer, Signer};
+
+    /// Cost probe (run with `--ignored --nocapture`): per-verification time of the
+    /// quorum hot path.
+    #[test]
+    #[ignore]
+    fn verify_cost() {
+        let signer = Secp256k1Signer::from_bytes(&[7; 32]).unwrap();
+        let digest = sha256(b"o3");
+        let sig = signer.sign(&digest);
+        let pk = signer.public_key();
+        let n = 300;
+        let time = |name: &str, f: &dyn Fn()| {
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            println!("{name}: {:?} per call", t.elapsed() / n);
+        };
+        // the pre-O3 check: ECDSA verification against the trusted key, v ignored
+        time("old (verify_prehash only)", &|| {
+            use k256::ecdsa::signature::hazmat::PrehashVerifier;
+            let vk = VerifyingKey::from_sec1_bytes(pk.as_bytes()).unwrap();
+            let k = sig.canonical().unwrap();
+            assert!(vk.verify_prehash(digest.data(), &k).is_ok());
+        });
+        // first O3 version: recover, re-encode, re-parse the key, compare
+        time("recover + PublicKey round trip", &|| {
+            assert!(sig.recover(digest.data()).unwrap() == pk);
+        });
+        time("verify (recover, compare encodings)", &|| {
+            assert!(sig.verify(digest.data(), &pk));
+        });
+    }
 
     #[test]
     fn only_the_recovery_id_that_recovers_the_signer_verifies() {

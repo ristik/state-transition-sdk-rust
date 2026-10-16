@@ -90,20 +90,16 @@ fn seal_quorum_vectors_count_only_conforming_signatures() {
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let bytes = hex::decode(case["sealCbor"].as_str().unwrap()).unwrap();
-        // surplus malformed signatures (compact 64 bytes) make the wire decode fail in the
-        // Rust codec; that is a rejection of the whole seal here, never an acceptance
-        let verdict = UnicitySeal::from_cbor(Decoder::new(&bytes))
-            .ok()
-            .map(|seal| SealSession::new(&tb).verify_quorum(&seal));
-        let accepted = matches!(verdict, Some(Ok(())));
-        let expect = case["accept"].as_bool().unwrap();
-        if expect {
-            assert!(accepted, "{name}: {verdict:?}");
+        // every fixture seal decodes (signatures are raw byte strings in the codec): a
+        // nonconforming signature, a compact one included, is rejected by the quorum
+        // count (zero votes, as in Go), never by the decoder
+        let seal = UnicitySeal::from_cbor(Decoder::new(&bytes))
+            .unwrap_or_else(|e| panic!("{name}: fixture seal must decode: {e}"));
+        let verdict = SealSession::new(&tb).verify_quorum(&seal);
+        if case["accept"].as_bool().unwrap() {
+            assert_eq!(verdict, Ok(()), "{name}");
         } else {
-            assert!(!accepted, "{name}: {verdict:?}");
-            if let Some(Err(e)) = verdict {
-                assert_eq!(e, VerificationError::QuorumNotMet, "{name}");
-            }
+            assert_eq!(verdict, Err(VerificationError::QuorumNotMet), "{name}");
         }
     }
 }
@@ -206,6 +202,73 @@ mod generated {
             s.signatures[0].1[64] = v;
             let ok = SealSession::new(&tb).verify_quorum(&s).is_ok();
             assert_eq!(ok, v == three.signatures[0].1[64], "v={v}");
+        }
+    }
+}
+
+#[cfg(feature = "client")]
+mod surplus {
+    use super::*;
+    use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
+
+    /// Surplus entries that are not 65-byte signatures (compact, short, long, empty)
+    /// count as zero votes and do not hurt a met quorum (the shared fixtures have no
+    /// such accepting case yet).
+    #[test]
+    fn surplus_non_65_byte_signatures_are_zero_votes_next_to_a_met_quorum() {
+        let signers: Vec<_> = (1..=4u8)
+            .map(|i| Secp256k1Signer::from_bytes(&[i; 32]).unwrap())
+            .collect();
+        let tb = RootTrustBase::new(
+            1,
+            NetworkId::LOCAL,
+            1,
+            1,
+            signers
+                .iter()
+                .enumerate()
+                .map(|(i, s)| RootTrustBaseNodeInfo {
+                    node_id: format!("n{i}"),
+                    signing_key: s.public_key(),
+                    stake: 1,
+                })
+                .collect(),
+            3,
+        );
+        let mut seal = UnicitySeal {
+            network_id: NetworkId::LOCAL,
+            root_chain_round_number: 5,
+            epoch: 1,
+            timestamp: 1_731_504_000,
+            previous_hash: None,
+            hash: vec![7; 32],
+            signatures: Vec::new(),
+        };
+        let digest = seal.calculate_hash();
+        let sigs: Vec<_> = signers
+            .iter()
+            .map(|s| s.sign(&digest).encode().to_vec())
+            .collect();
+        seal.signatures = (0..3).map(|i| (format!("n{i}"), sigs[i].clone())).collect();
+        for junk in [
+            sigs[3][..64].to_vec(),
+            sigs[3][..63].to_vec(),
+            {
+                let mut l = sigs[3].clone();
+                l.push(0);
+                l
+            },
+            Vec::new(),
+        ] {
+            let mut s = seal.clone();
+            s.signatures.push(("n3".to_string(), junk));
+            assert_eq!(SealSession::new(&tb).verify_quorum(&s), Ok(()));
+            // ... and in place of a needed signature the quorum is lost
+            s.signatures.remove(0);
+            assert_eq!(
+                SealSession::new(&tb).verify_quorum(&s),
+                Err(VerificationError::QuorumNotMet)
+            );
         }
     }
 }
