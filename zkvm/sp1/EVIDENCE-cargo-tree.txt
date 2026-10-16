@@ -1,0 +1,19 @@
+# cargo tree evidence (SP1 6.0.0 patches), 2026-10-16
+
+== guest: cargo tree -i k256 / -i sha2 / -i ecdsa
+k256 v0.13.4 (https://github.com/sp1-patches/elliptic-curves?tag=patch-k256-13.4-sp1-6.0.0#476243d3)
+└── unicity-token v3.0.1 (/Users/risto/uni/sync/wt/state-transition-sdk-rust-sp1)
+    └── unicity-sp1-guest v0.0.0 (/Users/risto/uni/sync/wt/state-transition-sdk-rust-sp1/zkvm/sp1/guest)
+sha2 v0.10.9 (https://github.com/sp1-patches/RustCrypto-hashes?tag=patch-sha2-0.10.9-sp1-6.0.0#e48b656e)
+├── k256 v0.13.4 (https://github.com/sp1-patches/elliptic-curves?tag=patch-k256-13.4-sp1-6.0.0#476243d3)
+ecdsa v0.16.9 (https://github.com/sp1-patches/signatures?tag=sp1-skip-verify-on-recovery#1880299a)
+└── k256 v0.13.4 (https://github.com/sp1-patches/elliptic-curves?tag=patch-k256-13.4-sp1-6.0.0#476243d3)
+
+== guest-unpatched: cargo tree -i k256 / -i sha2 / -i ecdsa
+k256 v0.13.4
+└── unicity-token v3.0.1 (/Users/risto/uni/sync/wt/state-transition-sdk-rust-sp1)
+    └── unicity-sp1-guest-unpatched v0.0.0 (/Users/risto/uni/sync/wt/state-transition-sdk-rust-sp1/zkvm/sp1/guest-unpatched)
+sha2 v0.10.9
+├── k256 v0.13.4
+ecdsa v0.16.9
+└── k256 v0.13.4

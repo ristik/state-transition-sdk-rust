@@ -1,0 +1,17 @@
+# Executes (does not prove) the SP1 guests and reports cycle and syscall counts.
+[package]
+name = "unicity-sp1-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+sp1-sdk = { version = "6.0.0", features = ["blocking"] }
+unicity-token = { path = "../../..", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+
+[build-dependencies]
+sp1-build = "6.0.0"

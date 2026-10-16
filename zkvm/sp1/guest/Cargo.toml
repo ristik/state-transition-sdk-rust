@@ -1,0 +1,18 @@
+# SP1 guest with the SP1 precompile patches applied (see ../README.md).
+[package]
+name = "unicity-sp1-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not part of the SDK crate or any workspace of it.
+[workspace]
+
+[dependencies]
+unicity-token = { path = "../../..", default-features = false, features = ["alloc"] }
+sp1-zkvm = "6.0.0"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[patch.crates-io]
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-6.0.0" }
+k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-6.0.0" }
