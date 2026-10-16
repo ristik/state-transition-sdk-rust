@@ -28,8 +28,8 @@ pub use batch::{
 };
 pub use consolidate::{
     AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,
-    ConsolidationOutcome, ConsolidationSummary, IntegrityError, ProofBundle, ProofClient,
-    ProofClientConfig, ProofItem, SequentialExecutor, UnavailableReason, WaveExecutor,
+    ConsolidationOutcome, ConsolidationSummary, IntegrityError, MasterLongPoll, ProofBundle,
+    ProofClient, ProofClientConfig, ProofItem, SequentialExecutor, UnavailableReason, WaveExecutor,
     DEFAULT_TIMEOUT_MS,
 };
 #[cfg(feature = "std")]
