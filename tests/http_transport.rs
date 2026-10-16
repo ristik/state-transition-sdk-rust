@@ -991,9 +991,11 @@ fn resubmitting_a_pending_request_is_not_a_failure() {
 
 #[test]
 fn submit_and_wait_resubmits_the_same_request_when_it_is_reported_lost() {
-    let (proof, data) = fixture_proof_and_data();
+    let (_, data) = fixture_proof_and_data();
+    let (proof, _, full) = pending_hex();
     let unknown = served("v2-status-unknown.json");
-    let found = served("v2-status-included.json");
+    // a proof of the *submitted* request (the server fixtures certify another one)
+    let found = status_json(&full, "included");
     let dup = http_response("200 OK", QUEUE_DUPLICATE);
 
     // submit, three unknown answers (grace 2), resubmit (still held elsewhere), the proof
@@ -1006,14 +1008,8 @@ fn submit_and_wait_resubmits_the_same_request_when_it_is_reported_lost() {
         found.clone(),
     ]);
     let got = client(&server.url).submit_and_wait(&data, 1).unwrap();
-    assert_eq!(
-        got,
-        legacy_response("v2-default-included.json")
-            .inclusion_proof()
-            .unwrap()
-            .clone()
-    );
-    let _ = proof;
+    assert_eq!(got, proof);
+    assert_eq!(got.certification_data, data);
     assert_eq!(server.request_count(), 6);
 
     // the resubmission is the identical signed request
@@ -1070,4 +1066,87 @@ fn submit_and_wait_resubmits_the_same_request_when_it_is_reported_lost() {
         client(&server.url).submit_and_wait(&data, 1),
         Err(HttpError::Rejected(ref s)) if s == "REQUEST_EXPIRED"
     ));
+}
+
+/// The server reports a duplicate by state id alone: a different request for the same
+/// state (a conflicting spend) is answered like a repeat, and the proof that comes back
+/// certifies the other request. `submit_and_wait` must not report that as success.
+#[test]
+fn submit_and_wait_refuses_a_proof_of_another_request() {
+    let (_, data) = fixture_proof_and_data();
+    let (_, _, full) = pending_hex();
+    // another request for the same state: same lock script and source state, other hash
+    let other = CertificationData::new(
+        data.lock_script().clone(),
+        data.source_state_hash().clone(),
+        unicity_token::crypto::hash::sha256(b"another transaction"),
+        data.unlock_script().to_vec(),
+        data.expires_at(),
+    );
+    assert_ne!(other, data);
+    let proof_of_data = status_json(&full, "included");
+    let dup = http_response("200 OK", QUEUE_DUPLICATE);
+    for (name, first_reply) in [
+        ("state id exists", status_reply("STATE_ID_EXISTS")),
+        ("mongo duplicate key", dup.clone()),
+        ("redis accepts the copy", status_reply("SUCCESS")),
+    ] {
+        let server = MockServer::start(vec![first_reply, proof_of_data.clone()]);
+        let err = client(&server.url).submit_and_wait(&other, 1).unwrap_err();
+        assert!(
+            matches!(err, HttpError::StateCertifiedWithOtherData),
+            "{name}: {err}"
+        );
+        assert_eq!(
+            server.request_count(),
+            2,
+            "{name}: no resubmission after the mismatch"
+        );
+    }
+    // the same request gets its proof
+    let server = MockServer::start(vec![status_reply("STATE_ID_EXISTS"), proof_of_data.clone()]);
+    assert!(client(&server.url).submit_and_wait(&data, 1).is_ok());
+
+    // complete equality: another unlock script or deadline is another request too
+    for variant in [
+        CertificationData::new(
+            data.lock_script().clone(),
+            data.source_state_hash().clone(),
+            data.transaction_hash().clone(),
+            vec![0xee; 65],
+            data.expires_at(),
+        ),
+        CertificationData::new(
+            data.lock_script().clone(),
+            data.source_state_hash().clone(),
+            data.transaction_hash().clone(),
+            data.unlock_script().to_vec(),
+            Some(data.expires_at().map_or(1, |t| t + 1)),
+        ),
+    ] {
+        let server =
+            MockServer::start(vec![status_reply("STATE_ID_EXISTS"), proof_of_data.clone()]);
+        assert!(matches!(
+            client(&server.url).submit_and_wait(&variant, 0),
+            Err(HttpError::StateCertifiedWithOtherData)
+        ));
+    }
+
+    // a mismatch found after a resubmission (lost, then a conflicting request won)
+    let (_, empty, _) = pending_hex();
+    let _ = empty;
+    let unknown = served("v2-status-unknown.json");
+    let server = MockServer::start(vec![
+        status_reply("SUCCESS"),
+        unknown.clone(),
+        unknown.clone(),
+        unknown,
+        status_reply("STATE_ID_EXISTS"),
+        proof_of_data,
+    ]);
+    assert!(matches!(
+        client(&server.url).submit_and_wait(&other, 1),
+        Err(HttpError::StateCertifiedWithOtherData)
+    ));
+    assert_eq!(server.request_count(), 6);
 }

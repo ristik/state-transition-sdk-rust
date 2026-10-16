@@ -90,6 +90,11 @@ pub enum HttpError {
     /// the request was admitted but dropped before inclusion, because its timeout
     /// passed. Waiting can not help; the caller may resubmit the same signed request.
     StateExpired,
+    /// A proof certifies this state id, but **not the submitted request** (different
+    /// transaction hash, unlock script or deadline): another request, typically a
+    /// conflicting spend of the same state, won the race. Not retryable; the
+    /// submission must not be treated as certified.
+    StateCertifiedWithOtherData,
     /// The aggregator reports (an unauthenticated hint, see [`ProofStatus`]) that
     /// it does not know the state id, beyond the configured grace period. This is
     /// not proof of absence or of non-spending: the request may have been lost,
@@ -117,6 +122,10 @@ impl fmt::Display for HttpError {
             HttpError::Rejected(s) => write!(f, "certification rejected: {s:?}"),
             HttpError::Timeout => write!(f, "timed out waiting for inclusion proof"),
             HttpError::StateNotFound => write!(f, "state is not known to the aggregator"),
+            HttpError::StateCertifiedWithOtherData => write!(
+                f,
+                "the state id is certified with a different request than the one submitted"
+            ),
             HttpError::StateExpired => {
                 write!(f, "aggregator reports the request expired before inclusion")
             }
@@ -286,10 +295,13 @@ impl HttpAggregatorClient {
     /// Submit a certification request **idempotently**: re-sending a request the
     /// aggregator already holds is not a failure.
     ///
-    /// The request is signed and carries no fresh randomness, so a resubmission is
-    /// the same request and never produces a second leaf. When the aggregator already
-    /// has it the call returns [`SubmitOutcome::AlreadySubmitted`] and the caller
-    /// should just wait for the proof. That covers: the Mongo-backed queue refusing the
+    /// The request is signed and carries no fresh randomness, so resubmitting the
+    /// *same* request never produces a second leaf. When the aggregator already has a
+    /// record for the state id the call returns [`SubmitOutcome::AlreadySubmitted`]
+    /// and the caller should wait for the proof - and check that it certifies *its*
+    /// request: the server reports a duplicate by state id alone, so a **different**
+    /// request for the same state (a conflicting spend) is reported the same way.
+    /// ([`submit_and_wait`](Self::submit_and_wait) makes that check.) That covers: the Mongo-backed queue refusing the
     /// copy of a still-pending request (reported as an internal error whose data names a
     /// duplicate key; the Redis-backed queue silently accepts and drops it) and
     /// `STATE_ID_EXISTS` (already certified). Every other rejection (invalid signature,
@@ -335,6 +347,9 @@ impl HttpAggregatorClient {
                 {
                     resubmits += 1;
                     self.resubmit_certification_request(data)?;
+                }
+                Ok(proof) if proof.certification_data != *data => {
+                    return Err(HttpError::StateCertifiedWithOtherData)
                 }
                 other => return other,
             }
@@ -524,8 +539,10 @@ enum SubmitReply {
 pub enum SubmitOutcome {
     /// The request was queued.
     Accepted,
-    /// The aggregator already holds this request - still queued, or already
-    /// certified - and did not queue a second copy. Not a failure: wait for the proof.
+    /// The aggregator already holds a record for this state id - queued or
+    /// certified - and did not queue a second copy. **It may be a different request**
+    /// (a conflicting spend of the same state has the same state id): not a failure,
+    /// but confirm through the proof that it certifies *this* request.
     AlreadySubmitted,
 }
 
