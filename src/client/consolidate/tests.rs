@@ -770,6 +770,19 @@ fn a_strict_parser_rejection_costs_exactly_one_counted_retry_without_the_wait() 
 }
 
 #[test]
+fn a_caller_margin_below_two_seconds_sizes_the_sent_wait() {
+    let (sim, token) = spread_token(3);
+    let c = client(&sim, false).with_master_long_poll(MasterLongPoll {
+        margin_ms: 500,
+        ..Default::default()
+    });
+    c.consolidate(&token, &quick()).unwrap();
+    let (_, wait) = sim.lock().unwrap().waits[0];
+    // 10 s deadline - 0.5 s margin, less host time already spent; not capped at 8 s
+    assert!(wait > 8_000 && wait <= 9_500, "{wait}");
+}
+
+#[test]
 fn master_long_poll_budget_arithmetic() {
     let lp = MasterLongPoll::default();
     assert_eq!(lp.wait_for(600_000), Some(20_000));
