@@ -276,10 +276,12 @@ impl HttpAggregatorClient {
                     return Err(HttpError::StateNotFound)
                 }
                 Err(HttpError::Http { status: 404, .. }) => return Err(HttpError::StateNotFound),
-                // A call whose timeout was capped by the deadline and that was cut
-                // off is the deadline (the transport's clock may fire a hair early).
-                Err(HttpError::Transport(_))
-                    if plan.timeout_ms >= left_ms || Instant::now() >= deadline =>
+                // A call that timed out because the deadline capped it is the
+                // deadline (the transport's clock may fire a hair early). Any
+                // other transport failure (refused, reset, TLS) stays one.
+                Err(HttpError::Transport(m))
+                    if m.contains("timed out")
+                        && (plan.timeout_ms >= left_ms || Instant::now() >= deadline) =>
                 {
                     return Err(HttpError::Timeout)
                 }

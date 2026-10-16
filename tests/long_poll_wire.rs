@@ -78,14 +78,14 @@ fn v2_wait_is_clamped_to_the_timeout_margin_and_omitted_when_nothing_fits() {
     let hexp = proof_response_hex(&proof);
     let server = Scripted::start(move |_, _| Reply::result(format!("\"{hexp}\"")));
     let c = client(&server.url);
-    // 5 s timeout, 2 s margin: at most 3 s of the requested 20 s.
+    // The wait only has to stay below the timeout (the margin is the caller's).
     c.lookup_inclusion_proof_with_wait(&sid(), 20_000, Duration::from_secs(5))
         .unwrap();
-    assert_eq!(server.request(0).params["waitMs"], 3_000);
-    // A 2 s budget leaves no positive wait: an ordinary lookup, no waitMs.
-    c.lookup_inclusion_proof_with_wait(&sid(), 20_000, Duration::from_secs(2))
-        .unwrap();
-    assert!(server.request(1).params.get("waitMs").is_none());
+    assert_eq!(server.request(0).params["waitMs"], 4_999);
+    // Nothing positive fits a 1 ms budget: no waitMs on the wire.
+    assert_eq!(unicity_token::client::wait_on_wire(20_000, 1), None);
+    assert_eq!(unicity_token::client::wait_on_wire(0, 1), Some(0));
+    assert_eq!(unicity_token::client::wait_on_wire(20_000, 2), Some(1));
     // A legacy bare string has no echo.
     let got = c
         .lookup_inclusion_proof_with_wait(&sid(), 1_000, Duration::from_secs(9))
@@ -268,9 +268,7 @@ fn batch_wait_is_clamped_to_the_call_timeout() {
     };
     let c = client(&server.url);
     let _ = c.get_inclusion_proofs_with_wait(&latest, &opts(5_000), 20_000);
-    assert_eq!(server.request(0).params["waitMs"], 3_000);
-    let _ = c.get_inclusion_proofs_with_wait(&latest, &opts(1_500), 20_000);
-    assert!(server.request(1).params.get("waitMs").is_none());
+    assert_eq!(server.request(0).params["waitMs"], 4_999);
 }
 
 // --- parser negotiation -----------------------------------------------------
@@ -616,4 +614,29 @@ fn negotiation_does_not_retry_when_the_rejection_echoes_the_wait() {
     assert_eq!((out.requests, out.retried_without_wait), (1, false));
     assert_eq!(server.count(), 1);
     assert_eq!(out.result.unwrap_err().waited_ms, Some(0));
+}
+
+#[test]
+fn negotiation_does_not_repeat_an_identical_request_when_no_wait_was_sent() {
+    // timeout 1 ms: no positive wait fits, so waitMs is absent from the wire and a
+    // malformed_params answer is not about it; there is nothing to retry.
+    let server = Scripted::start(|_, _| Reply::error(malformed_params()));
+    let ids = batch_ids();
+    let now = clock();
+    let out = get_latest_negotiating_wait(&client(&server.url), &ids, &opts(1), 5_000, &now);
+    assert_eq!((out.requests, out.retried_without_wait), (1, false));
+    assert!(server.count() <= 1, "never a second identical request");
+}
+
+#[test]
+fn a_small_caller_margin_reaches_the_request() {
+    let server = Scripted::start(|_, _| Reply::error(pending_error("")));
+    let ids = batch_ids();
+    let latest = BatchRequest {
+        state_ids: &ids,
+        state_root: StateRoot::Latest,
+    };
+    // the caller sized 1.5 s of wait for a 2 s call (500 ms margin): sent as is
+    let _ = client(&server.url).get_inclusion_proofs_with_wait(&latest, &opts(2_000), 1_500);
+    assert_eq!(server.request(0).params["waitMs"], 1_500);
 }
