@@ -375,3 +375,20 @@ fn cancellation_is_observed_between_calls_and_during_sleeps() {
     assert!(matches!(r, Err(HttpError::Cancelled)));
     assert_eq!(server.count(), before);
 }
+
+#[test]
+fn a_refused_connection_is_a_transport_error_not_a_timeout() {
+    // grab a free port, then close it so connecting is refused
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let url = format!("http://127.0.0.1:{port}/");
+    for total in [Duration::from_millis(500), secs(5), secs(60)] {
+        let r = client(&url, 5).wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(total));
+        assert!(
+            matches!(r, Err(HttpError::Transport(_))),
+            "{total:?}: {r:?}"
+        );
+    }
+}
