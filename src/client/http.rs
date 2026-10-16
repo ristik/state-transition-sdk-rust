@@ -32,6 +32,11 @@ use super::{
 };
 use crate::consolidation::PartitionView;
 
+mod wait;
+pub use wait::{
+    WaitOptions, WaitOutcome, WaitStats, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT,
+};
+
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_PROOF_HEX_CHARS: usize = MAX_RESPONSE_BODY_BYTES - 1024;
@@ -102,8 +107,10 @@ pub enum HttpError {
     },
     /// The aggregator rejected the certification request (status != SUCCESS).
     Rejected(String),
-    /// Polling for the inclusion proof exceeded the configured attempts.
+    /// Polling for the inclusion proof exceeded the configured attempts or deadline.
     Timeout,
+    /// The caller cancelled the wait.
+    Cancelled,
     /// The aggregator has no certified or pending record for this state id.
     StateNotFound,
     /// The aggregator reports (an unauthenticated hint, see [`ProofStatus`]) that
@@ -154,6 +161,7 @@ impl fmt::Display for HttpError {
             }
             HttpError::Rejected(s) => write!(f, "certification rejected: {s:?}"),
             HttpError::Timeout => write!(f, "timed out waiting for inclusion proof"),
+            HttpError::Cancelled => write!(f, "wait cancelled"),
             HttpError::StateNotFound => write!(f, "state is not known to the aggregator"),
             HttpError::ProofOfOtherData => write!(
                 f,
