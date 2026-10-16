@@ -187,7 +187,8 @@ impl HttpAggregatorClient {
     /// server echoed a positive `waitedMs` **and** the call itself already lasted
     /// the polling interval; otherwise the remaining interval is slept (the full
     /// interval for a missing or zero echo, never less than a few milliseconds).
-    /// An answer without any echo to a request that carried a wait means the
+    /// An answer without any echo to a request that carried a wait (a result, or a
+    /// legacy server's `-32021` pending error) means the
     /// endpoint does not do long-poll: the rest of this wait omits `waitMs` (nothing
     /// is remembered beyond the call). `unknown` answers keep the consecutive-count
     /// grace and the normal pause; `expired` ends the wait. Legacy servers' pending
@@ -270,6 +271,13 @@ impl HttpAggregatorClient {
                 Ok(result) => result,
                 Err(HttpError::Rpc { code, .. }) if code == RPC_INCLUSION_PENDING => {
                     stats.pending += 1;
+                    // A legacy server's own pending error (dispatched method, no echo) is
+                    // as good evidence of "no long-poll" as a result without `waitedMs`:
+                    // stop sending `waitMs` for the rest of this wait only.
+                    if plan.wait_ms.is_some() {
+                        send_wait = false;
+                        stats.wait_dropped_for_missing_echo = true;
+                    }
                     self.pause(Pace::Sleep(interval.max(MIN_PAUSE)), deadline, options)?;
                     continue;
                 }
