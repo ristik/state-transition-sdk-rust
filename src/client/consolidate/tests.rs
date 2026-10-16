@@ -16,7 +16,8 @@ use crate::api::leaf_value::calculate_leaf_value;
 use crate::api::{CertificationData, NetworkId};
 use crate::cbor::{encode_byte_string, encode_tag, Decoder};
 use crate::client::{
-    certification_data_for, mint, transfer, AggregatorClient, BatchProof, ClientError,
+    certification_data_for, mint, transfer, AggregatorClient, BatchProof, ClientError, WaitedBatch,
+    WaitedFailure,
 };
 use crate::consolidation::{PartitionView, PartitionViewInputRecord, PartitionViewLeaf};
 use crate::crypto::hash::{sha256, DataHash, DataHasher, HashAlgorithm};
@@ -150,6 +151,8 @@ struct Faults {
     retained_from: usize,
     /// Fail every batch call with this.
     fail: Option<BatchFailure>,
+    /// Answer a request carrying `waitMs` with the generic strict-parser rejection.
+    reject_wait: bool,
     /// Run once after the next latest response (concurrent writes).
     after_latest: Option<fn(&mut Sim)>,
     /// Rewrite every latest response (an attacker or a faulty server).
@@ -164,6 +167,8 @@ struct Sim {
     leaves: [BTreeMap<[u8; 32], DataHash>; 2],
     submissions: usize,
     batch_calls: usize,
+    /// Every `waitMs` received: (is a latest request, wait).
+    waits: Vec<(bool, u64)>,
     faults: Faults,
     /// One partition with the empty shard id: no sidecar view is ever served.
     unsharded: bool,
@@ -222,6 +227,7 @@ impl Sim {
             leaves: [BTreeMap::new(), BTreeMap::new()],
             submissions: 0,
             batch_calls: 0,
+            waits: Vec::new(),
             faults: Faults::default(),
             unsharded,
         };
@@ -377,6 +383,36 @@ fn unavailable(detail: &str) -> BatchFailure {
 }
 
 impl BatchAggregatorClient for Node {
+    fn get_inclusion_proofs_with_wait(
+        &self,
+        request: &BatchRequest<'_>,
+        options: &RequestOptions,
+        wait_ms: u64,
+    ) -> Result<WaitedBatch, WaitedFailure> {
+        {
+            let mut sim = self.sim.lock().unwrap();
+            sim.waits
+                .push((matches!(request.state_root, StateRoot::Latest), wait_ms));
+            if sim.faults.reject_wait {
+                sim.batch_calls += 1;
+                return Err(WaitedFailure::from(BatchFailure::Rpc {
+                    code: rpc_code::INVALID_PARAMS,
+                    message: "Invalid params".into(),
+                    reason: Some("invalid_request".into()),
+                    detail: Some("malformed_params".into()),
+                    retryable: Some(false),
+                    indexes: Default::default(),
+                }));
+            }
+        }
+        self.get_inclusion_proofs(request, options)
+            .map(|batch| WaitedBatch {
+                batch,
+                waited_ms: Some(0),
+            })
+            .map_err(WaitedFailure::from)
+    }
+
     fn get_inclusion_proofs(
         &self,
         request: &BatchRequest<'_>,
@@ -661,6 +697,102 @@ fn consolidates_into_a_verified_token_with_one_outer_seal() {
         );
         assert!(master_seal.root_chain_round_number >= summary.required_round);
     }
+}
+
+#[test]
+fn the_master_latest_request_never_waits_unless_explicitly_enabled() {
+    let (sim, token) = spread_token(3);
+    let out = client(&sim, false).consolidate(&token, &quick()).unwrap();
+    assert!(matches!(out, ConsolidationOutcome::Consolidated { .. }));
+    assert!(
+        sim.lock().unwrap().waits.is_empty(),
+        "default: no waitMs anywhere"
+    );
+}
+
+#[test]
+fn an_enabled_wait_goes_on_the_master_latest_request_only() {
+    let (sim, token) = spread_token(3);
+    let c = client(&sim, false).with_master_long_poll(MasterLongPoll::default());
+    let ConsolidationOutcome::Consolidated { summary, .. } =
+        c.consolidate(&token, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    let s = sim.lock().unwrap();
+    // exactly one waited request, a latest one, sized by the 10 s attempt deadline
+    assert_eq!(s.waits.len(), 1);
+    let (latest, wait) = s.waits[0];
+    assert!(latest);
+    // 10 s - 2 s margin, less whatever the (slow, loaded) host already spent verifying
+    assert!((1..=8_000).contains(&wait), "10 s - 2 s margin: {wait}");
+    // the exact-root peer wave is unchanged: master + one peer request
+    assert_eq!(summary.requests, 2);
+    assert_eq!(s.batch_calls, 2);
+}
+
+#[test]
+fn no_wait_fits_a_short_deadline_so_the_plain_request_is_used() {
+    let (sim, token) = spread_token(3);
+    let c = client(&sim, false).with_master_long_poll(MasterLongPoll::default());
+    let opts = ConsolidateOptions {
+        timeout_ms: 1_500,
+        ..Default::default()
+    };
+    let out = c.consolidate(&token, &opts).unwrap();
+    assert!(matches!(out, ConsolidationOutcome::Consolidated { .. }));
+    assert!(sim.lock().unwrap().waits.is_empty());
+}
+
+#[test]
+fn a_strict_parser_rejection_costs_exactly_one_counted_retry_without_the_wait() {
+    let (sim, token) = spread_token(3);
+    sim.lock().unwrap().faults.reject_wait = true;
+    let c = client(&sim, false).with_master_long_poll(MasterLongPoll::default());
+    let ConsolidationOutcome::Consolidated { summary, .. } =
+        c.consolidate(&token, &quick()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        sim.lock().unwrap().waits.len(),
+        1,
+        "one wait attempt, never repeated"
+    );
+    // rejected master wait + retried master + one peer request
+    assert_eq!(summary.requests, 3);
+}
+
+#[test]
+fn a_caller_margin_below_two_seconds_sizes_the_sent_wait() {
+    let (sim, token) = spread_token(3);
+    let c = client(&sim, false).with_master_long_poll(MasterLongPoll {
+        margin_ms: 500,
+        ..Default::default()
+    });
+    c.consolidate(&token, &quick()).unwrap();
+    let (_, wait) = sim.lock().unwrap().waits[0];
+    // 10 s deadline - 0.5 s margin, less host time already spent; not capped at 8 s
+    assert!(wait > 8_000 && wait <= 9_500, "{wait}");
+}
+
+#[test]
+fn master_long_poll_budget_arithmetic() {
+    let lp = MasterLongPoll::default();
+    assert_eq!(lp.wait_for(600_000), Some(20_000));
+    assert_eq!(lp.wait_for(10_000), Some(8_000));
+    assert_eq!(lp.wait_for(2_000), None);
+    assert_eq!(lp.wait_for(1), None);
+    let tight = MasterLongPoll {
+        preferred_ms: 60_000,
+        margin_ms: 2_000,
+        max_request_ms: 15_000,
+    };
+    assert_eq!(
+        tight.wait_for(600_000),
+        Some(13_000),
+        "respects a 15 s transport"
+    );
 }
 
 #[test]
