@@ -18,9 +18,10 @@ pub use http::{
 };
 
 pub use batch::{
-    detail, get_latest_negotiating_wait, is_malformed_params, rpc_code, BatchAggregatorClient,
-    BatchFailure, BatchProof, BatchRequest, InclusionProofBatch, NegotiatedBatch, RequestOptions,
-    StateRoot, WaitedBatch, WaitedFailure, MAX_BATCH_STATE_IDS, MAX_WAIT_MS, UNCLASSIFIED,
+    detail, get_latest_negotiating_wait, is_malformed_params, rpc_code, wait_on_wire,
+    BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest, InclusionProofBatch,
+    NegotiatedBatch, RequestOptions, StateRoot, WaitedBatch, WaitedFailure, MAX_BATCH_STATE_IDS,
+    MAX_WAIT_MS, UNCLASSIFIED,
 };
 pub use consolidate::{
     AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,

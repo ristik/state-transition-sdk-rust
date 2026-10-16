@@ -44,8 +44,8 @@ const RPC_INCLUSION_PENDING: i64 = -32021;
 const RPC_STATE_INCLUDED: i64 = -32022;
 const RPC_SERVER_BUSY: i64 = -32023;
 
-/// Response margin kept between a sent `waitMs` and the call timeout: the wait is
-/// clamped so that `wait + margin` fits the caller's timeout.
+/// Default response margin the wait helpers keep between a `waitMs` and the call
+/// timeout. One-shot calls do not apply it: their caller sizes the wait.
 pub const DEFAULT_WAIT_MARGIN_MS: u64 = 2_000;
 
 /// One proof lookup with the long-poll echo (see
@@ -404,7 +404,8 @@ impl HttpAggregatorClient {
     ///
     /// A one-shot building block: it never polls or retries. `timeout` is the
     /// whole call's limit (connection, the server-side wait and the response);
-    /// the wait actually sent is clamped to `timeout - DEFAULT_WAIT_MARGIN_MS`.
+    /// the caller sizes `wait_ms` to leave its own response margin, and the wait
+    /// is only guarded to stay below `timeout`.
     /// A positive `wait_ms` for which no positive wait fits sends no `waitMs` at
     /// all (an ordinary immediate lookup); a `wait_ms` of zero is sent and asks
     /// for the echo only. Servers that do not know `waitMs` ignore it and answer
@@ -871,18 +872,8 @@ fn parse_waited_ms(value: &serde_json::Value) -> Result<u64, String> {
         .ok_or_else(|| "malformed waitedMs".to_string())
 }
 
-/// The `waitMs` to put on a request whose whole call may last `timeout_ms`:
-/// zero is sent as zero (echo only); a positive wait is clamped to leave
-/// [`DEFAULT_WAIT_MARGIN_MS`] for the response and is omitted when nothing
-/// positive fits.
 fn clamp_wait(wait_ms: u64, timeout_ms: u64) -> Option<u64> {
-    if wait_ms == 0 {
-        return Some(0);
-    }
-    let sent = wait_ms
-        .min(MAX_WAIT_MS)
-        .min(timeout_ms.saturating_sub(DEFAULT_WAIT_MARGIN_MS));
-    (sent > 0).then_some(sent)
+    super::batch::wait_on_wire(wait_ms, timeout_ms)
 }
 
 impl NonInclusionAggregatorClient for HttpAggregatorClient {

@@ -256,6 +256,18 @@ pub trait BatchAggregatorClient: AggregatorClient {
     }
 }
 
+/// The `waitMs` a transport puts on a request whose whole call may last
+/// `timeout_ms`: zero stays zero (echo only); a positive wait is guarded to stay
+/// below the timeout and is `None` (not sent) when nothing positive fits. The
+/// response margin is the caller's to size; it is not subtracted here.
+pub fn wait_on_wire(wait_ms: u64, timeout_ms: u64) -> Option<u64> {
+    if wait_ms == 0 {
+        return Some(0);
+    }
+    let sent = wait_ms.min(MAX_WAIT_MS).min(timeout_ms.saturating_sub(1));
+    (sent > 0).then_some(sent)
+}
+
 /// Whether `failure` is the generic strict-parser rejection (`-32602`,
 /// `invalid_request`, `malformed_params`) that an endpoint without `waitMs`
 /// support answers to a batch carrying it. The field name is not part of the
@@ -305,12 +317,15 @@ pub fn get_latest_negotiating_wait<C: BatchAggregatorClient + ?Sized>(
         state_ids,
         state_root: StateRoot::Latest,
     };
+    // When the transport could not put a wait on the wire the retry would repeat
+    // the identical request: there is nothing to negotiate.
+    let sent_wait = wait_on_wire(wait_ms, options.timeout_ms).is_some();
     let started = now_ms();
     let first = client.get_inclusion_proofs_with_wait(&request, options, wait_ms);
     // A `waitedMs` echo on the error means the server understood `waitMs`: the
     // rejection is about something else and a retry without the wait can not help.
-    let rejected =
-        matches!(&first, Err(e) if is_malformed_params(&e.failure) && e.waited_ms.is_none());
+    let rejected = sent_wait
+        && matches!(&first, Err(e) if is_malformed_params(&e.failure) && e.waited_ms.is_none());
     if !rejected {
         return NegotiatedBatch {
             result: first,
