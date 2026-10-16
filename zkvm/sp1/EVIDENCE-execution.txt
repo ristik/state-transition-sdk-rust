@@ -1,0 +1,16 @@
+# Executor results (host/ run, SP1 6.9 sdk executor, succinct rustc 1.94.0-dev, riscv64im), 2026-10-16.
+# "unpatched" = same program, same SDK source, without [patch.crates-io]; instruction counts, not proving cycles.
+== token carol (mint + 2 transfers, 1-of-1 quorum)
+  unpatched: instructions=11467641 syscalls:
+  patched  : instructions=966928 syscalls: SECP256K1_ADD=1808 SECP256K1_DOUBLE=3584 SHA_COMPRESS=77 SHA_EXTEND=77
+== token alice (mint only)
+  unpatched: instructions=5039017 syscalls:
+  patched  : instructions=373287 syscalls: SECP256K1_ADD=768 SECP256K1_DOUBLE=1536 SHA_COMPRESS=29 SHA_EXTEND=29
+== native UC (4-node trust base, quorum seal)
+  unpatched: instructions=4735108 syscalls:
+  patched  : instructions=266954 syscalls: SECP256K1_ADD=751 SECP256K1_DOUBLE=1536 SHA_COMPRESS=20 SHA_EXTEND=20
+
+# Same inputs with the previous formulation (patched library recover_from_prehash, the double-work version on the host):
+  carol   unpatched=19342443  patched=972080
+  alice   unpatched= 7667337  patched=375123
+  UC      unpatched= 8672999  patched=269624
