@@ -32,6 +32,7 @@
 mod context;
 mod error;
 mod mint_justification;
+mod ni_context;
 mod seal;
 
 pub use context::{VerificationContext, VerificationLimits, VerificationPolicy};
@@ -39,6 +40,7 @@ pub use error::VerificationError;
 pub use mint_justification::{
     MintJustificationRegistry, MintJustificationVerifier, TokenDataVerifier,
 };
+pub use ni_context::NonInclusionContext;
 pub(crate) use seal::check_seal_shape;
 pub use seal::{SealAuthenticator, SealSession, SealStats, DEFAULT_SEAL_MEMO_CAPACITY};
 
@@ -387,14 +389,53 @@ fn verify_unicity_certificate(
 
 /// Verify that `target` was absent at the certified root carried by `proof`.
 ///
+/// The unicity certificate is authenticated **strictly** under the trust base:
+/// network, the exact epoch, a root round not before the epoch's start, the native
+/// seal structure and the quorum. A fixed trust base therefore rejects seals of any
+/// other epoch, even when the validators' keys are reused.
+///
 /// This establishes a snapshot fact only. It does not imply that the state is
-/// absent at any later root.
+/// absent at any later root, and it does not say *which partition, shard or
+/// configuration* the certificate is for, nor how recent the root is: use
+/// [`verify_non_inclusion_proof_in_context`] when the caller has expectations
+/// (it should). The low-level
+/// [`NonInclusionCertificate::authenticates`](crate::api::NonInclusionCertificate::authenticates)
+/// checks the path against a root the caller already trusts; it is not
+/// certificate authentication.
 pub fn verify_non_inclusion_proof(
     trust_base: &RootTrustBase,
     proof: &NonInclusionProof,
     target: &StateId,
 ) -> Result<(), VerificationError> {
-    let mut seals = SealSession::new(trust_base);
+    verify_non_inclusion_in(&mut SealSession::new(trust_base), proof, target, None)
+}
+
+/// [`verify_non_inclusion_proof`] plus the caller's expectations: partition,
+/// optionally shard and configuration pin, a minimum root round and the end of the
+/// verifying authority's interval (see [`NonInclusionContext`]).
+pub fn verify_non_inclusion_proof_in_context(
+    trust_base: &RootTrustBase,
+    proof: &NonInclusionProof,
+    target: &StateId,
+    context: &NonInclusionContext,
+) -> Result<(), VerificationError> {
+    verify_non_inclusion_in(
+        &mut SealSession::new(trust_base),
+        proof,
+        target,
+        Some(context),
+    )
+}
+
+/// The shared implementation, within a caller-owned seal session so that several
+/// proofs under one certificate authenticate it once (verdicts are namespaced by
+/// the context).
+pub fn verify_non_inclusion_in(
+    seals: &mut SealSession<'_>,
+    proof: &NonInclusionProof,
+    target: &StateId,
+    context: Option<&NonInclusionContext>,
+) -> Result<(), VerificationError> {
     seals.ensure_trust_base()?;
 
     let uc = proof.unicity_certificate();
@@ -425,13 +466,72 @@ pub fn verify_non_inclusion_proof(
         }
     }
 
-    // Authenticate the root before reporting whether the terminal is the
-    // requested state. An untrusted certificate must never yield StateIncluded.
-    verify_unicity_certificate(&mut seals, uc, &[0; 32])?;
+    // Authenticate the certificate (strictly, in the context's namespace) before
+    // reporting whether the terminal is the requested state. An untrusted
+    // certificate must never yield StateIncluded.
+    verify_unicity_certificate_strict(seals, uc, context)?;
 
     if proof.certificate().terminal_matches(target) {
         return Err(VerificationError::StateIncluded);
     }
+    Ok(())
+}
+
+/// Strict authentication of a certificate for non-inclusion: the context's
+/// expectations, the shard path shape, the unicity-tree root and the seal under the
+/// strict authority policy (network, exact epoch, not before the epoch start,
+/// quorum). Successes are remembered per `(certificate, context)`.
+fn verify_unicity_certificate_strict(
+    seals: &mut SealSession<'_>,
+    uc: &UnicityCertificate,
+    context: Option<&NonInclusionContext>,
+) -> Result<(), VerificationError> {
+    let policy = ni_context::digest_of(context);
+    if seals.body_verified(uc, &policy) {
+        return Ok(());
+    }
+    seals.note_body_check();
+
+    // the shard path has exactly one sibling per bit of the shard id
+    let shard = &uc.shard_tree_certificate.shard;
+    if uc.shard_tree_certificate.sibling_hash_list.len() != shard.length() {
+        return Err(VerificationError::ShardPathInvalid);
+    }
+    let seal = &uc.unicity_seal;
+    if let Some(c) = context {
+        if uc.unicity_tree_certificate.partition_identifier != c.partition_id() {
+            return Err(VerificationError::PartitionMismatch);
+        }
+        if c.shard().is_some_and(|expected| expected != shard) {
+            return Err(VerificationError::ShardPathInvalid);
+        }
+        if c.shard_conf_hash()
+            .is_some_and(|pin| pin.as_slice() != uc.shard_configuration_hash.as_slice())
+        {
+            return Err(VerificationError::ConfigurationMismatch);
+        }
+        if c.min_root_round()
+            .is_some_and(|min| seal.root_chain_round_number < min)
+        {
+            return Err(VerificationError::SealTooOld);
+        }
+        if c.authority_end_round()
+            .is_some_and(|end| seal.root_chain_round_number >= end)
+        {
+            return Err(VerificationError::SealAfterAuthorityEnd);
+        }
+    }
+
+    // The recomputed unicity-tree root must equal the signed seal hash.
+    let computed = uc
+        .computed_seal_hash()
+        .map_err(|_| VerificationError::SealRootMismatch)?;
+    if computed.data() != seal.hash.as_slice() {
+        return Err(VerificationError::SealRootMismatch);
+    }
+
+    seals.authenticate_seal_under(seal, &policy)?;
+    seals.remember_body(uc, &policy);
     Ok(())
 }
 
@@ -534,7 +634,7 @@ mod tests {
     fn mk_seal(hash: Vec<u8>, signatures: Vec<(String, Vec<u8>)>) -> UnicitySeal {
         UnicitySeal {
             network_id: NetworkId::LOCAL,
-            root_chain_round_number: 0,
+            root_chain_round_number: 1,
             epoch: 0,
             timestamp: REFERENCE_TIME,
             previous_hash: None,
@@ -1271,6 +1371,296 @@ mod tests {
         assert!(
             matches!(result, Err(VerificationError::Transfer { index: 0, .. })),
             "expected a wrapped transfer rejection, got {result:?}"
+        );
+    }
+
+    // --- non-inclusion: strict authority and context ------------------------
+
+    /// Re-sign `uc` after `edit` changed its seal (the tree root is recomputed).
+    fn resign(
+        uc: &mut UnicityCertificate,
+        node: &Secp256k1Signer,
+        edit: impl FnOnce(&mut UnicitySeal),
+    ) {
+        let hash = uc.computed_seal_hash().unwrap().data().to_vec();
+        let mut seal = mk_seal(hash, Vec::new());
+        edit(&mut seal);
+        let signature = node.sign(&seal.calculate_hash()).encode().to_vec();
+        seal.signatures = alloc::vec![("NODE".to_string(), signature)];
+        uc.unicity_seal = seal;
+    }
+
+    fn ni_proof(
+        node: &Secp256k1Signer,
+        edit: impl FnOnce(&mut UnicityCertificate),
+    ) -> NonInclusionProof {
+        let base = singleton_non_inclusion_proof(node, [0x22; 32], [0x33; 32]);
+        let mut uc = base.unicity_certificate().clone();
+        edit(&mut uc);
+        NonInclusionProof::new(base.certificate().clone(), uc)
+    }
+
+    fn verify_ni(tb: &RootTrustBase, proof: &NonInclusionProof) -> Result<(), VerificationError> {
+        verify_non_inclusion_proof(tb, proof, &state_id([0x44; 32]))
+    }
+
+    fn verify_ni_ctx(
+        tb: &RootTrustBase,
+        proof: &NonInclusionProof,
+        ctx: &NonInclusionContext,
+    ) -> Result<(), VerificationError> {
+        verify_non_inclusion_proof_in_context(tb, proof, &state_id([0x44; 32]), ctx)
+    }
+
+    #[test]
+    fn non_inclusion_enforces_the_exact_epoch_with_reused_keys() {
+        let node = signer(0x11);
+        // the proof is sealed in epoch 3; the validators' keys are the same in epoch 1
+        let proof = ni_proof(&node, |uc| resign(uc, &node, |s| s.epoch = 3));
+        let mut tb = trust_base(&node);
+        tb.epoch = 3;
+        assert_eq!(verify_ni(&tb, &proof), Ok(()));
+        for other in [0u64, 1, 2, 4] {
+            tb.epoch = other;
+            assert_eq!(
+                verify_ni(&tb, &proof),
+                Err(VerificationError::SealEpochMismatch),
+                "authority of epoch {other}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_inclusion_rejects_rounds_before_the_epoch_start() {
+        let node = signer(0x11);
+        let proof = ni_proof(&node, |uc| {
+            resign(uc, &node, |s| s.root_chain_round_number = 9)
+        });
+        let mut tb = trust_base(&node);
+        tb.epoch_start_round = 9;
+        assert_eq!(
+            verify_ni(&tb, &proof),
+            Ok(()),
+            "the start round itself is in the epoch"
+        );
+        tb.epoch_start_round = 10;
+        assert_eq!(
+            verify_ni(&tb, &proof),
+            Err(VerificationError::SealBeforeEpochStart)
+        );
+    }
+
+    #[test]
+    fn non_inclusion_rejects_other_networks_and_malformed_seals() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let other_network = ni_proof(&node, |uc| {
+            resign(uc, &node, |s| s.network_id = NetworkId::MAINNET)
+        });
+        assert_eq!(
+            verify_ni(&tb, &other_network),
+            Err(VerificationError::SealNetworkMismatch)
+        );
+        let round_zero = ni_proof(&node, |uc| {
+            resign(uc, &node, |s| s.root_chain_round_number = 0)
+        });
+        assert_eq!(
+            verify_ni(&tb, &round_zero),
+            Err(VerificationError::SealMalformed)
+        );
+        let no_signatures = ni_proof(&node, |uc| uc.unicity_seal.signatures.clear());
+        assert_eq!(
+            verify_ni(&tb, &no_signatures),
+            Err(VerificationError::SealMalformed)
+        );
+    }
+
+    #[test]
+    fn non_inclusion_context_binds_partition_shard_configuration_and_rounds() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let proof = ni_proof(&node, |_| {});
+        // the fixture certificate is of partition 0, the empty shard, configuration 0x00..
+        let ctx = NonInclusionContext::new(0)
+            .with_shard(ShardId::root())
+            .with_shard_conf_hash([0u8; 32])
+            .with_min_root_round(1)
+            .with_authority_end_round(2);
+        assert_eq!(verify_ni_ctx(&tb, &proof, &ctx), Ok(()));
+        assert_eq!(
+            verify_ni_ctx(&tb, &proof, &NonInclusionContext::new(7)),
+            Err(VerificationError::PartitionMismatch)
+        );
+        let (a, _) = ShardId::root().split();
+        assert_eq!(
+            verify_ni_ctx(&tb, &proof, &NonInclusionContext::new(0).with_shard(a)),
+            Err(VerificationError::ShardPathInvalid)
+        );
+        assert_eq!(
+            verify_ni_ctx(
+                &tb,
+                &proof,
+                &NonInclusionContext::new(0).with_shard_conf_hash([1; 32])
+            ),
+            Err(VerificationError::ConfigurationMismatch)
+        );
+        assert_eq!(
+            verify_ni_ctx(
+                &tb,
+                &proof,
+                &NonInclusionContext::new(0).with_min_root_round(2)
+            ),
+            Err(VerificationError::SealTooOld),
+            "an authenticated but older root is not the freshness the caller needs"
+        );
+        assert_eq!(
+            verify_ni_ctx(
+                &tb,
+                &proof,
+                &NonInclusionContext::new(0).with_authority_end_round(1)
+            ),
+            Err(VerificationError::SealAfterAuthorityEnd),
+            "a seal at the retirement boundary is outside the authority's interval"
+        );
+        // the proof's own claims never substitute for the context
+        let other_partition = ni_proof(&node, |uc| {
+            uc.unicity_tree_certificate.partition_identifier = 5;
+            resign(uc, &node, |_| {});
+        });
+        assert_eq!(
+            verify_ni(&tb, &other_partition),
+            Ok(()),
+            "no context, no partition claim"
+        );
+        assert_eq!(
+            verify_ni_ctx(&tb, &other_partition, &NonInclusionContext::new(0)),
+            Err(VerificationError::PartitionMismatch)
+        );
+        assert_eq!(
+            verify_ni_ctx(&tb, &other_partition, &NonInclusionContext::new(5)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn non_inclusion_rejects_malformed_shard_paths() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        // one-bit shard "0" (the target 0x44.. and terminal 0x22.. both start with 0) but no sibling
+        let missing = ni_proof(&node, |uc| {
+            uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
+            resign(uc, &node, |_| {});
+        });
+        assert_eq!(
+            verify_ni(&tb, &missing),
+            Err(VerificationError::ShardPathInvalid)
+        );
+        // an extra sibling on the empty shard
+        // (its root can not even be recomputed, so the seal is left as it was)
+        let extra = ni_proof(&node, |uc| {
+            uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![0u8; 32]];
+        });
+        assert_eq!(
+            verify_ni(&tb, &extra),
+            Err(VerificationError::ShardPathInvalid)
+        );
+        // a well-formed one-bit shard passes
+        let ok = ni_proof(&node, |uc| {
+            uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
+            uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![9u8; 32]];
+            resign(uc, &node, |_| {});
+        });
+        assert_eq!(verify_ni(&tb, &ok), Ok(()));
+    }
+
+    /// Strict verdicts are never inherited from, or by, the legacy inclusion check or
+    /// another context, nor by a different signature witness.
+    #[test]
+    fn non_inclusion_verdicts_are_namespaced_and_witness_bound() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let proof = ni_proof(&node, |uc| resign(uc, &node, |s| s.epoch = 4)); // epoch mismatch
+                                                                              // the legacy (inclusion) check of the same certificate in one session passes ...
+        let mut session = SealSession::new(&tb);
+        assert_eq!(
+            verify_unicity_certificate(&mut session, proof.unicity_certificate(), &[0; 32]),
+            Ok(())
+        );
+        // ... and does not make the strict non-inclusion check pass
+        let target = state_id([0x44; 32]);
+        assert_eq!(
+            verify_non_inclusion_in(&mut session, &proof, &target, None),
+            Err(VerificationError::SealEpochMismatch)
+        );
+
+        // one session, one valid certificate: reused under the same context only
+        let good = ni_proof(&node, |_| {});
+        let mut session = SealSession::new(&tb);
+        let ctx = NonInclusionContext::new(0);
+        for _ in 0..3 {
+            assert_eq!(
+                verify_non_inclusion_in(&mut session, &good, &target, Some(&ctx)),
+                Ok(())
+            );
+        }
+        let s = session.stats();
+        assert_eq!((s.body_checks, s.body_hits, s.quorum_checks), (1, 2, 1));
+        assert_eq!(
+            verify_non_inclusion_in(&mut session, &good, &target, None),
+            Ok(())
+        );
+        assert_eq!(
+            session.stats().body_checks,
+            2,
+            "another context re-checks the body"
+        );
+        // a different witness for the same unsigned seal is another certificate
+        let mut other = good.unicity_certificate().clone();
+        other
+            .unicity_seal
+            .signatures
+            .push(("EXTRA".to_string(), alloc::vec![1u8; 65]));
+        let twin = NonInclusionProof::new(good.certificate().clone(), other);
+        assert_eq!(
+            verify_non_inclusion_in(&mut session, &twin, &target, Some(&ctx)),
+            Ok(())
+        );
+        assert_eq!(session.stats().body_checks, 3);
+    }
+
+    #[test]
+    fn the_legacy_inclusion_verifier_keeps_its_behavior() {
+        // scoping: only non-inclusion became strict; an inclusion proof sealed in
+        // another epoch still verifies under the network-only rule
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        resign(&mut proof.unicity_certificate, &node, |s| s.epoch = 9);
+        assert_eq!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bound_non_inclusion_proofs_verify_in_context() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let proof = ni_proof(&node, |_| {});
+        let target = state_id([0x44; 32]);
+        let ctx = NonInclusionContext::new(0);
+        assert_eq!(
+            proof.verify_in_context(&tb, &ctx),
+            Err(VerificationError::NonInclusionTargetMissing)
+        );
+        assert_eq!(proof.verify_for_in_context(&target, &tb, &ctx), Ok(()));
+        let bound = proof.for_state(&target).unwrap();
+        assert_eq!(bound.verify_in_context(&tb, &ctx), Ok(()));
+        assert_eq!(
+            bound.verify_for_in_context(&state_id([0x45; 32]), &tb, &ctx),
+            Err(VerificationError::NonInclusionTargetMismatch)
+        );
+        assert_eq!(
+            bound.verify_in_context(&tb, &NonInclusionContext::new(3)),
+            Err(VerificationError::PartitionMismatch)
         );
     }
 }

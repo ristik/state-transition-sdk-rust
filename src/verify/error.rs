@@ -91,6 +91,18 @@ pub enum VerificationError {
     SealBeforeEpochStart,
     /// The unicity seal is structurally unusable (no signatures, zero round, ...).
     SealMalformed,
+    /// The certificate is of another partition than the verification context expects.
+    PartitionMismatch,
+    /// The shard tree path of the certificate is malformed (its length differs
+    /// from the shard id's), or the certificate is of another shard than expected.
+    ShardPathInvalid,
+    /// The certificate commits to another shard configuration than the pinned one.
+    ConfigurationMismatch,
+    /// The seal's root round is older than the verification context requires.
+    SealTooOld,
+    /// The seal's root round is at or after the end of the verifying authority's
+    /// interval (a retired authority).
+    SealAfterAuthorityEnd,
     /// The recomputed unicity-tree root does not match the signed seal hash.
     SealRootMismatch,
     /// Fewer than `quorumThreshold` distinct root-node signatures were valid.
@@ -226,6 +238,22 @@ impl fmt::Display for VerificationError {
                 write!(f, "unicity seal predates the trust base epoch")
             }
             VerificationError::SealMalformed => write!(f, "malformed unicity seal"),
+            VerificationError::PartitionMismatch => {
+                write!(f, "unicity certificate is of another partition")
+            }
+            VerificationError::ShardPathInvalid => {
+                write!(f, "malformed or unexpected shard tree path")
+            }
+            VerificationError::ConfigurationMismatch => {
+                write!(f, "shard configuration differs from the pinned one")
+            }
+            VerificationError::SealTooOld => write!(f, "unicity seal is older than required"),
+            VerificationError::SealAfterAuthorityEnd => {
+                write!(
+                    f,
+                    "unicity seal is after the end of the authority's interval"
+                )
+            }
             VerificationError::SealRootMismatch => {
                 write!(f, "unicity tree root does not match seal hash")
             }

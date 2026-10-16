@@ -7,7 +7,7 @@ use super::bft::{RootTrustBase, UnicityCertificate};
 use super::{NonInclusionCertificate, StateId};
 use crate::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
 use crate::error::Error;
-use crate::verify::{self, VerificationError};
+use crate::verify::{self, NonInclusionContext, VerificationError};
 
 /// CBOR tag for [`NonInclusionProof`].
 pub const NON_INCLUSION_PROOF_TAG: u64 = 39034;
@@ -105,6 +105,11 @@ impl NonInclusionProof {
 
     /// Verify a client-bound proof against `trust_base`.
     ///
+    /// The unicity certificate is authenticated strictly (network, exact epoch,
+    /// root round not before the epoch start, quorum), but nothing here says which
+    /// partition, shard or configuration it belongs to or how recent it is: prefer
+    /// [`verify_in_context`](Self::verify_in_context).
+    ///
     /// Proofs returned by the provided clients are bound automatically. A proof
     /// decoded directly from untrusted bytes has no request context; use
     /// [`verify_for`](Self::verify_for) for that case.
@@ -116,7 +121,42 @@ impl NonInclusionProof {
         verify::verify_non_inclusion_proof(trust_base, self, target)
     }
 
-    /// Verify a directly decoded proof for an explicit `target`.
+    /// Verify a client-bound proof, additionally against the caller's expectations
+    /// (partition, optional shard and configuration pin, minimum root round, end of
+    /// the authority's interval). See [`NonInclusionContext`].
+    pub fn verify_in_context(
+        &self,
+        trust_base: &RootTrustBase,
+        context: &NonInclusionContext,
+    ) -> Result<(), VerificationError> {
+        let target = self
+            .requested_state_id
+            .as_ref()
+            .ok_or(VerificationError::NonInclusionTargetMissing)?;
+        verify::verify_non_inclusion_proof_in_context(trust_base, self, target, context)
+    }
+
+    /// [`verify_in_context`](Self::verify_in_context) for a directly decoded proof
+    /// and an explicit `target` (a different target than a client-bound one is
+    /// rejected).
+    pub fn verify_for_in_context(
+        &self,
+        target: &StateId,
+        trust_base: &RootTrustBase,
+        context: &NonInclusionContext,
+    ) -> Result<(), VerificationError> {
+        if self
+            .requested_state_id
+            .as_ref()
+            .is_some_and(|requested| requested != target)
+        {
+            return Err(VerificationError::NonInclusionTargetMismatch);
+        }
+        verify::verify_non_inclusion_proof_in_context(trust_base, self, target, context)
+    }
+
+    /// Verify a directly decoded proof for an explicit `target` (strict authority
+    /// authentication; see [`verify`](Self::verify)).
     ///
     /// If the proof is already client-bound, a different target is rejected so
     /// request context cannot be silently replaced.
