@@ -439,3 +439,32 @@ fn a_legacy_not_found_is_terminal_and_a_wait_free_pending_stays_wait_free() {
     assert!(matches!(out.result, Err(HttpError::Timeout)));
     assert!(!out.stats.wait_dropped_for_missing_echo);
 }
+
+#[test]
+fn a_pending_error_that_echoes_the_wait_keeps_long_poll_on() {
+    let f = full();
+    let server = Scripted::start(move |i, _| {
+        if i < 2 {
+            Reply::error(r#"{"code":-32021,"message":"pending","data":{"waitedMs":0}}"#)
+        } else {
+            Reply::result(obj(&f, None, Some(0)))
+        }
+    });
+    let out = client(&server.url, 20)
+        .wait_for_inclusion_proof_with_stats(&state_id(7), &WaitOptions::new(secs(10)));
+    assert!(out.result.is_ok());
+    assert!(!out.stats.wait_dropped_for_missing_echo);
+    for i in 0..3 {
+        assert!(wait_param(&server, i).is_some(), "request {i} still asks");
+    }
+}
+
+#[test]
+fn a_pending_error_with_a_malformed_echo_is_a_protocol_error() {
+    let server = Scripted::start(|_, _| {
+        Reply::error(r#"{"code":-32021,"message":"pending","data":{"waitedMs":-3}}"#)
+    });
+    let r =
+        client(&server.url, 20).wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(secs(5)));
+    assert!(matches!(r, Err(HttpError::Decode(_))), "{r:?}");
+}
