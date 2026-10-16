@@ -14,11 +14,15 @@ mod http;
 #[cfg(all(test, feature = "http"))]
 pub(crate) use http::conflict_error;
 #[cfg(feature = "http")]
-pub use http::{HttpAggregatorClient, HttpError, SubmitOutcome, DEFAULT_UNKNOWN_GRACE};
+pub use http::{
+    HttpAggregatorClient, HttpError, SubmitOutcome, WaitedLookup, DEFAULT_UNKNOWN_GRACE,
+    DEFAULT_WAIT_MARGIN_MS,
+};
 
 pub use batch::{
-    detail, rpc_code, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
-    InclusionProofBatch, RequestOptions, StateRoot, MAX_BATCH_STATE_IDS, UNCLASSIFIED,
+    detail, get_latest_negotiating_wait, is_malformed_params, rpc_code, BatchAggregatorClient,
+    BatchFailure, BatchProof, BatchRequest, InclusionProofBatch, NegotiatedBatch, RequestOptions,
+    StateRoot, WaitedBatch, WaitedFailure, MAX_BATCH_STATE_IDS, MAX_WAIT_MS, UNCLASSIFIED,
 };
 pub use consolidate::{
     AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,
