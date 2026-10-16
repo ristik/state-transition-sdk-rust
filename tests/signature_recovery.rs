@@ -86,7 +86,7 @@ fn seal_quorum_vectors_count_only_conforming_signatures() {
         s["quorumThreshold"].as_u64().unwrap(),
     );
     let cases = s["cases"].as_array().unwrap();
-    assert!(cases.len() >= 9);
+    assert!(cases.len() >= 10);
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let bytes = hex::decode(case["sealCbor"].as_str().unwrap()).unwrap();
