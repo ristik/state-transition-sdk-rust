@@ -3,11 +3,11 @@
 //! Wire signature = 65 bytes: `r(32) || s(32) || recovery(1)`. Public keys are
 //! 33-byte compressed SEC1 points. Signatures are over a *raw 32-byte digest*
 //! (no extra prehash). Verification enforces **low-`s`** (BIP-0062 canonical
-//! form) so a malleated high-`s` copy of a valid signature is rejected.
+//! form) so a malleated high-`s` copy of a valid signature is rejected, and the
+//! recovery id is bound to the trusted key (see [`Signature::verify`]).
 
 use alloc::vec::Vec;
 
-use k256::ecdsa::signature::hazmat::PrehashVerifier;
 use k256::ecdsa::{RecoveryId, Signature as K256Signature, VerifyingKey};
 
 use crate::cbor::{encode_byte_string, Decoder};
@@ -35,11 +35,6 @@ impl PublicKey {
     /// The 33 compressed bytes.
     pub fn as_bytes(&self) -> &[u8; 33] {
         &self.bytes
-    }
-
-    fn verifying_key(&self) -> VerifyingKey {
-        // Safe to unwrap: validated at construction.
-        VerifyingKey::from_sec1_bytes(&self.bytes).expect("validated public key")
     }
 }
 
@@ -118,16 +113,18 @@ impl Signature {
         Ok(sig)
     }
 
-    /// Verify this signature over `digest` against `public_key`.
+    /// Verify this signature over `digest` against `public_key`, **binding the
+    /// recovery id**: the key recovered from `(digest, r, s, v)` must equal
+    /// `public_key`. A signature whose `r || s` verifies but whose `v` selects another
+    /// recovery branch (or an out of range one, which can not be constructed) is
+    /// refused, so the 65-byte witness has no malleable byte. A range check on `v`
+    /// would not be enough: `v ^ 1` stays in range and recovers another key.
     ///
-    /// Returns `false` for any verification failure, including a non-canonical
-    /// high-`s` encoding.
+    /// Returns `false` for any failure, including a non-canonical high-`s` encoding.
+    /// (Recovering the trusted key implies the ECDSA equation holds for it.)
     pub fn verify(&self, digest: &[u8], public_key: &PublicKey) -> bool {
-        match self.canonical() {
-            Ok(sig) => public_key
-                .verifying_key()
-                .verify_prehash(digest, &sig)
-                .is_ok(),
+        match self.recover(digest) {
+            Ok(recovered) => recovered == *public_key,
             Err(_) => false,
         }
     }
@@ -152,6 +149,38 @@ impl core::fmt::Debug for Signature {
             hex::encode(self.bytes),
             self.recovery
         )
+    }
+}
+
+#[cfg(all(test, feature = "client"))]
+mod recovery_tests {
+    use super::*;
+    use crate::crypto::hash::sha256;
+    use crate::crypto::signer::{Secp256k1Signer, Signer};
+
+    #[test]
+    fn only_the_recovery_id_that_recovers_the_signer_verifies() {
+        let signer = Secp256k1Signer::from_bytes(&[7; 32]).unwrap();
+        let other = Secp256k1Signer::from_bytes(&[8; 32]).unwrap();
+        let digest = sha256(b"o3");
+        let sig = signer.sign(&digest);
+        let pk = signer.public_key();
+        assert!(sig.verify(digest.data(), &pk));
+        assert!(!sig.verify(digest.data(), &other.public_key()));
+        for v in 0..=3u8 {
+            let variant = Signature::new(*sig.compact(), v).unwrap();
+            assert_eq!(
+                variant.verify(digest.data(), &pk),
+                v == sig.recovery(),
+                "v={v}"
+            );
+        }
+        // xor-1 stays in range and recovers another key (or none)
+        let flipped = Signature::new(*sig.compact(), sig.recovery() ^ 1).unwrap();
+        assert!(!flipped.verify(digest.data(), &pk));
+        // a high-s copy with the matching parity flip is valid ECDSA but not canonical
+        // (covered by the shared fixtures); a wrong digest never verifies
+        assert!(!sig.verify(sha256(b"other").data(), &pk));
     }
 }
 
