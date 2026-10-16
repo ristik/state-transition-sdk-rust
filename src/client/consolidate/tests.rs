@@ -152,6 +152,8 @@ struct Faults {
     fail: Option<BatchFailure>,
     /// Run once after the next latest response (concurrent writes).
     after_latest: Option<fn(&mut Sim)>,
+    /// Rewrite every latest response (an attacker or a faulty server).
+    mangle_latest: Option<fn(&mut InclusionProofBatch)>,
 }
 
 struct Sim {
@@ -163,14 +165,42 @@ struct Sim {
     submissions: usize,
     batch_calls: usize,
     faults: Faults,
+    /// One partition with the empty shard id: no sidecar view is ever served.
+    unsharded: bool,
 }
 
 fn shard_of(key: &[u8; 32]) -> usize {
     usize::from(bit_at(key, 0))
 }
 
+/// The unsharded configuration: the single empty shard, its configuration pinned.
+fn unsharded_topology(pinned: bool) -> PartitionTopology {
+    let t = PartitionTopology::single_shard();
+    if pinned {
+        t.with_shard_conf_hash(&ShardId::root(), conf_hash(0))
+    } else {
+        t
+    }
+}
+
 impl Sim {
     fn new() -> Self {
+        Self::with_sharding(false)
+    }
+
+    fn new_unsharded() -> Self {
+        Self::with_sharding(true)
+    }
+
+    fn shard_index(&self, key: &[u8; 32]) -> usize {
+        if self.unsharded {
+            0
+        } else {
+            shard_of(key)
+        }
+    }
+
+    fn with_sharding(unsharded: bool) -> Self {
         let signers: Vec<_> = (1..=4u8)
             .map(|i| Secp256k1Signer::from_bytes(&[i; 32]).unwrap())
             .collect();
@@ -193,6 +223,7 @@ impl Sim {
             submissions: 0,
             batch_calls: 0,
             faults: Faults::default(),
+            unsharded,
         };
         sim.advance();
         sim
@@ -205,12 +236,16 @@ impl Sim {
         let mut roots: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
         let mut paths: [BTreeMap<[u8; 32], Vec<u8>>; 2] = Default::default();
         let mut view_leaves = Vec::new();
-        for s in 0..2 {
+        for s in 0..if self.unsharded { 1 } else { 2 } {
             let (root, p) = smt(&self.leaves[s]);
             let prev_root = prev.map_or(Vec::new(), |p| p.roots[s].clone());
             let changed = prev_root != root;
             view_leaves.push(PartitionViewLeaf {
-                shard_id: shard_ids()[s].clone(),
+                shard_id: if self.unsharded {
+                    ShardId::root()
+                } else {
+                    shard_ids()[s].clone()
+                },
                 input_record: PartitionViewInputRecord {
                     round_number: r,
                     epoch: 0,
@@ -232,7 +267,16 @@ impl Sim {
             partition_id: PARTITION,
             leaves: view_leaves,
         };
-        let tree = view.build_shard_tree(PARTITION, &topology(true)).unwrap();
+        let tree = view
+            .build_shard_tree(
+                PARTITION,
+                &if self.unsharded {
+                    unsharded_topology(true)
+                } else {
+                    topology(true)
+                },
+            )
+            .unwrap();
         let utc = UnicityTreeCertificate {
             partition_identifier: PARTITION,
             steps: vec![HashStep {
@@ -266,7 +310,7 @@ impl Sim {
             }
         };
         self.rounds.push(Round {
-            ucs: [uc(0), uc(1)],
+            ucs: [uc(0), uc(view.leaves.len() - 1)],
             seal,
             roots,
             view,
@@ -276,7 +320,7 @@ impl Sim {
     }
 
     fn proof_at(&self, round: usize, key: &[u8; 32]) -> Option<InclusionProof> {
-        let s = shard_of(key);
+        let s = self.shard_index(key);
         let r = &self.rounds[round];
         r.leaves[s].get(key)?;
         let (data, reference_time) = self.certs.get(key)?.clone();
@@ -308,7 +352,8 @@ impl AggregatorClient for Node {
         let reference_time = T0 + sim.rounds.len() as u64 + 1;
         let value = calculate_leaf_value(data.transaction_hash(), reference_time);
         sim.certs.insert(key, (data.clone(), reference_time));
-        sim.leaves[shard_of(&key)].insert(key, value);
+        let shard = sim.shard_index(&key);
+        sim.leaves[shard].insert(key, value);
         sim.advance();
         Ok(())
     }
@@ -360,14 +405,18 @@ impl BatchAggregatorClient for Node {
             StateRoot::Latest => {
                 let round = sim.faults.latest_override.unwrap_or(sim.rounds.len() - 1);
                 let proofs = proofs_at(&sim, round)?;
-                let partition_view = Some(sim.rounds[round].view.clone());
+                let partition_view = (!sim.unsharded).then(|| sim.rounds[round].view.clone());
                 if let Some(hook) = sim.faults.after_latest.take() {
                     hook(&mut sim);
                 }
-                Ok(InclusionProofBatch {
+                let mut batch = InclusionProofBatch {
                     proofs,
                     partition_view,
-                })
+                };
+                if let Some(mangle) = sim.faults.mangle_latest {
+                    mangle(&mut batch);
+                }
+                Ok(batch)
             }
             StateRoot::Exact(root) => {
                 // the oldest retained round with this root: its seal is older than the master's
@@ -1644,4 +1693,284 @@ fn embedded_tokens_decode_through_the_operation_interner() {
         "each distinct embedded certificate parsed once"
     );
     assert_eq!(st.uc_hits as usize, l - m);
+}
+
+// --------------------------------------------- unsharded direct target ----
+
+fn unsharded_client_with(
+    sim: &Arc<Mutex<Sim>>,
+    partition: u32,
+    topology: PartitionTopology,
+) -> TestClient {
+    let tb = sim.lock().unwrap().trust_base.clone();
+    ProofClient::with_host_defaults(
+        ProofClientConfig {
+            partition_id: partition,
+            topology,
+        },
+        vec![(ShardId::root(), node(sim))],
+        tb,
+        2,
+    )
+    .unwrap()
+}
+
+fn unsharded_client(sim: &Arc<Mutex<Sim>>, pinned: bool) -> TestClient {
+    unsharded_client_with(sim, PARTITION, unsharded_topology(pinned))
+}
+
+fn unsharded_token(transfers: usize) -> (Arc<Mutex<Sim>>, Token) {
+    let sim = Arc::new(Mutex::new(Sim::new_unsharded()));
+    let token = make_token(&sim, 1, None, transfers);
+    (sim, token)
+}
+
+fn each_certificate(batch: &mut InclusionProofBatch, f: impl Fn(&mut UnicityCertificate)) {
+    for p in &mut batch.proofs {
+        f(&mut p.proof.unicity_certificate);
+    }
+}
+
+#[test]
+fn an_unsharded_latest_batch_consolidates_without_any_view() {
+    for pinned in [false, true] {
+        let (sim, token) = unsharded_token(3);
+        let tb = sim.lock().unwrap().trust_base.clone();
+        let before = token.clone();
+        assert!(distinct_seals(outer_proofs(&token).iter().map(|o| o.proof)) >= 3);
+        let calls = sim.lock().unwrap().batch_calls;
+
+        let out = unsharded_client(&sim, pinned)
+            .consolidate(&token, &quick())
+            .unwrap();
+        let ConsolidationOutcome::Consolidated {
+            token: out,
+            summary,
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert_eq!(token, before);
+        out.verify(&tb).unwrap();
+        assert_eq!(tx_bytes(&out), tx_bytes(&token));
+        assert_eq!(
+            distinct_seals(outer_proofs(&out).iter().map(|o| o.proof)),
+            1
+        );
+        // one latest request, one wave, no view, nothing derived
+        assert_eq!(sim.lock().unwrap().batch_calls, calls + 1);
+        assert_eq!((summary.requests, summary.shards), (1, 1));
+        assert_eq!(summary.certificates_derived, 0);
+        assert_eq!(summary.verification_quorum_checks, 1);
+        assert_eq!(summary.outer_seals_after, 1);
+        assert!(!summary.already_shared);
+        for (a, b) in outer_proofs(&out).iter().zip(outer_proofs(&token)) {
+            assert_eq!(a.proof.certification_data, b.proof.certification_data);
+            assert_eq!(a.proof.reference_time, b.proof.reference_time);
+        }
+
+        // already shared: no request, the strict authority is still checked
+        let again = unsharded_client(&sim, pinned)
+            .consolidate(&out, &quick())
+            .unwrap();
+        let ConsolidationOutcome::Consolidated { summary, .. } = again else {
+            panic!("{again:?}")
+        };
+        assert!(summary.already_shared);
+        assert_eq!(sim.lock().unwrap().batch_calls, calls + 1);
+    }
+}
+
+#[test]
+fn the_direct_target_never_falls_back_or_downgrades() {
+    let unsharded = |mangle: fn(&mut InclusionProofBatch)| {
+        let (sim, token) = unsharded_token(2);
+        sim.lock().unwrap().faults.mangle_latest = Some(mangle);
+        let out = unsharded_client(&sim, true).consolidate(&token, &quick());
+        (sim, token, out)
+    };
+    let context = |out: &Result<ConsolidationOutcome, ConsolidationError>| {
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(
+                IntegrityError::Context { .. }
+            ))
+        )
+    };
+
+    // an empty shard id with a nonempty shard path
+    let (_, _, out) = unsharded(|b| {
+        each_certificate(b, |uc| {
+            uc.shard_tree_certificate.sibling_hash_list = vec![vec![0; 32]]
+        })
+    });
+    assert!(context(&out), "{out:?}");
+
+    // a malformed sidecar beside an unsharded certificate: validated through the
+    // view path (and refused), never ignored in favor of the direct target
+    let (_, _, out) = unsharded(|b| {
+        b.partition_view = Some(PartitionView {
+            partition_id: PARTITION,
+            leaves: Vec::new(),
+        })
+    });
+    assert!(
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(IntegrityError::View(_)))
+        ),
+        "{out:?}"
+    );
+
+    // a nonempty shard without its view stays unavailable
+    let (_, _, out) = unsharded(|b| {
+        each_certificate(b, |uc| {
+            uc.shard_tree_certificate.shard = ShardId::root().split().0
+        })
+    });
+    assert!(matches!(
+        out,
+        Ok(ConsolidationOutcome::Unavailable {
+            reason: UnavailableReason::PartitionViewUnavailable,
+            ..
+        })
+    ));
+
+    // forged material: a changed root, a tampered signature
+    let (_, _, out) = unsharded(|b| each_certificate(b, |uc| uc.input_record.hash[0] ^= 1));
+    assert!(
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(IntegrityError::Target(_)))
+        ),
+        "{out:?}"
+    );
+    let (_, _, out) =
+        unsharded(|b| each_certificate(b, |uc| uc.unicity_seal.signatures[0].1[3] ^= 1));
+    assert!(
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(IntegrityError::Target(_)))
+        ),
+        "{out:?}"
+    );
+    // a seal of a quorum-less witness
+    let (_, _, out) =
+        unsharded(|b| each_certificate(b, |uc| uc.unicity_seal.signatures.truncate(1)));
+    assert!(
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(IntegrityError::Target(_)))
+        ),
+        "{out:?}"
+    );
+
+    // mixed certificates in one batch
+    let (_, _, out) = unsharded(|b| {
+        let last = b.proofs.len() - 1;
+        b.proofs[last]
+            .proof
+            .unicity_certificate
+            .unicity_seal
+            .timestamp += 1;
+    });
+    assert!(
+        matches!(out, Err(ConsolidationError::InvalidResponse { .. })),
+        "{out:?}"
+    );
+
+    // a sharded configuration never accepts an unsharded certificate or a missing view
+    let (sim, token) = spread_token(3);
+    let c = client(&sim, true);
+    sim.lock().unwrap().faults.mangle_latest = Some(|b| b.partition_view = None);
+    assert!(matches!(
+        c.consolidate(&token, &quick()),
+        Ok(ConsolidationOutcome::Unavailable {
+            reason: UnavailableReason::PartitionViewUnavailable,
+            retryable: true
+        })
+    ));
+    sim.lock().unwrap().faults.mangle_latest = Some(|b| {
+        b.partition_view = None;
+        each_certificate(b, |uc| uc.shard_tree_certificate.shard = ShardId::root());
+    });
+    let out = c.consolidate(&token, &quick());
+    assert!(context(&out), "{out:?}");
+}
+
+#[test]
+fn the_direct_target_is_bound_to_the_configured_partition_and_pins() {
+    let (sim, token) = unsharded_token(2);
+    let other_partition = unsharded_client_with(&sim, PARTITION + 1, unsharded_topology(false));
+    let out = other_partition.consolidate(&token, &quick());
+    assert!(
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(
+                IntegrityError::Context { .. }
+            ))
+        ),
+        "{out:?}"
+    );
+    let wrong_pin = unsharded_client_with(
+        &sim,
+        PARTITION,
+        PartitionTopology::single_shard().with_shard_conf_hash(&ShardId::root(), [0xee; 32]),
+    );
+    let out = wrong_pin.consolidate(&token, &quick());
+    assert!(
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(
+                IntegrityError::Context { .. }
+            ))
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_stale_direct_target_is_unavailable_not_accepted() {
+    let (sim, token) = unsharded_token(2);
+    let rounds = sim.lock().unwrap().rounds.len();
+    // serve a genuinely signed round older than the evidence
+    sim.lock().unwrap().faults.latest_override = Some(rounds - 3);
+    let out = unsharded_client(&sim, false).consolidate(&token, &quick());
+    assert!(
+        matches!(
+            out,
+            Ok(ConsolidationOutcome::Unavailable {
+                reason: UnavailableReason::TargetNotYetAvailable,
+                retryable: true
+            })
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn direct_replacements_share_the_session_memo() {
+    // loose proofs: one quorum verification for the target, reused by every replacement
+    let (sim, token) = unsharded_token(3);
+    let items: Vec<ProofItem> = outer_proofs(&token)
+        .iter()
+        .map(|o| ProofItem {
+            state_id: o.state_id.clone(),
+            proof: o.proof.clone(),
+        })
+        .collect();
+    let out = unsharded_client(&sim, true)
+        .consolidate_proofs(&items, &quick())
+        .unwrap();
+    let BundleOutcome::Consolidated(bundle) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(bundle.summary.requests, 1);
+    assert_eq!(bundle.summary.certificates_derived, 0);
+    // the original evidence's seals, then exactly one more quorum for the target
+    assert_eq!(
+        bundle.summary.consolidation_quorum_checks,
+        distinct_seals(items.iter().map(|i| &i.proof)) as u64 + 1
+    );
+    assert_eq!(distinct_seals(bundle.proofs.iter()), 1);
 }

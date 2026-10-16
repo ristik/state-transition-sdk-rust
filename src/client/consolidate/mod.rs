@@ -13,6 +13,14 @@
 //! parallel on a host), all under one total deadline and one [`CancelToken`].
 //! There is no retry, no chunking and no chasing of a moving "latest".
 //!
+//! An **unsharded** partition (empty shard id, no shard-tree siblings) needs no
+//! partition view: its ordinary certificate already commits to everything a one-leaf
+//! view would repeat, so the batch's common certificate is authenticated directly
+//! (strictly, under the configured partition and pins) and is the target of one
+//! latest request. A sharded partition without its view is still unavailable, and a
+//! malformed or unauthenticated certificate or sidecar is an integrity error, never a
+//! reason to fall back.
+//!
 //! Only the outer-history proofs are replaced. Proofs embedded in signed mint
 //! justifications, split/burn dependencies or predicate data stay byte-identical
 //! and may still need their own seals: the summary reports outer-history and
@@ -23,6 +31,7 @@
 // obscure the public error enum that callers match on.
 #![allow(clippy::result_large_err)]
 
+mod direct;
 mod error;
 mod run;
 #[cfg(all(test, feature = "std"))]
@@ -58,6 +67,7 @@ use crate::verify::{
     verify_token_with_seal_stats, MintJustificationRegistry, SealAuthenticator, SealSession,
     VerificationPolicy,
 };
+use direct::DirectTarget;
 
 /// Default total deadline of one attempt.
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -642,13 +652,30 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         let mg = &groups[mi];
         let mbatch = Self::fetch(&self.endpoints, mg, StateRoot::Latest, budget, &requests)?;
         Self::check_batch(mg, items, &mbatch, None)?;
-        let Some(view) = &mbatch.partition_view else {
-            return Err(Stop::Unavailable(
-                UnavailableReason::PartitionViewUnavailable,
-                true,
-            ));
-        };
         let enclosing = &mbatch.proofs[0].proof.unicity_certificate;
+        let Some(view) = &mbatch.partition_view else {
+            // No view. Only an unsharded certificate (empty shard id) needs none; a
+            // sharded partition without its view stays unavailable.
+            if enclosing.shard_tree_certificate.shard.length() != 0 {
+                return Err(Stop::Unavailable(
+                    UnavailableReason::PartitionViewUnavailable,
+                    true,
+                ));
+            }
+            return self.run_direct(
+                items,
+                &groups,
+                mi,
+                &first_of,
+                &mbatch,
+                &bound,
+                budget,
+                session,
+                summary,
+                &requests,
+                base_quorum,
+            );
+        };
         let authenticated = view
             .authenticate(
                 enclosing,
@@ -802,6 +829,95 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         summary.outer_seals_after = distinct_seals(&proofs);
         summary.requests = requests.load(Ordering::SeqCst);
         summary.certificates_derived = derived;
+        summary.master = Some(mg.shard.clone());
+        summary.master_round = Some(master_round);
+        summary.consolidation_quorum_checks = session.stats().quorum_checks - base_quorum;
+        Ok(ProofBundle { proofs, summary })
+    }
+
+    /// The unsharded latest batch without a view: the batch's common certificate
+    /// is the target (see [`DirectTarget`]). One request, no peers, no derivation.
+    #[allow(clippy::too_many_arguments)]
+    fn run_direct(
+        &self,
+        items: &[ProofItem],
+        groups: &[Group],
+        mi: usize,
+        first_of: &[usize],
+        mbatch: &InclusionProofBatch,
+        bound: &RootRoundBound,
+        budget: &Budget<'_, K>,
+        session: &mut SealSession<'_>,
+        mut summary: ConsolidationSummary,
+        requests: &AtomicUsize,
+        base_quorum: u64,
+    ) -> Res<ProofBundle> {
+        let mg = &groups[mi];
+        let context = |what| {
+            Stop::Error(ConsolidationError::Integrity(IntegrityError::Context {
+                what,
+            }))
+        };
+        // an unsharded certificate is only meaningful for an unsharded configuration
+        // routed to one group; anything else contradicts the trusted topology
+        if self.router.shards().len() != 1 || mg.shard.length() != 0 || groups.len() != 1 {
+            return Err(context("unsharded certificate for a sharded configuration"));
+        }
+        let enclosing = &mbatch.proofs[0].proof.unicity_certificate;
+        let target = DirectTarget::authenticate(
+            enclosing,
+            self.config.partition_id,
+            &self.config.topology,
+            session,
+        )
+        .map_err(|e| Stop::Error(ConsolidationError::Integrity(e)))?;
+        let master_round = target.certificate().unicity_seal.root_chain_round_number;
+        if master_round < bound.round() {
+            // a genuinely signed older snapshot: publication lag, not forgery
+            return Err(Stop::Unavailable(
+                UnavailableReason::TargetNotYetAvailable,
+                true,
+            ));
+        }
+        budget.check()?;
+
+        let mut replaced: Vec<Option<InclusionProof>> = alloc::vec![None; items.len()];
+        for (k, (&idx, served)) in mg.items.iter().zip(&mbatch.proofs).enumerate() {
+            let p = replacement_proof(&items[idx].proof, &served.proof, target.certificate())
+                .map_err(|what| {
+                    Stop::Error(ConsolidationError::Integrity(IntegrityError::Binding {
+                        shard: mg.shard.clone(),
+                        index: k,
+                        what,
+                    }))
+                })?;
+            verify_membership_under(
+                session,
+                &p,
+                &items[idx].state_id,
+                p.reference_time,
+                target.policy(),
+            )
+            .map_err(|e| {
+                Stop::Error(ConsolidationError::Integrity(IntegrityError::Verification(
+                    e,
+                )))
+            })?;
+            replaced[idx] = Some(p);
+        }
+        let proofs: Vec<InclusionProof> = first_of
+            .iter()
+            .map(|&f| {
+                replaced[f]
+                    .clone()
+                    .expect("every state belongs to the one participating shard")
+            })
+            .collect();
+        budget.check()?;
+
+        summary.outer_seals_after = distinct_seals(&proofs);
+        summary.requests = requests.load(Ordering::SeqCst);
+        summary.certificates_derived = 0;
         summary.master = Some(mg.shard.clone());
         summary.master_round = Some(master_round);
         summary.consolidation_quorum_checks = session.stats().quorum_checks - base_quorum;
