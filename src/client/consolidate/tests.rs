@@ -327,6 +327,7 @@ fn unavailable(detail: &str) -> BatchFailure {
         reason: Some("proof_unavailable".into()),
         detail: Some(detail.into()),
         retryable: Some(true),
+        indexes: Default::default(),
     }
 }
 
@@ -689,6 +690,7 @@ fn unavailable_outcomes_leave_the_input_untouched() {
         reason: None,
         detail: None,
         retryable: None,
+        indexes: Default::default(),
     });
     assert_eq!(
         unavailable(c.consolidate(&token, &quick())),
@@ -702,6 +704,7 @@ fn unavailable_outcomes_leave_the_input_untouched() {
         reason: Some("busy".into()),
         detail: Some("active_requests".into()),
         retryable: Some(true),
+        indexes: Default::default(),
     });
     assert_eq!(
         unavailable(c.consolidate(&token, &quick())),
@@ -715,6 +718,7 @@ fn unavailable_outcomes_leave_the_input_untouched() {
         reason: None,
         detail: None,
         retryable: None,
+        indexes: Default::default(),
     });
     assert!(matches!(
         c.consolidate(&token, &quick()),

@@ -1,0 +1,1 @@
+{"error":{"code":-32008,"message":"Proof unavailable","data":{"reason":"proof_unavailable","detail":"state_expired","retryable":false,"indexes":{"expired":[0]}}},"id":7,"jsonrpc":"2.0"}

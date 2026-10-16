@@ -42,7 +42,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::batch::{
-    rpc_code, BatchAggregatorClient, BatchFailure, BatchRequest, InclusionProofBatch,
+    detail, rpc_code, BatchAggregatorClient, BatchFailure, BatchRequest, InclusionProofBatch,
     RequestOptions, StateRoot, MAX_BATCH_STATE_IDS,
 };
 use crate::api::bft::{RootTrustBase, ShardId};
@@ -849,6 +849,19 @@ fn classify(shard: &ShardId, failure: BatchFailure) -> Stop {
                 match detail.as_deref() {
                     Some("unsupported_configuration") => {
                         Stop::Unavailable(UnavailableReason::UnsupportedConfiguration, false)
+                    }
+                    Some(detail::STATE_PENDING) => Stop::Unavailable(
+                        UnavailableReason::StatePending,
+                        retryable.unwrap_or(true),
+                    ),
+                    Some(detail::STATE_EXPIRED) => {
+                        Stop::Unavailable(UnavailableReason::StateExpired, false)
+                    }
+                    Some(detail::STATE_UNKNOWN) => {
+                        Stop::Unavailable(UnavailableReason::StateUnknown, false)
+                    }
+                    Some(detail::STATE_NOT_IN_ROOT) => {
+                        Stop::Unavailable(UnavailableReason::StateNotInRoot, false)
                     }
                     Some("view_not_retained") => {
                         Stop::Unavailable(UnavailableReason::TargetNotRetained, retry)

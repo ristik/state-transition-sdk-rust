@@ -11,6 +11,7 @@ pub mod leaf_value;
 pub mod network_id;
 pub mod non_inclusion_certificate;
 pub mod non_inclusion_proof;
+pub mod proof_status;
 pub mod state_id;
 
 /// Leaf-value width in the Unicity aggregation profile.
@@ -28,4 +29,5 @@ pub use leaf_value::calculate_leaf_value;
 pub use network_id::NetworkId;
 pub use non_inclusion_certificate::NonInclusionCertificate;
 pub use non_inclusion_proof::NonInclusionProof;
+pub use proof_status::ProofStatus;
 pub use state_id::StateId;
