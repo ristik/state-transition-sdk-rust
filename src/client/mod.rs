@@ -15,14 +15,13 @@ mod http;
 pub use http::{
     HttpAggregatorClient, HttpError, SubmitOutcome, WaitOptions, WaitOutcome, WaitStats,
     WaitedLookup, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT, DEFAULT_UNKNOWN_GRACE,
-    DEFAULT_WAIT_MARGIN_MS,
 };
 
 pub use batch::{
     detail, get_latest_negotiating_wait, is_malformed_params, rpc_code, wait_on_wire,
     BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest, InclusionProofBatch,
-    NegotiatedBatch, RequestOptions, StateRoot, WaitedBatch, WaitedFailure, MAX_BATCH_STATE_IDS,
-    MAX_WAIT_MS, UNCLASSIFIED,
+    NegotiatedBatch, RequestOptions, StateRoot, WaitRequest, WaitedBatch, WaitedFailure,
+    DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS, MAX_WAIT_MS, UNCLASSIFIED,
 };
 pub use consolidate::{
     AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,

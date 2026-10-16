@@ -104,6 +104,37 @@ pub struct InclusionProofBatch {
     pub partition_view: Option<PartitionView>,
 }
 
+/// Default response margin kept between a sent `waitMs` and the call timeout.
+pub const DEFAULT_WAIT_MARGIN_MS: u64 = 2_000;
+
+/// A long-poll request: how long to ask the aggregator to hold the request and
+/// the response margin the **call timeout** must keep beyond it (rev-3 section 10:
+/// the per-request timeout exceeds the sent wait by the margin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WaitRequest {
+    /// Requested wait in milliseconds; zero asks for the echo only.
+    pub wait_ms: u64,
+    /// Margin between the sent wait and the call timeout, in milliseconds.
+    pub margin_ms: u64,
+}
+
+impl WaitRequest {
+    /// Ask for `wait_ms` with the default margin ([`DEFAULT_WAIT_MARGIN_MS`]).
+    pub fn new(wait_ms: u64) -> Self {
+        Self {
+            wait_ms,
+            margin_ms: DEFAULT_WAIT_MARGIN_MS,
+        }
+    }
+
+    /// Use another response margin.
+    pub fn with_margin_ms(mut self, margin_ms: u64) -> Self {
+        self.margin_ms = margin_ms;
+        self
+    }
+}
+
 /// A decoded batch response together with the long-poll echo.
 ///
 /// `waited_ms` is **unauthenticated timing metadata**: the server's claim of how
@@ -111,11 +142,30 @@ pub struct InclusionProofBatch {
 /// server without long-poll support, or a request that did not ask for one) and
 /// is never evidence about the proofs, which are verified on their own.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WaitedBatch {
     /// The batch itself.
     pub batch: InclusionProofBatch,
     /// `result.waitedMs`, when present.
     pub waited_ms: Option<u64>,
+    /// The `waitMs` the transport actually put on the wire; `None` when it sent
+    /// none (the default implementation, an exact root, or no positive wait fit).
+    pub sent_wait_ms: Option<u64>,
+}
+
+impl WaitedBatch {
+    /// A batch with its echo and the wait that was really sent.
+    pub fn new(
+        batch: InclusionProofBatch,
+        waited_ms: Option<u64>,
+        sent_wait_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            batch,
+            waited_ms,
+            sent_wait_ms,
+        }
+    }
 }
 
 /// A failed [`BatchAggregatorClient::get_inclusion_proofs_with_wait`] call with
@@ -124,19 +174,31 @@ pub struct WaitedBatch {
 /// Kept beside [`BatchFailure`] instead of inside it so existing code that
 /// builds or matches `BatchFailure::Rpc` keeps compiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WaitedFailure {
     /// The typed failure.
     pub failure: BatchFailure,
     /// `error.data.waitedMs`, when present on a handled error.
     pub waited_ms: Option<u64>,
+    /// The `waitMs` the transport actually put on the wire, if any.
+    pub sent_wait_ms: Option<u64>,
+}
+
+impl WaitedFailure {
+    /// A failure with its echo and the wait that was really sent.
+    pub fn new(failure: BatchFailure, waited_ms: Option<u64>, sent_wait_ms: Option<u64>) -> Self {
+        Self {
+            failure,
+            waited_ms,
+            sent_wait_ms,
+        }
+    }
 }
 
 impl From<BatchFailure> for WaitedFailure {
+    /// A failure of a call that sent no wait and saw no echo.
     fn from(failure: BatchFailure) -> Self {
-        WaitedFailure {
-            failure,
-            waited_ms: None,
-        }
+        WaitedFailure::new(failure, None, None)
     }
 }
 
@@ -228,15 +290,17 @@ pub trait BatchAggregatorClient: AggregatorClient {
     ) -> Result<InclusionProofBatch, BatchFailure>;
 
     /// [`get_inclusion_proofs`](Self::get_inclusion_proofs) asking the aggregator
-    /// to hold a **latest** request for up to `wait_ms` milliseconds while every
-    /// missing state is still pending (`waitMs`; zero asks for the echo only).
+    /// to hold a **latest** request for up to `wait.wait_ms` milliseconds while
+    /// every missing state is still pending (`waitMs`; zero asks for the echo only).
     ///
     /// The default implementation does not know the extension: it sends no wait,
-    /// reports no echo and behaves exactly like the plain call. Transports that
+    /// reports no echo (`sent_wait_ms == None`) and behaves exactly like the plain
+    /// call. Transports that
     /// support it must never send `waitMs` for [`StateRoot::Exact`] (the server
     /// rejects that combination), must apply `options.timeout_ms` to the whole
-    /// call (the caller sizes `wait_ms` so that the wait plus a response margin
-    /// fits it) and must reject a malformed echo as
+    /// call, keep `wait.margin_ms` between the sent wait and that timeout (see
+    /// [`wait_on_wire`]), report what they sent in `sent_wait_ms` and reject a
+    /// malformed echo as
     /// [`BatchFailure::Decode`]. It does not retry; see
     /// [`get_latest_negotiating_wait`] for the parser-compatibility retry.
     #[allow(clippy::result_large_err)]
@@ -244,27 +308,25 @@ pub trait BatchAggregatorClient: AggregatorClient {
         &self,
         request: &BatchRequest<'_>,
         options: &RequestOptions,
-        wait_ms: u64,
+        wait: &WaitRequest,
     ) -> Result<WaitedBatch, WaitedFailure> {
-        let _ = wait_ms;
+        let _ = wait;
         self.get_inclusion_proofs(request, options)
-            .map(|batch| WaitedBatch {
-                batch,
-                waited_ms: None,
-            })
+            .map(|batch| WaitedBatch::new(batch, None, None))
             .map_err(WaitedFailure::from)
     }
 }
 
 /// The `waitMs` a transport puts on a request whose whole call may last
-/// `timeout_ms`: zero stays zero (echo only); a positive wait is guarded to stay
-/// below the timeout and is `None` (not sent) when nothing positive fits. The
-/// response margin is the caller's to size; it is not subtracted here.
-pub fn wait_on_wire(wait_ms: u64, timeout_ms: u64) -> Option<u64> {
+/// `timeout_ms`: zero stays zero (echo only); a positive wait is limited to
+/// `timeout_ms - margin_ms` and is `None` (not sent) when nothing positive fits.
+pub fn wait_on_wire(wait_ms: u64, timeout_ms: u64, margin_ms: u64) -> Option<u64> {
     if wait_ms == 0 {
         return Some(0);
     }
-    let sent = wait_ms.min(MAX_WAIT_MS).min(timeout_ms.saturating_sub(1));
+    let sent = wait_ms
+        .min(MAX_WAIT_MS)
+        .min(timeout_ms.saturating_sub(margin_ms));
     (sent > 0).then_some(sent)
 }
 
@@ -310,18 +372,21 @@ pub fn get_latest_negotiating_wait<C: BatchAggregatorClient + ?Sized>(
     client: &C,
     state_ids: &[StateId],
     options: &RequestOptions,
-    wait_ms: u64,
+    wait: &WaitRequest,
     now_ms: &dyn Fn() -> u64,
 ) -> NegotiatedBatch {
     let request = BatchRequest {
         state_ids,
         state_root: StateRoot::Latest,
     };
-    // When the transport could not put a wait on the wire the retry would repeat
-    // the identical request: there is nothing to negotiate.
-    let sent_wait = wait_on_wire(wait_ms, options.timeout_ms).is_some();
     let started = now_ms();
-    let first = client.get_inclusion_proofs_with_wait(&request, options, wait_ms);
+    let first = client.get_inclusion_proofs_with_wait(&request, options, wait);
+    // When the transport reports that no wait went on the wire the retry would
+    // repeat the identical request: there is nothing to negotiate.
+    let sent_wait = match &first {
+        Ok(ok) => ok.sent_wait_ms.is_some(),
+        Err(e) => e.sent_wait_ms.is_some(),
+    };
     // A `waitedMs` echo on the error means the server understood `waitMs`: the
     // rejection is about something else and a retry without the wait can not help.
     let rejected = sent_wait
@@ -345,10 +410,7 @@ pub fn get_latest_negotiating_wait<C: BatchAggregatorClient + ?Sized>(
     }
     let second = client
         .get_inclusion_proofs(&request, &RequestOptions { timeout_ms: left })
-        .map(|batch| WaitedBatch {
-            batch,
-            waited_ms: None,
-        })
+        .map(|batch| WaitedBatch::new(batch, None, None))
         .map_err(WaitedFailure::from);
     NegotiatedBatch {
         result: second,
