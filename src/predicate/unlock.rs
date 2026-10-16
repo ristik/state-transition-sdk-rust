@@ -47,3 +47,30 @@ pub fn sign_signature_unlock(
     let message = signature_unlock_message(source_state_hash, transaction_hash);
     signer.sign(&message).encode().to_vec()
 }
+
+#[cfg(all(test, feature = "client"))]
+mod tests {
+    use super::*;
+    use crate::crypto::signer::{Secp256k1Signer, Signer};
+
+    /// The unlock witness is one 65-byte signature with no malleable byte: only the
+    /// recovery id that recovers the predicate's key verifies.
+    #[test]
+    fn unlock_scripts_bind_the_recovery_id() {
+        let signer = Secp256k1Signer::from_bytes(&[3; 32]).unwrap();
+        let (src, tx) = (sha256(b"source"), sha256(b"transaction"));
+        let script = sign_signature_unlock(&signer, &src, &tx);
+        let pk = signer.public_key();
+        assert!(verify_signature_unlock(&pk, &src, &tx, &script));
+        for v in 0..=255u8 {
+            let mut w = script.clone();
+            w[64] = v;
+            assert_eq!(
+                verify_signature_unlock(&pk, &src, &tx, &w),
+                v == script[64],
+                "v={v}"
+            );
+        }
+        assert!(!verify_signature_unlock(&pk, &src, &tx, &script[..64]));
+    }
+}
