@@ -12,11 +12,11 @@ mod consolidate;
 #[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "http")]
-pub use http::{HttpAggregatorClient, HttpError};
+pub use http::{HttpAggregatorClient, HttpError, SubmitOutcome, DEFAULT_UNKNOWN_GRACE};
 
 pub use batch::{
-    rpc_code, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest, InclusionProofBatch,
-    RequestOptions, StateRoot, MAX_BATCH_STATE_IDS,
+    detail, rpc_code, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
+    InclusionProofBatch, RequestOptions, StateRoot, MAX_BATCH_STATE_IDS, UNCLASSIFIED,
 };
 pub use consolidate::{
     AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,

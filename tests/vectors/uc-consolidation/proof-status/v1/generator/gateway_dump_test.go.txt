@@ -1,0 +1,52 @@
+package gateway
+
+import (
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/unicitynetwork/bft-go-base/types"
+
+	"github.com/unicitynetwork/aggregator-go/pkg/api"
+)
+
+// Dumps the real handler output of get_inclusion_proof.v2 (default and includeStatus) for the
+// Rust SDK conformance vectors. The unicity certificate is replaced by a decodable one.
+func TestDumpRustV2Fixtures(t *testing.T) {
+	dir := os.Getenv("DUMP_DIR")
+	if dir == "" {
+		t.Skip("DUMP_DIR not set")
+	}
+	uc, err := hex.DecodeString(os.Getenv("UC_HEX"))
+	require.NoError(t, err)
+	write := func(name, body string) {
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644))
+	}
+	full := func() *api.GetInclusionProofResponseV2 { r := v2Fixture(); r.InclusionProof.UnicityCertificate = types.RawCBOR(uc); return r }
+	empty := func() *api.GetInclusionProofResponseV2 { r := emptyV2Fixture(); r.InclusionProof.UnicityCertificate = types.RawCBOR(uc); return r }
+
+	cases := []struct {
+		name string
+		resp *api.GetInclusionProofResponseV2
+		hint api.ProofStatus
+	}{
+		{"included", full(), api.ProofStatusIncluded},
+		{"stale-pending-mark", full(), api.ProofStatusPending},
+		{"pending", empty(), api.ProofStatusPending},
+		{"expired", empty(), api.ProofStatusExpired},
+		{"unknown", empty(), api.ProofStatusUnknown},
+	}
+	for _, c := range cases {
+		rpc := newRPCTestServer(t, &statusV2Service{fixedV2Service: fixedV2Service{resp: c.resp}, hint: c.hint}, nil)
+		_, body := postRPC(t, rpc, rpcBody(7, `{"stateId":"`+stateIDHex+`","includeStatus":true}`))
+		write("v2-status-"+c.name+".json", body)
+		_, body = postRPC(t, rpc, rpcBody(7, `{"stateId":"`+stateIDHex+`"}`))
+		write("v2-default-"+c.name+".json", body)
+	}
+	rpc := newRPCTestServer(t, fixedV2Service{resp: empty()}, nil)
+	_, body := postRPC(t, rpc, rpcBody(7, `{"stateId":"`+stateIDHex+`","includeStatus":true}`))
+	write("v2-status-no-provider.json", body)
+}
