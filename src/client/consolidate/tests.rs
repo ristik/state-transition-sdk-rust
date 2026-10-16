@@ -1217,7 +1217,9 @@ fn routing_is_a_binary_search_that_agrees_with_the_linear_scan() {
 }
 
 /// One operation, one session: the input's own verification authenticates each
-/// distinct evidence seal once; consolidation adds only its own target check.
+/// distinct evidence seal once. The target's seal is the newest evidence seal here, so
+/// consolidation verifies no signature again: total native quorum verifications ==
+/// distinct seals (the Go and JS clients' count).
 #[test]
 fn token_consolidation_checks_each_evidence_quorum_once() {
     let (sim, token) = spread_token(3);
@@ -1232,16 +1234,17 @@ fn token_consolidation_checks_each_evidence_quorum_once() {
         "E evidence seals, once each"
     );
     assert_eq!(
-        summary.consolidation_quorum_checks, 1,
-        "only the master seal is new"
+        summary.consolidation_quorum_checks, 0,
+        "the master seal is the newest evidence seal: memoized"
     );
     assert_eq!(
         summary.input_quorum_checks + summary.consolidation_quorum_checks,
-        e as u64 + 1
+        e as u64
     );
     assert_eq!(summary.certificates_derived, 2);
 
-    // already shared: the view-policy check of the shared seal is the only extra quorum
+    // already shared: the shared seal's signatures were verified by the input check; the
+    // view-policy authentication of the same seal reuses that verdict
     let ConsolidationOutcome::Consolidated { token: shared, .. } =
         client(&sim, false).consolidate(&token, &quick()).unwrap()
     else {
@@ -1254,7 +1257,7 @@ fn token_consolidation_checks_each_evidence_quorum_once() {
     };
     assert!(summary.already_shared);
     assert_eq!(summary.input_quorum_checks, 1);
-    assert_eq!(summary.consolidation_quorum_checks, 1);
+    assert_eq!(summary.consolidation_quorum_checks, 0);
 }
 
 #[test]
@@ -1967,10 +1970,10 @@ fn direct_replacements_share_the_session_memo() {
     };
     assert_eq!(bundle.summary.requests, 1);
     assert_eq!(bundle.summary.certificates_derived, 0);
-    // the original evidence's seals, then exactly one more quorum for the target
+    // the target's seal is the newest evidence seal: one verification per distinct seal
     assert_eq!(
         bundle.summary.consolidation_quorum_checks,
-        distinct_seals(items.iter().map(|i| &i.proof)) as u64 + 1
+        distinct_seals(items.iter().map(|i| &i.proof)) as u64
     );
     assert_eq!(distinct_seals(bundle.proofs.iter()), 1);
 }
