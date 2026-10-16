@@ -62,6 +62,29 @@ fn primitive_vectors_agree_with_the_reference() {
     }
 }
 
+/// Single-pass recover-and-compare cases: valid 2/3 accepted, wrong branch, `r + n >= p`,
+/// decompression failure, recovered identity, zero and `>= n` digests (reduced mod n).
+#[test]
+fn recovery_vectors_agree_with_the_reference() {
+    let f = fixtures();
+    let cases = f["recovery"].as_array().unwrap();
+    assert!(cases.len() >= 18);
+    let mut accepted = 0;
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let trusted = key(case["publicKeyCompressed"].as_str().unwrap());
+        let digest = hex::decode(case["digest"].as_str().unwrap()).unwrap();
+        let wire = hex::decode(case["signature"].as_str().unwrap()).unwrap();
+        let expect = case["accept"].as_bool().unwrap();
+        assert_eq!(accepts(&wire, &digest, &trusted), expect, "{name}");
+        accepted += usize::from(expect);
+    }
+    assert!(
+        accepted >= 7,
+        "valid 2/3 and reduced-digest cases are accepted"
+    );
+}
+
 #[test]
 fn seal_quorum_vectors_count_only_conforming_signatures() {
     let f = fixtures();

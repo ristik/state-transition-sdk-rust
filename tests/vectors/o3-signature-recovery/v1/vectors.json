@@ -2,6 +2,7 @@
   "spec": [
     "Each signature counted toward a unicity seal quorum is exactly 65 bytes r[32]||s[32]||v[1] over SHA-256 of the seal's signature-free CBOR.",
     "1 \u003c= r,s \u003c n; low-S (s \u003c= n/2); v in 0..3 (no 27/28, no EIP-155).",
+    "One recover-and-compare: Q' = r^-1(sR - zG) with x = r + (v\u003e\u003e1)*n (x \u003c p required), R = lift(x, parity v\u00261), z = digest mod n (digests 0 and \u003e= n allowed); reject on failed lift/identity. No separate ECDSA verification.",
     "The public key recovered from (hash, r, s, v) must equal the trusted key of the claimed node ID; a range check on v is not enough.",
     "A signature that does not conform contributes zero votes. The seal is accepted iff the stake of conforming signatures from distinct admitted node IDs reaches the quorum threshold.",
     "64-byte compact r||s signatures are not canonical seal signatures."
@@ -125,6 +126,150 @@
       }
     ]
   },
+  "recovery": [
+    {
+      "name": "v2-recovers-trusted-key",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000102",
+      "accept": true,
+      "note": "r=2,s=1,z=0: x=r+n lifts to a curve point; valid ID 2 must be accepted"
+    },
+    {
+      "name": "v3-recovers-trusted-key",
+      "publicKeyCompressed": "03ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000103",
+      "accept": true,
+      "note": "same x, odd y"
+    },
+    {
+      "name": "v2-signature-against-v3-key",
+      "publicKeyCompressed": "03ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000102",
+      "accept": false,
+      "note": "wrong branch"
+    },
+    {
+      "name": "v3-signature-against-v2-key",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000103",
+      "accept": false,
+      "note": "wrong branch"
+    },
+    {
+      "name": "v0-for-v2-signature",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000100",
+      "accept": false,
+      "note": "same r,s, no overflow lift: recovers another key"
+    },
+    {
+      "name": "r-plus-n-equals-p-v2",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "000000000000000000000000000000014551231950b75fc4402da1722fc9baee000000000000000000000000000000000000000000000000000000000000000102",
+      "accept": false,
+      "note": "x = p is not a field element"
+    },
+    {
+      "name": "r-plus-n-equals-p-v3",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "000000000000000000000000000000014551231950b75fc4402da1722fc9baee000000000000000000000000000000000000000000000000000000000000000103",
+      "accept": false
+    },
+    {
+      "name": "r-plus-n-overflow-v2",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "000000000000000000000000000000014551231950b75fc4402da1722fc9baf3000000000000000000000000000000000000000000000000000000000000000102",
+      "accept": false,
+      "note": "r+n \u003e p"
+    },
+    {
+      "name": "r-near-n-overflow-v3",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140000000000000000000000000000000000000000000000000000000000000000103",
+      "accept": false,
+      "note": "r = n-1, x = r+n \u003e\u003e p"
+    },
+    {
+      "name": "decompression-failure-v0",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000000000000100",
+      "accept": false,
+      "note": "x=5 is not on the curve"
+    },
+    {
+      "name": "decompression-failure-v1",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000000000000101",
+      "accept": false
+    },
+    {
+      "name": "recovered-identity",
+      "publicKeyCompressed": "02ad802f2145df548ce1fc418b851cb32669c5a6bb939e6caf744de90310f8f1ff",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000001",
+      "signature": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798000000000000000000000000000000000000000000000000000000000000000100",
+      "accept": false,
+      "note": "R=G, s=z=1: Q' is the point at infinity"
+    },
+    {
+      "name": "zero-digest",
+      "publicKeyCompressed": "026b2abaa3eb647258bd2bf0df4edc5f3bd660b905299fa4b0e883b00c33915e6d",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "72956bcfdf23a1cfac13212fdbd4a5bbd1c506c1bd3d4d5780b47eddac4f86036586a29530108505f26af869aed81b78ed577ef2f442031eaffd455f32a1aac701",
+      "accept": true,
+      "note": "digest 0 is a valid message representative"
+    },
+    {
+      "name": "digest-all-ones-ge-n",
+      "publicKeyCompressed": "026b2abaa3eb647258bd2bf0df4edc5f3bd660b905299fa4b0e883b00c33915e6d",
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "signature": "ad3fdf0d3bf4ecd83101f6c3af4fc4fb1e4ea74789716655e10a3b08fd954f3a10534c931a5dc89900a62aa5865d1d1b540b4e8eb34744b15e724fc8cc62142c01",
+      "accept": true,
+      "note": "digest \u003e= n is reduced mod n"
+    },
+    {
+      "name": "digest-equals-n",
+      "publicKeyCompressed": "026b2abaa3eb647258bd2bf0df4edc5f3bd660b905299fa4b0e883b00c33915e6d",
+      "digest": "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+      "signature": "2462ba99c5bb0a8c2c2dc15ce3f1adb5c007b3a117fa7dc64d4b669d8b143d05000c0c4e5ba2688f884debbe2f0ada1aeb59f84527efb8c14867140d9c469df101",
+      "accept": true,
+      "note": "z = 0 after reduction"
+    },
+    {
+      "name": "signature-of-zero-digest-for-digest-n",
+      "publicKeyCompressed": "026b2abaa3eb647258bd2bf0df4edc5f3bd660b905299fa4b0e883b00c33915e6d",
+      "digest": "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+      "signature": "72956bcfdf23a1cfac13212fdbd4a5bbd1c506c1bd3d4d5780b47eddac4f86036586a29530108505f26af869aed81b78ed577ef2f442031eaffd455f32a1aac701",
+      "accept": true,
+      "note": "n reduces to the zero digest: the same signature verifies"
+    },
+    {
+      "name": "signature-of-digest-1-for-digest-n-plus-1",
+      "publicKeyCompressed": "026b2abaa3eb647258bd2bf0df4edc5f3bd660b905299fa4b0e883b00c33915e6d",
+      "digest": "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364142",
+      "signature": "bf7849c41762eab1ae3d879e6794b476a5e7c94094e23d0c37def4a8cf8970150facade6b2e9ebbde02584161afed98f0d0e14b685febf615ff8d3c9fb3914df01",
+      "accept": true,
+      "note": "n+1 reduces to 1"
+    },
+    {
+      "name": "signature-of-zero-digest-for-digest-1",
+      "publicKeyCompressed": "026b2abaa3eb647258bd2bf0df4edc5f3bd660b905299fa4b0e883b00c33915e6d",
+      "digest": "0000000000000000000000000000000000000000000000000000000000000001",
+      "signature": "72956bcfdf23a1cfac13212fdbd4a5bbd1c506c1bd3d4d5780b47eddac4f86036586a29530108505f26af869aed81b78ed577ef2f442031eaffd455f32a1aac701",
+      "accept": false,
+      "note": "different representative"
+    }
+  ],
   "seal": {
     "description": "4 nodes, stake 1 each, quorum 3, network local, epoch 1",
     "networkId": 3,
