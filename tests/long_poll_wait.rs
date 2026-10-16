@@ -392,3 +392,79 @@ fn a_refused_connection_is_a_transport_error_not_a_timeout() {
         );
     }
 }
+
+#[test]
+fn a_legacy_pending_error_switches_the_wait_off_for_the_rest_of_the_call_only() {
+    // S1-style: pending is the -32021 error, the proof (a bare string) comes last.
+    let f = full();
+    let server = Scripted::start(move |i, _| {
+        if i < 3 {
+            Reply::error(r#"{"code":-32021,"message":"certification is pending"}"#)
+        } else {
+            Reply::result(format!("\"{f}\""))
+        }
+    });
+    let c = client(&server.url, 20);
+    let out = c.wait_for_inclusion_proof_with_stats(&state_id(7), &WaitOptions::new(secs(10)));
+    assert!(out.result.is_ok());
+    assert_eq!(out.stats.requests, 4);
+    assert_eq!(
+        out.stats.long_poll_requests, 1,
+        "only the first call asked for a wait"
+    );
+    assert!(out.stats.wait_dropped_for_missing_echo);
+    assert!(wait_param(&server, 0).is_some());
+    for i in 1..4 {
+        assert_eq!(wait_param(&server, i), None, "request {i}");
+    }
+    // not a permanent cache: the next wait on the same client asks again
+    let before = server.count();
+    let _ = c.wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(secs(10)));
+    assert!(wait_param(&server, before).is_some());
+}
+
+#[test]
+fn a_legacy_not_found_is_terminal_and_a_wait_free_pending_stays_wait_free() {
+    let server = Scripted::start(|_, _| Reply::error(r#"{"code":-32020,"message":"nf"}"#));
+    let out = client(&server.url, 20)
+        .wait_for_inclusion_proof_with_stats(&state_id(7), &WaitOptions::new(secs(5)));
+    assert!(matches!(out.result, Err(HttpError::StateNotFound)));
+    assert_eq!(out.stats.requests, 1);
+    // long-poll off: a pending error changes nothing
+    let server = Scripted::start(|_, _| Reply::error(r#"{"code":-32021,"message":"pending"}"#));
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_millis(300)).with_long_poll(false),
+    );
+    assert!(matches!(out.result, Err(HttpError::Timeout)));
+    assert!(!out.stats.wait_dropped_for_missing_echo);
+}
+
+#[test]
+fn a_pending_error_that_echoes_the_wait_keeps_long_poll_on() {
+    let f = full();
+    let server = Scripted::start(move |i, _| {
+        if i < 2 {
+            Reply::error(r#"{"code":-32021,"message":"pending","data":{"waitedMs":0}}"#)
+        } else {
+            Reply::result(obj(&f, None, Some(0)))
+        }
+    });
+    let out = client(&server.url, 20)
+        .wait_for_inclusion_proof_with_stats(&state_id(7), &WaitOptions::new(secs(10)));
+    assert!(out.result.is_ok());
+    assert!(!out.stats.wait_dropped_for_missing_echo);
+    for i in 0..3 {
+        assert!(wait_param(&server, i).is_some(), "request {i} still asks");
+    }
+}
+
+#[test]
+fn a_pending_error_with_a_malformed_echo_is_a_protocol_error() {
+    let server = Scripted::start(|_, _| {
+        Reply::error(r#"{"code":-32021,"message":"pending","data":{"waitedMs":-3}}"#)
+    });
+    let r =
+        client(&server.url, 20).wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(secs(5)));
+    assert!(matches!(r, Err(HttpError::Decode(_))), "{r:?}");
+}
