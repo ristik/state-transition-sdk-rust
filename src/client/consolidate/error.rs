@@ -164,6 +164,9 @@ pub enum IntegrityError {
     },
     /// The rebuilt token failed complete verification.
     Verification(VerificationError),
+    /// The unicity certificate of an unsharded partition, used directly as the
+    /// target (no partition view), is not authenticated.
+    Target(VerificationError),
 }
 
 /// A failed consolidation. Never a statement that the input token is valid.
