@@ -267,14 +267,27 @@ impl HttpAggregatorClient {
             );
             let call_took = call_started.elapsed();
             let timed_out = matches!(raw, Err(RawFailure::TimedOut(_)));
+            // `error.data.waitedMs` of a handled error: a server that echoes understood `waitMs`.
+            let error_echo = match &raw {
+                Err(RawFailure::Envelope(EnvelopeError::Rpc { data, .. }))
+                | Err(RawFailure::Http {
+                    rpc: Some(EnvelopeError::Rpc { data, .. }),
+                    ..
+                }) => data.as_ref().and_then(|d| d.get("waitedMs")).cloned(),
+                _ => None,
+            };
             let result = match raw.map_err(raw_to_http) {
                 Ok(result) => result,
                 Err(HttpError::Rpc { code, .. }) if code == RPC_INCLUSION_PENDING => {
                     stats.pending += 1;
-                    // A legacy server's own pending error (dispatched method, no echo) is
-                    // as good evidence of "no long-poll" as a result without `waitedMs`:
-                    // stop sending `waitMs` for the rest of this wait only.
-                    if plan.wait_ms.is_some() {
+                    // A legacy server's own pending error (dispatched method, no
+                    // `data.waitedMs`) is as good evidence of "no long-poll" as a result
+                    // without `waitedMs`: stop sending `waitMs` for the rest of this wait
+                    // only. An error that does echo keeps long-poll on; a malformed echo
+                    // is a protocol error.
+                    if let Some(echo) = &error_echo {
+                        parse_waited_ms(echo).map_err(HttpError::Decode)?;
+                    } else if plan.wait_ms.is_some() {
                         send_wait = false;
                         stats.wait_dropped_for_missing_echo = true;
                     }
