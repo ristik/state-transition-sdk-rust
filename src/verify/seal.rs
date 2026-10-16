@@ -62,9 +62,12 @@ pub trait SealAuthenticator {
 
     /// [`authenticate_seal`](Self::authenticate_seal) under an immutable caller
     /// policy (for example the partition and pinned configuration hashes a view
-    /// is authenticated for). An authenticator that remembers verdicts must
-    /// namespace them by `policy`; the default ignores it, which is only right
-    /// for authenticators that do not memoize.
+    /// is authenticated for). An authenticator that remembers verdicts must key
+    /// each by everything it depends on: a signature-only verdict by the complete
+    /// seal and the authority; anything evaluated under `policy` also by `policy`;
+    /// strict per-call checks (network, epoch, position) are never memoized. The
+    /// default ignores `policy`, which is only right for authenticators that do
+    /// not memoize.
     fn authenticate_seal_under(
         &mut self,
         seal: &UnicitySeal,
