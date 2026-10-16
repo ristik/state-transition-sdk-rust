@@ -16,8 +16,8 @@ use crate::api::leaf_value::calculate_leaf_value;
 use crate::api::{CertificationData, NetworkId};
 use crate::cbor::{encode_byte_string, encode_tag, Decoder};
 use crate::client::{
-    certification_data_for, mint, transfer, AggregatorClient, BatchProof, ClientError, WaitedBatch,
-    WaitedFailure,
+    certification_data_for, mint, transfer, AggregatorClient, BatchProof, ClientError, WaitRequest,
+    WaitedBatch, WaitedFailure,
 };
 use crate::consolidation::{PartitionView, PartitionViewInputRecord, PartitionViewLeaf};
 use crate::crypto::hash::{sha256, DataHash, DataHasher, HashAlgorithm};
@@ -387,29 +387,32 @@ impl BatchAggregatorClient for Node {
         &self,
         request: &BatchRequest<'_>,
         options: &RequestOptions,
-        wait_ms: u64,
+        wait: &WaitRequest,
     ) -> Result<WaitedBatch, WaitedFailure> {
         {
             let mut sim = self.sim.lock().unwrap();
-            sim.waits
-                .push((matches!(request.state_root, StateRoot::Latest), wait_ms));
+            sim.waits.push((
+                matches!(request.state_root, StateRoot::Latest),
+                wait.wait_ms,
+            ));
             if sim.faults.reject_wait {
                 sim.batch_calls += 1;
-                return Err(WaitedFailure::from(BatchFailure::Rpc {
-                    code: rpc_code::INVALID_PARAMS,
-                    message: "Invalid params".into(),
-                    reason: Some("invalid_request".into()),
-                    detail: Some("malformed_params".into()),
-                    retryable: Some(false),
-                    indexes: Default::default(),
-                }));
+                return Err(WaitedFailure::new(
+                    BatchFailure::Rpc {
+                        code: rpc_code::INVALID_PARAMS,
+                        message: "Invalid params".into(),
+                        reason: Some("invalid_request".into()),
+                        detail: Some("malformed_params".into()),
+                        retryable: Some(false),
+                        indexes: Default::default(),
+                    },
+                    None,
+                    Some(wait.wait_ms),
+                ));
             }
         }
         self.get_inclusion_proofs(request, options)
-            .map(|batch| WaitedBatch {
-                batch,
-                waited_ms: Some(0),
-            })
+            .map(|batch| WaitedBatch::new(batch, Some(0), Some(wait.wait_ms)))
             .map_err(WaitedFailure::from)
     }
 

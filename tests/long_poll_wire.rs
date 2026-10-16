@@ -14,7 +14,7 @@ use unicity_token::api::{InclusionProofResponse, ProofStatus, StateId};
 use unicity_token::client::{
     get_latest_negotiating_wait, is_malformed_params, AggregatorClient, BatchAggregatorClient,
     BatchFailure, BatchRequest, HttpAggregatorClient, HttpError, RequestOptions, StateRoot,
-    WaitedFailure,
+    WaitRequest, WaitedFailure,
 };
 
 fn client(url: &str) -> HttpAggregatorClient {
@@ -46,7 +46,7 @@ fn v2_wait_request_carries_wait_ms_and_include_status() {
     let server =
         Scripted::start(move |_, _| Reply::result(v2_object(&hexp, Some("pending"), Some("8000"))));
     let got = client(&server.url)
-        .lookup_inclusion_proof_with_wait(&sid(), 8_000, Duration::from_secs(20))
+        .lookup_inclusion_proof_with_wait(&sid(), &WaitRequest::new(8_000), Duration::from_secs(20))
         .unwrap();
     assert_eq!(got.waited_ms, Some(8_000));
     assert_eq!(got.status, Some(ProofStatus::Pending));
@@ -66,7 +66,7 @@ fn v2_zero_wait_is_sent_as_zero_and_echo_zero_is_accepted() {
     let hexp = proof_response_hex(&proof);
     let server = Scripted::start(move |_, _| Reply::result(v2_object(&hexp, None, Some("0"))));
     let got = client(&server.url)
-        .lookup_inclusion_proof_with_wait(&sid(), 0, Duration::from_secs(5))
+        .lookup_inclusion_proof_with_wait(&sid(), &WaitRequest::new(0), Duration::from_secs(5))
         .unwrap();
     assert_eq!(got.waited_ms, Some(0));
     assert_eq!(server.request(0).params["waitMs"], 0);
@@ -79,16 +79,22 @@ fn v2_wait_is_clamped_to_the_timeout_margin_and_omitted_when_nothing_fits() {
     let server = Scripted::start(move |_, _| Reply::result(format!("\"{hexp}\"")));
     let c = client(&server.url);
     // The wait only has to stay below the timeout (the margin is the caller's).
-    c.lookup_inclusion_proof_with_wait(&sid(), 20_000, Duration::from_secs(5))
+    c.lookup_inclusion_proof_with_wait(&sid(), &WaitRequest::new(20_000), Duration::from_secs(5))
         .unwrap();
-    assert_eq!(server.request(0).params["waitMs"], 4_999);
-    // Nothing positive fits a 1 ms budget: no waitMs on the wire.
-    assert_eq!(unicity_token::client::wait_on_wire(20_000, 1), None);
-    assert_eq!(unicity_token::client::wait_on_wire(0, 1), Some(0));
-    assert_eq!(unicity_token::client::wait_on_wire(20_000, 2), Some(1));
+    assert_eq!(server.request(0).params["waitMs"], 3_000); // 5 s call - 2 s default margin
+                                                           // Nothing positive fits once the margin is kept: no waitMs on the wire.
+    assert_eq!(
+        unicity_token::client::wait_on_wire(20_000, 2_000, 2_000),
+        None
+    );
+    assert_eq!(unicity_token::client::wait_on_wire(0, 1, 2_000), Some(0));
+    assert_eq!(
+        unicity_token::client::wait_on_wire(20_000, 2_001, 2_000),
+        Some(1)
+    );
     // A legacy bare string has no echo.
     let got = c
-        .lookup_inclusion_proof_with_wait(&sid(), 1_000, Duration::from_secs(9))
+        .lookup_inclusion_proof_with_wait(&sid(), &WaitRequest::new(1_000), Duration::from_secs(9))
         .unwrap();
     assert_eq!(got.waited_ms, None);
 }
@@ -128,7 +134,11 @@ fn v2_malformed_echo_is_a_protocol_error() {
         let server =
             Scripted::start(move |_, _| Reply::result(v2_object(&hexp, None, Some(&bad_owned))));
         let err = client(&server.url)
-            .lookup_inclusion_proof_with_wait(&sid(), 1_000, Duration::from_secs(9))
+            .lookup_inclusion_proof_with_wait(
+                &sid(),
+                &WaitRequest::new(1_000),
+                Duration::from_secs(9),
+            )
             .unwrap_err();
         assert!(matches!(err, HttpError::Decode(_)), "{bad}: {err}");
         // The legacy poller rejects the same malformed metadata.
@@ -140,7 +150,7 @@ fn v2_malformed_echo_is_a_protocol_error() {
     let server =
         Scripted::start(move |_, _| Reply::result(v2_object(&h, None, Some("9007199254740991"))));
     let got = client(&server.url)
-        .lookup_inclusion_proof_with_wait(&sid(), 1_000, Duration::from_secs(9))
+        .lookup_inclusion_proof_with_wait(&sid(), &WaitRequest::new(1_000), Duration::from_secs(9))
         .unwrap();
     assert_eq!(got.waited_ms, Some(9_007_199_254_740_991));
 }
@@ -182,7 +192,7 @@ fn batch_wait_is_sent_only_for_latest_and_error_echo_is_typed() {
         state_root: StateRoot::Latest,
     };
     let err = c
-        .get_inclusion_proofs_with_wait(&latest, &opts(20_000), 8_000)
+        .get_inclusion_proofs_with_wait(&latest, &opts(20_000), &WaitRequest::new(8_000))
         .unwrap_err();
     assert_eq!(err.waited_ms, Some(8_000));
     let BatchFailure::Rpc {
@@ -212,7 +222,7 @@ fn batch_wait_is_sent_only_for_latest_and_error_echo_is_typed() {
         state_ids: &ids,
         state_root: StateRoot::Exact([9u8; 32]),
     };
-    let _ = c.get_inclusion_proofs_with_wait(&exact, &opts(20_000), 8_000);
+    let _ = c.get_inclusion_proofs_with_wait(&exact, &opts(20_000), &WaitRequest::new(8_000));
     assert!(server.request(1).params.get("waitMs").is_none());
     assert_eq!(
         server.request(1).params["stateRoot"],
@@ -232,7 +242,7 @@ fn batch_plain_call_never_sends_wait_and_error_without_echo_has_none() {
     let _ = c.get_inclusion_proofs(&latest, &opts(5_000));
     assert!(server.request(0).params.get("waitMs").is_none());
     let err = c
-        .get_inclusion_proofs_with_wait(&latest, &opts(20_000), 3_000)
+        .get_inclusion_proofs_with_wait(&latest, &opts(20_000), &WaitRequest::new(3_000))
         .unwrap_err();
     assert_eq!(err.waited_ms, None);
 }
@@ -248,7 +258,7 @@ fn batch_malformed_error_echo_is_a_decode_failure() {
             state_root: StateRoot::Latest,
         };
         let err = client(&server.url)
-            .get_inclusion_proofs_with_wait(&latest, &opts(20_000), 3_000)
+            .get_inclusion_proofs_with_wait(&latest, &opts(20_000), &WaitRequest::new(3_000))
             .unwrap_err();
         assert!(
             matches!(err.failure, BatchFailure::Decode(_)),
@@ -267,8 +277,8 @@ fn batch_wait_is_clamped_to_the_call_timeout() {
         state_root: StateRoot::Latest,
     };
     let c = client(&server.url);
-    let _ = c.get_inclusion_proofs_with_wait(&latest, &opts(5_000), 20_000);
-    assert_eq!(server.request(0).params["waitMs"], 4_999);
+    let _ = c.get_inclusion_proofs_with_wait(&latest, &opts(5_000), &WaitRequest::new(20_000));
+    assert_eq!(server.request(0).params["waitMs"], 3_000); // 5 s call - 2 s default margin
 }
 
 // --- parser negotiation -----------------------------------------------------
@@ -294,7 +304,13 @@ fn negotiation_retries_exactly_once_without_the_wait() {
     });
     let ids = batch_ids();
     let now = clock();
-    let out = get_latest_negotiating_wait(&client(&server.url), &ids, &opts(20_000), 8_000, &now);
+    let out = get_latest_negotiating_wait(
+        &client(&server.url),
+        &ids,
+        &opts(20_000),
+        &WaitRequest::new(8_000),
+        &now,
+    );
     assert_eq!((out.requests, out.retried_without_wait), (2, true));
     assert_eq!(server.count(), 2);
     assert_eq!(server.request(0).params["waitMs"], 8_000);
@@ -304,7 +320,9 @@ fn negotiation_retries_exactly_once_without_the_wait() {
     assert_eq!(second["stateIds"], server.request(0).params["stateIds"]);
     assert_eq!(second["stateRoot"], "latest");
     // The second outcome is final, not a retry trigger.
-    let WaitedFailure { failure, waited_ms } = out.result.unwrap_err();
+    let WaitedFailure {
+        failure, waited_ms, ..
+    } = out.result.unwrap_err();
     assert!(matches!(failure, BatchFailure::Rpc { code: -32008, .. }));
     assert_eq!(waited_ms, None);
 }
@@ -314,7 +332,13 @@ fn negotiation_returns_the_second_error_when_it_is_malformed_again() {
     let server = Scripted::start(|_, _| Reply::error(malformed_params()));
     let ids = batch_ids();
     let now = clock();
-    let out = get_latest_negotiating_wait(&client(&server.url), &ids, &opts(20_000), 8_000, &now);
+    let out = get_latest_negotiating_wait(
+        &client(&server.url),
+        &ids,
+        &opts(20_000),
+        &WaitRequest::new(8_000),
+        &now,
+    );
     assert_eq!((out.requests, out.retried_without_wait), (2, true));
     assert_eq!(server.count(), 2, "never a third request");
     assert!(is_malformed_params(&out.result.unwrap_err().failure));
@@ -370,8 +394,13 @@ fn negotiation_does_not_retry_unrelated_failures() {
             Scripted::start(move |_, _| cell.lock().unwrap().take().unwrap_or_else(Reply::silent));
         let ids = batch_ids();
         let now = clock();
-        let out =
-            get_latest_negotiating_wait(&client(&server.url), &ids, &opts(5_000), 3_000, &now);
+        let out = get_latest_negotiating_wait(
+            &client(&server.url),
+            &ids,
+            &opts(5_000),
+            &WaitRequest::new(3_000),
+            &now,
+        );
         assert_eq!(
             (out.requests, out.retried_without_wait),
             (1, false),
@@ -396,7 +425,13 @@ fn negotiation_does_not_spend_a_fresh_deadline_on_the_retry() {
     let ids = batch_ids();
     let now = clock();
     let started = std::time::Instant::now();
-    let out = get_latest_negotiating_wait(&client(&server.url), &ids, &opts(500), 1, &now);
+    let out = get_latest_negotiating_wait(
+        &client(&server.url),
+        &ids,
+        &opts(500),
+        &WaitRequest::new(1).with_margin_ms(0),
+        &now,
+    );
     let took = started.elapsed();
     assert_eq!(out.requests, 2);
     assert!(matches!(
@@ -415,7 +450,13 @@ fn negotiation_without_time_left_returns_the_first_error() {
         Scripted::start(|_, _| Reply::error(malformed_params()).after(Duration::from_millis(80)));
     let ids = batch_ids();
     let now = clock();
-    let out = get_latest_negotiating_wait(&client(&server.url), &ids, &opts(50), 1, &now);
+    let out = get_latest_negotiating_wait(
+        &client(&server.url),
+        &ids,
+        &opts(50),
+        &WaitRequest::new(1),
+        &now,
+    );
     // the first call either timed out or came back with nothing left
     assert_eq!(out.requests, 1);
     assert_eq!(server.count(), 1);
@@ -441,7 +482,7 @@ fn batch_success_echo_is_decoded_and_strictly_validated() {
         let b = body(extra);
         let server = Scripted::start(move |_, _| Reply::result(b.clone()));
         let ok = client(&server.url)
-            .get_inclusion_proofs_with_wait(&latest, &opts(20_000), 5_000)
+            .get_inclusion_proofs_with_wait(&latest, &opts(20_000), &WaitRequest::new(5_000))
             .unwrap();
         assert_eq!((ok.batch.proofs.len(), ok.waited_ms), (2, want), "{extra}");
         // The plain call decodes the same body (an unrequested echo is admitted).
@@ -460,7 +501,7 @@ fn batch_success_echo_is_decoded_and_strictly_validated() {
         let b = body(bad);
         let server = Scripted::start(move |_, _| Reply::result(b.clone()));
         let err = client(&server.url)
-            .get_inclusion_proofs_with_wait(&latest, &opts(20_000), 5_000)
+            .get_inclusion_proofs_with_wait(&latest, &opts(20_000), &WaitRequest::new(5_000))
             .unwrap_err();
         assert!(
             matches!(err.failure, BatchFailure::Decode(_)),
@@ -471,7 +512,7 @@ fn batch_success_echo_is_decoded_and_strictly_validated() {
     let b = body(r#","status":"x""#);
     let server = Scripted::start(move |_, _| Reply::result(b.clone()));
     let err = client(&server.url)
-        .get_inclusion_proofs_with_wait(&latest, &opts(20_000), 5_000)
+        .get_inclusion_proofs_with_wait(&latest, &opts(20_000), &WaitRequest::new(5_000))
         .unwrap_err();
     assert!(matches!(err.failure, BatchFailure::Decode(_)));
 }
@@ -538,7 +579,11 @@ fn frozen_echo_examples_decode_with_the_contract_placement() {
             v2 += 1;
             if response.get("result").is_some() {
                 let got = c
-                    .lookup_inclusion_proof_with_wait(&sid(), 5_000, Duration::from_secs(20))
+                    .lookup_inclusion_proof_with_wait(
+                        &sid(),
+                        &WaitRequest::new(5_000),
+                        Duration::from_secs(20),
+                    )
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_eq!(got.waited_ms, want, "{name}");
                 // The status hint rides along unchanged.
@@ -552,7 +597,8 @@ fn frozen_echo_examples_decode_with_the_contract_placement() {
                 state_ids: &ids,
                 state_root: StateRoot::Latest,
             };
-            let out = c.get_inclusion_proofs_with_wait(&latest, &opts(20_000), 5_000);
+            let out =
+                c.get_inclusion_proofs_with_wait(&latest, &opts(20_000), &WaitRequest::new(5_000));
             if response.get("result").is_some() {
                 let ok = out.unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 assert_eq!(ok.waited_ms, want, "{name}");
@@ -586,8 +632,13 @@ fn frozen_capability_table_drives_exactly_the_specified_retries() {
             Reply::error(error.to_string())
         });
         let now = clock();
-        let out =
-            get_latest_negotiating_wait(&client(&server.url), &ids, &opts(5_000), 3_000, &now);
+        let out = get_latest_negotiating_wait(
+            &client(&server.url),
+            &ids,
+            &opts(5_000),
+            &WaitRequest::new(3_000),
+            &now,
+        );
         let expect = if action == "retry" { 2 } else { 1 };
         assert_eq!(out.requests, expect, "{name}");
         assert_eq!(server.count(), expect as usize, "{name}");
@@ -610,7 +661,13 @@ fn negotiation_does_not_retry_when_the_rejection_echoes_the_wait() {
     });
     let ids = batch_ids();
     let now = clock();
-    let out = get_latest_negotiating_wait(&client(&server.url), &ids, &opts(5_000), 3_000, &now);
+    let out = get_latest_negotiating_wait(
+        &client(&server.url),
+        &ids,
+        &opts(5_000),
+        &WaitRequest::new(3_000),
+        &now,
+    );
     assert_eq!((out.requests, out.retried_without_wait), (1, false));
     assert_eq!(server.count(), 1);
     assert_eq!(out.result.unwrap_err().waited_ms, Some(0));
@@ -623,7 +680,13 @@ fn negotiation_does_not_repeat_an_identical_request_when_no_wait_was_sent() {
     let server = Scripted::start(|_, _| Reply::error(malformed_params()));
     let ids = batch_ids();
     let now = clock();
-    let out = get_latest_negotiating_wait(&client(&server.url), &ids, &opts(1), 5_000, &now);
+    let out = get_latest_negotiating_wait(
+        &client(&server.url),
+        &ids,
+        &opts(1),
+        &WaitRequest::new(5_000),
+        &now,
+    );
     assert_eq!((out.requests, out.retried_without_wait), (1, false));
     assert!(server.count() <= 1, "never a second identical request");
 }
@@ -637,6 +700,96 @@ fn a_small_caller_margin_reaches_the_request() {
         state_root: StateRoot::Latest,
     };
     // the caller sized 1.5 s of wait for a 2 s call (500 ms margin): sent as is
-    let _ = client(&server.url).get_inclusion_proofs_with_wait(&latest, &opts(2_000), 1_500);
+    let _ = client(&server.url).get_inclusion_proofs_with_wait(
+        &latest,
+        &opts(2_000),
+        &WaitRequest::new(1_500).with_margin_ms(500),
+    );
     assert_eq!(server.request(0).params["waitMs"], 1_500);
+}
+
+#[test]
+fn a_one_shot_keeps_the_response_margin_below_the_call_timeout() {
+    let (proof, _) = fixture_proof_and_data();
+    let hexp = proof_response_hex(&proof);
+    let server = Scripted::start(move |_, _| Reply::result(format!("\"{hexp}\"")));
+    let c = client(&server.url);
+    c.lookup_inclusion_proof_with_wait(&sid(), &WaitRequest::new(20_000), Duration::from_secs(5))
+        .unwrap();
+    c.lookup_inclusion_proof_with_wait(
+        &sid(),
+        &WaitRequest::new(20_000).with_margin_ms(500),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(server.request(0).params["waitMs"], 3_000);
+    assert_eq!(server.request(1).params["waitMs"], 4_500);
+}
+
+/// A transport relying on the trait's default method sends no wait and says so;
+/// a rejection is then not about a wait and must not be retried.
+struct DefaultImpl(HttpAggregatorClient);
+impl AggregatorClient for DefaultImpl {
+    type Error = HttpError;
+    fn submit_certification_request(
+        &self,
+        d: &unicity_token::api::CertificationData,
+    ) -> Result<(), HttpError> {
+        self.0.submit_certification_request(d)
+    }
+    fn get_inclusion_proof(
+        &self,
+        s: &StateId,
+    ) -> Result<unicity_token::api::InclusionProof, HttpError> {
+        self.0.get_inclusion_proof(s)
+    }
+}
+impl BatchAggregatorClient for DefaultImpl {
+    fn get_inclusion_proofs(
+        &self,
+        r: &BatchRequest<'_>,
+        o: &RequestOptions,
+    ) -> Result<unicity_token::client::InclusionProofBatch, BatchFailure> {
+        self.0.get_inclusion_proofs(r, o)
+    }
+}
+
+#[test]
+fn a_default_implementation_transport_is_never_retried_identically() {
+    let server = Scripted::start(|_, _| Reply::error(malformed_params()));
+    let ids = batch_ids();
+    let now = clock();
+    let c = DefaultImpl(client(&server.url));
+    let out = get_latest_negotiating_wait(&c, &ids, &opts(5_000), &WaitRequest::new(3_000), &now);
+    assert_eq!((out.requests, out.retried_without_wait), (1, false));
+    assert_eq!(server.count(), 1);
+    assert_eq!(out.result.unwrap_err().sent_wait_ms, None);
+}
+
+#[test]
+fn the_http_transport_reports_the_wait_it_sent() {
+    let server = Scripted::start(|_, _| Reply::error(pending_error("")));
+    let ids = batch_ids();
+    let latest = BatchRequest {
+        state_ids: &ids,
+        state_root: StateRoot::Latest,
+    };
+    let c = client(&server.url);
+    let sent = |ms: u64, timeout: u64| {
+        c.get_inclusion_proofs_with_wait(&latest, &opts(timeout), &WaitRequest::new(ms))
+            .unwrap_err()
+            .sent_wait_ms
+    };
+    assert_eq!(sent(1_000, 10_000), Some(1_000));
+    assert_eq!(sent(0, 10_000), Some(0));
+    assert_eq!(sent(20_000, 10_000), Some(8_000));
+    assert_eq!(sent(1_000, 2_000), None, "margin leaves nothing");
+    let exact = BatchRequest {
+        state_ids: &ids,
+        state_root: StateRoot::Exact([9; 32]),
+    };
+    let e = c
+        .get_inclusion_proofs_with_wait(&exact, &opts(10_000), &WaitRequest::new(1_000))
+        .unwrap_err();
+    assert_eq!(e.sent_wait_ms, None);
 }

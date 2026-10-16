@@ -265,6 +265,7 @@ impl HttpAggregatorClient {
                 Some(Duration::from_millis(plan.timeout_ms)),
             );
             let call_took = call_started.elapsed();
+            let timed_out = matches!(raw, Err(RawFailure::TimedOut(_)));
             let result = match raw.map_err(raw_to_http) {
                 Ok(result) => result,
                 Err(HttpError::Rpc { code, .. }) if code == RPC_INCLUSION_PENDING => {
@@ -279,9 +280,8 @@ impl HttpAggregatorClient {
                 // A call that timed out because the deadline capped it is the
                 // deadline (the transport's clock may fire a hair early). Any
                 // other transport failure (refused, reset, TLS) stays one.
-                Err(HttpError::Transport(m))
-                    if m.contains("timed out")
-                        && (plan.timeout_ms >= left_ms || Instant::now() >= deadline) =>
+                Err(HttpError::Transport(_))
+                    if timed_out && (plan.timeout_ms >= left_ms || Instant::now() >= deadline) =>
                 {
                     return Err(HttpError::Timeout)
                 }
