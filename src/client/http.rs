@@ -28,7 +28,8 @@ use crate::cbor::Decoder;
 use super::{
     rpc_code, AggregatorClient, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
     InclusionProofBatch, MembershipStatus, NonInclusionAggregatorClient, RequestOptions, StateRoot,
-    WaitedBatch, WaitedFailure, MAX_BATCH_STATE_IDS, MAX_WAIT_MS, UNCLASSIFIED,
+    WaitRequest, WaitedBatch, WaitedFailure, DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS,
+    MAX_WAIT_MS, UNCLASSIFIED,
 };
 use crate::consolidation::PartitionView;
 
@@ -49,10 +50,6 @@ const RPC_STATE_NOT_FOUND: i64 = -32020;
 const RPC_INCLUSION_PENDING: i64 = -32021;
 const RPC_STATE_INCLUDED: i64 = -32022;
 const RPC_SERVER_BUSY: i64 = -32023;
-
-/// Default response margin the wait helpers keep between a `waitMs` and the call
-/// timeout. One-shot calls do not apply it: their caller sizes the wait.
-pub const DEFAULT_WAIT_MARGIN_MS: u64 = 2_000;
 
 /// One proof lookup with the long-poll echo (see
 /// [`HttpAggregatorClient::lookup_inclusion_proof_with_wait`]).
@@ -471,8 +468,8 @@ impl HttpAggregatorClient {
     ///
     /// A one-shot building block: it never polls or retries. `timeout` is the
     /// whole call's limit (connection, the server-side wait and the response);
-    /// the caller sizes `wait_ms` to leave its own response margin, and the wait
-    /// is only guarded to stay below `timeout`.
+    /// the wait sent is limited to `timeout - wait.margin_ms` (the request's
+    /// response margin, default [`DEFAULT_WAIT_MARGIN_MS`]).
     /// A positive `wait_ms` for which no positive wait fits sends no `waitMs` at
     /// all (an ordinary immediate lookup); a `wait_ms` of zero is sent and asks
     /// for the echo only. Servers that do not know `waitMs` ignore it and answer
@@ -483,7 +480,7 @@ impl HttpAggregatorClient {
     pub fn lookup_inclusion_proof_with_wait(
         &self,
         state_id: &StateId,
-        wait_ms: u64,
+        wait: &WaitRequest,
         timeout: Duration,
     ) -> Result<WaitedLookup, HttpError> {
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
@@ -491,7 +488,7 @@ impl HttpAggregatorClient {
             "stateId": hex::encode(state_id.bytes()),
             "includeStatus": true,
         });
-        if let Some(sent) = clamp_wait(wait_ms, timeout_ms) {
+        if let Some(sent) = super::batch::wait_on_wire(wait.wait_ms, timeout_ms, wait.margin_ms) {
             params["waitMs"] = serde_json::json!(sent);
         }
         let result = self
@@ -643,7 +640,7 @@ impl HttpAggregatorClient {
                 };
                 return Err(RawFailure::Http { status, body, rpc });
             }
-            Err(e) => return Err(RawFailure::Transport(e.to_string())),
+            Err(e) => return Err(transport_failure(&e)),
         };
         if !(200..300).contains(&response.status()) {
             return Err(RawFailure::Http {
@@ -661,7 +658,7 @@ impl HttpAggregatorClient {
 fn raw_to_http(e: RawFailure) -> HttpError {
     match e {
         RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
-        RawFailure::Transport(m) => HttpError::Transport(m),
+        RawFailure::Transport(m) | RawFailure::TimedOut(m) => HttpError::Transport(m),
         RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
         RawFailure::Envelope(EnvelopeError::Rpc { code, message, .. }) => {
             HttpError::Rpc { code, message }
@@ -717,9 +714,42 @@ enum RawFailure {
         rpc: Option<EnvelopeError>,
     },
     Transport(String),
+    /// A transport failure caused by a timeout (an `io::ErrorKind::TimedOut` at the
+    /// root of the error chain).
+    TimedOut(String),
     Envelope(EnvelopeError),
     TooLarge(usize),
     Config(HttpError),
+}
+
+fn is_timeout_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Classify a ureq transport error by walking its source chain to an
+/// `io::Error`, not by its text.
+fn transport_failure(error: &ureq::Error) -> RawFailure {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = source {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if is_timeout_kind(io.kind()) {
+                return RawFailure::TimedOut(error.to_string());
+            }
+        }
+        source = e.source();
+    }
+    RawFailure::Transport(error.to_string())
+}
+
+fn io_failure(error: &std::io::Error) -> RawFailure {
+    if is_timeout_kind(error.kind()) {
+        RawFailure::TimedOut(error.to_string())
+    } else {
+        RawFailure::Transport(error.to_string())
+    }
 }
 
 fn read_response_raw(response: ureq::Response, limit: usize) -> Result<String, RawFailure> {
@@ -728,7 +758,7 @@ fn read_response_raw(response: ureq::Response, limit: usize) -> Result<String, R
         .into_reader()
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| RawFailure::Transport(e.to_string()))?;
+        .map_err(|e| io_failure(&e))?;
     if bytes.len() > limit {
         return Err(RawFailure::TooLarge(limit));
     }
@@ -949,10 +979,6 @@ fn parse_waited_ms(value: &serde_json::Value) -> Result<u64, String> {
         .ok_or_else(|| "malformed waitedMs".to_string())
 }
 
-fn clamp_wait(wait_ms: u64, timeout_ms: u64) -> Option<u64> {
-    super::batch::wait_on_wire(wait_ms, timeout_ms)
-}
-
 impl NonInclusionAggregatorClient for HttpAggregatorClient {
     fn get_non_inclusion_proof(&self, state_id: &StateId) -> Result<NonInclusionProof, HttpError> {
         let params = serde_json::json!({ "stateId": hex::encode(state_id.bytes()) });
@@ -992,7 +1018,7 @@ impl HttpAggregatorClient {
         &self,
         request: &BatchRequest<'_>,
         options: &RequestOptions,
-        wait_ms: Option<u64>,
+        wait: Option<&WaitRequest>,
     ) -> Result<WaitedBatch, WaitedFailure> {
         let ids = request.state_ids;
         if ids.is_empty() || ids.len() > MAX_BATCH_STATE_IDS {
@@ -1015,8 +1041,11 @@ impl HttpAggregatorClient {
             "stateRoot": state_root,
         });
         // Never on an exact root: the server rejects that combination.
-        if let (StateRoot::Latest, Some(wait)) = (request.state_root, wait_ms) {
-            if let Some(sent) = clamp_wait(wait, options.timeout_ms) {
+        let mut sent_wait_ms = None;
+        if let (StateRoot::Latest, Some(wait)) = (request.state_root, wait) {
+            sent_wait_ms =
+                super::batch::wait_on_wire(wait.wait_ms, options.timeout_ms, wait.margin_ms);
+            if let Some(sent) = sent_wait_ms {
                 params["waitMs"] = serde_json::json!(sent);
             }
         }
@@ -1027,9 +1056,10 @@ impl HttpAggregatorClient {
                 &[],
                 Some(Duration::from_millis(options.timeout_ms.max(1))),
             )
-            .map_err(batch_failure_waited)?;
-        let (batch, waited_ms) = decode_batch_result(&result)?;
-        Ok(WaitedBatch { batch, waited_ms })
+            .map_err(|f| batch_failure_waited(f, sent_wait_ms))?;
+        let (batch, waited_ms) =
+            decode_batch_result(&result).map_err(|f| WaitedFailure::new(f, None, sent_wait_ms))?;
+        Ok(WaitedBatch::new(batch, waited_ms, sent_wait_ms))
     }
 }
 
@@ -1049,15 +1079,15 @@ impl BatchAggregatorClient for HttpAggregatorClient {
         &self,
         request: &BatchRequest<'_>,
         options: &RequestOptions,
-        wait_ms: u64,
+        wait: &WaitRequest,
     ) -> Result<WaitedBatch, WaitedFailure> {
-        self.batch_call(request, options, Some(wait_ms))
+        self.batch_call(request, options, Some(wait))
     }
 }
 
 /// [`batch_failure`] plus `error.data.waitedMs`. A malformed echo is a protocol
 /// error (and carries no echo).
-fn batch_failure_waited(failure: RawFailure) -> WaitedFailure {
+fn batch_failure_waited(failure: RawFailure, sent_wait_ms: Option<u64>) -> WaitedFailure {
     let echo = match &failure {
         RawFailure::Http {
             rpc: Some(EnvelopeError::Rpc { data, .. }),
@@ -1070,18 +1100,9 @@ fn batch_failure_waited(failure: RawFailure) -> WaitedFailure {
     };
     let failure = batch_failure(failure);
     match echo.as_ref().map(parse_waited_ms) {
-        None => WaitedFailure {
-            failure,
-            waited_ms: None,
-        },
-        Some(Ok(ms)) => WaitedFailure {
-            failure,
-            waited_ms: Some(ms),
-        },
-        Some(Err(m)) => WaitedFailure {
-            failure: BatchFailure::Decode(m),
-            waited_ms: None,
-        },
+        None => WaitedFailure::new(failure, None, sent_wait_ms),
+        Some(Ok(ms)) => WaitedFailure::new(failure, Some(ms), sent_wait_ms),
+        Some(Err(m)) => WaitedFailure::new(BatchFailure::Decode(m), None, sent_wait_ms),
     }
 }
 
@@ -1089,7 +1110,7 @@ fn batch_failure(failure: RawFailure) -> BatchFailure {
     match failure {
         RawFailure::Http { rpc: Some(e), .. } => batch_failure(RawFailure::Envelope(e)),
         RawFailure::Http { status, .. } => BatchFailure::Http { status },
-        RawFailure::Transport(m) if m.contains("timed out") => BatchFailure::Timeout,
+        RawFailure::TimedOut(_) => BatchFailure::Timeout,
         RawFailure::Transport(m) => BatchFailure::Transport(m),
         RawFailure::TooLarge(limit) => BatchFailure::TooLarge { limit },
         RawFailure::Config(e) => BatchFailure::Transport(e.to_string()),

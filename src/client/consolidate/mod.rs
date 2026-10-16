@@ -52,7 +52,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::batch::{
     detail, get_latest_negotiating_wait, rpc_code, BatchAggregatorClient, BatchFailure,
-    BatchRequest, InclusionProofBatch, RequestOptions, StateRoot, MAX_BATCH_STATE_IDS,
+    BatchRequest, InclusionProofBatch, RequestOptions, StateRoot, WaitRequest,
+    DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS,
 };
 use crate::api::bft::{RootTrustBase, ShardId};
 use crate::api::inclusion_proof::InclusionProof;
@@ -526,8 +527,10 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         };
         let result = match wait {
             Some(wait_ms) => {
+                let wait = WaitRequest::new(wait_ms)
+                    .with_margin_ms(long_poll.map_or(DEFAULT_WAIT_MARGIN_MS, |lp| lp.margin_ms));
                 let negotiated =
-                    get_latest_negotiating_wait(client, &group.ids, &options, wait_ms, &|| {
+                    get_latest_negotiating_wait(client, &group.ids, &options, &wait, &|| {
                         budget.clock.now_ms()
                     });
                 requests.fetch_add(negotiated.requests as usize, Ordering::SeqCst);
