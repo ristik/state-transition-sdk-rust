@@ -246,11 +246,8 @@ impl HttpAggregatorClient {
             else {
                 return Err(HttpError::Timeout);
             };
-            let plan = plan_call(
-                u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1),
-                options,
-                send_wait,
-            );
+            let left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1);
+            let plan = plan_call(left_ms, options, send_wait);
             let mut params = serde_json::json!({
                 "stateId": hex::encode(state_id.bytes()),
                 "includeStatus": true,
@@ -279,8 +276,11 @@ impl HttpAggregatorClient {
                     return Err(HttpError::StateNotFound)
                 }
                 Err(HttpError::Http { status: 404, .. }) => return Err(HttpError::StateNotFound),
-                // A call cut off by the end of the deadline is the deadline.
-                Err(HttpError::Transport(_)) if Instant::now() >= deadline => {
+                // A call whose timeout was capped by the deadline and that was cut
+                // off is the deadline (the transport's clock may fire a hair early).
+                Err(HttpError::Transport(_))
+                    if plan.timeout_ms >= left_ms || Instant::now() >= deadline =>
+                {
                     return Err(HttpError::Timeout)
                 }
                 Err(error) => return Err(error),
