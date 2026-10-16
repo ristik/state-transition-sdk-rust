@@ -13,7 +13,8 @@ mod consolidate;
 mod http;
 #[cfg(feature = "http")]
 pub use http::{
-    HttpAggregatorClient, HttpError, SubmitOutcome, WaitedLookup, DEFAULT_UNKNOWN_GRACE,
+    HttpAggregatorClient, HttpError, SubmitOutcome, WaitOptions, WaitOutcome, WaitStats,
+    WaitedLookup, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT, DEFAULT_UNKNOWN_GRACE,
     DEFAULT_WAIT_MARGIN_MS,
 };
 
