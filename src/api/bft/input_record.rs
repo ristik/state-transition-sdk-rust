@@ -13,6 +13,12 @@ pub const INPUT_RECORD_TAG: u64 = 39002;
 const VERSION: u64 = 1;
 
 /// Input record carried inside a [`UnicityCertificate`](super::UnicityCertificate).
+///
+/// Every nullable field keeps the CBOR distinction between `null` and an empty byte
+/// string, on decode, on encode and in every hash preimage (the shard-tree leaf hashes
+/// the exact encoding). In particular `hash: None` (native `null`, `f6`) is the
+/// authenticated **empty tree**; `Some(vec![])` (`40`) is a different, non-conforming
+/// encoding and is *not* an alias for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRecord {
     /// Round number.
@@ -21,10 +27,11 @@ pub struct InputRecord {
     pub epoch: u64,
     /// Previous block hash.
     pub previous_hash: Option<Vec<u8>>,
-    /// This block's certified state-tree root hash.
-    pub hash: Vec<u8>,
-    /// Summary value.
-    pub summary_value: Vec<u8>,
+    /// This block's certified state-tree root hash: `None` (native `null`) is the certified
+    /// empty tree, otherwise 32 bytes. See [`root_hash`](Self::root_hash).
+    pub hash: Option<Vec<u8>>,
+    /// Summary value (`null` in the initial and timeout-repeat records of round 0).
+    pub summary_value: Option<Vec<u8>>,
     /// Timestamp.
     pub timestamp: u64,
     /// Block hash.
@@ -36,6 +43,19 @@ pub struct InputRecord {
 }
 
 impl InputRecord {
+    /// The certified state-tree root this record authenticates: `Ok(None)` for the native
+    /// `null` hash (the certified empty tree), `Ok(Some(root))` for exactly 32 bytes, and an
+    /// error for anything else — in particular for an empty byte string or the all-zero hash,
+    /// which are not the empty tree.
+    pub fn root_hash(&self) -> Result<Option<[u8; 32]>, Error> {
+        match self.hash.as_deref() {
+            None => Ok(None),
+            Some(bytes) => <[u8; 32]>::try_from(bytes)
+                .map(Some)
+                .map_err(|_| Error::UnexpectedValue("input record hash must be null or 32 bytes")),
+        }
+    }
+
     /// Decode from CBOR (tagged).
     pub fn from_cbor(d: Decoder<'_>) -> Result<Self, Error> {
         let inner = d.expect_tag(INPUT_RECORD_TAG)?;
@@ -50,8 +70,8 @@ impl InputRecord {
             round_number: items[1].uint()?,
             epoch: items[2].uint()?,
             previous_hash: opt(items[3])?,
-            hash: items[4].bytes_value()?.to_vec(),
-            summary_value: items[5].bytes_value()?.to_vec(),
+            hash: opt(items[4])?,
+            summary_value: opt(items[5])?,
             timestamp: items[6].uint()?,
             block_hash: opt(items[7])?,
             sum_of_earned_fees: items[8].uint()?,
@@ -69,8 +89,8 @@ impl InputRecord {
                 &encode_uint(self.round_number),
                 &encode_uint(self.epoch),
                 &encode_nullable(self.previous_hash.as_ref(), bs),
-                &encode_byte_string(&self.hash),
-                &encode_byte_string(&self.summary_value),
+                &encode_nullable(self.hash.as_ref(), bs),
+                &encode_nullable(self.summary_value.as_ref(), bs),
                 &encode_uint(self.timestamp),
                 &encode_nullable(self.block_hash.as_ref(), bs),
                 &encode_uint(self.sum_of_earned_fees),
