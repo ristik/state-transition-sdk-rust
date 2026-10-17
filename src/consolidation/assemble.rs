@@ -323,8 +323,7 @@ impl AuthenticatedView {
             .map(|i| &self.leaves[i])
     }
 
-    /// Derive every shard's tree path and, where the input record has a state
-    /// hash and summary value, its ordinary version-1 unicity certificate, in
+    /// Derive every shard's tree path and its ordinary version-1 unicity certificate, in
     /// canonical order. Each carries the identical master seal and partition
     /// path, so one quorum authentication covers all of them.
     ///
@@ -348,17 +347,15 @@ impl AuthenticatedView {
     fn derive(&self, index: usize) -> Result<ShardCertificate, PartitionViewError> {
         let leaf = &self.leaves[index];
         let shard_tree_certificate = self.tree.certificate(&leaf.shard_id)?;
-        let certificate =
-            leaf.input_record
-                .to_input_record()
-                .map(|input_record| UnicityCertificate {
-                    input_record,
-                    technical_record_hash: Some(leaf.tr_hash.clone()),
-                    shard_configuration_hash: leaf.shard_conf_hash.clone(),
-                    shard_tree_certificate: shard_tree_certificate.clone(),
-                    unicity_tree_certificate: self.unicity_tree_certificate.clone(),
-                    unicity_seal: self.seal.clone(),
-                });
+        // The ordinary input record preserves every nullable field, so every leaf has one.
+        let certificate = Some(UnicityCertificate {
+            input_record: leaf.input_record.to_input_record(),
+            technical_record_hash: Some(leaf.tr_hash.clone()),
+            shard_configuration_hash: leaf.shard_conf_hash.clone(),
+            shard_tree_certificate: shard_tree_certificate.clone(),
+            unicity_tree_certificate: self.unicity_tree_certificate.clone(),
+            unicity_seal: self.seal.clone(),
+        });
         Ok(ShardCertificate {
             shard_id: leaf.shard_id.clone(),
             shard_tree_certificate,

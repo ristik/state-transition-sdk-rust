@@ -530,7 +530,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             }
         }
         if let Some(root) = exact {
-            if first.input_record.hash.as_slice() != root.as_slice() {
+            if first.input_record.hash.as_deref() != Some(root.as_slice()) {
                 return Err(Stop::Error(ConsolidationError::Integrity(
                     IntegrityError::RootSubstitution {
                         shard: group.shard.clone(),
