@@ -307,7 +307,7 @@ impl Sim {
         let uc = |s: usize| {
             let leaf = &view.leaves[s];
             UnicityCertificate {
-                input_record: leaf.input_record.to_input_record().unwrap(),
+                input_record: leaf.input_record.to_input_record(),
                 technical_record_hash: Some(leaf.tr_hash.clone()),
                 shard_configuration_hash: leaf.shard_conf_hash.clone(),
                 shard_tree_certificate: tree.certificate(&leaf.shard_id).unwrap(),
@@ -1557,7 +1557,7 @@ fn memoized_verification_equals_the_reference_on_tampered_tokens() {
         ),
         (
             "ir hash",
-            Box::new(|p| p[3].unicity_certificate.input_record.hash[0] ^= 1),
+            Box::new(|p| p[3].unicity_certificate.input_record.hash.as_mut().unwrap()[0] ^= 1),
         ),
         (
             "swap certificates",
@@ -1975,7 +1975,8 @@ fn the_direct_target_never_falls_back_or_downgrades() {
     ));
 
     // forged material: a changed root, a tampered signature
-    let (_, _, out) = unsharded(|b| each_certificate(b, |uc| uc.input_record.hash[0] ^= 1));
+    let (_, _, out) =
+        unsharded(|b| each_certificate(b, |uc| uc.input_record.hash.as_mut().unwrap()[0] ^= 1));
     assert!(
         matches!(
             out,

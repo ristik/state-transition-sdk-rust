@@ -325,11 +325,15 @@ pub fn verify_membership_under(
         }
     }
 
-    let expected_root = DataHash::new(
-        HashAlgorithm::Sha256,
-        proof.unicity_certificate.input_record.hash.clone(),
-    )
-    .map_err(|_| VerificationError::PathInvalid)?;
+    // An inclusion proof needs a real 32-byte root: the empty tree (null) contains nothing.
+    let root = proof
+        .unicity_certificate
+        .input_record
+        .root_hash()
+        .map_err(|_| VerificationError::PathInvalid)?
+        .ok_or(VerificationError::PathInvalid)?;
+    let expected_root = DataHash::new(HashAlgorithm::Sha256, root.to_vec())
+        .map_err(|_| VerificationError::PathInvalid)?;
     if proof.reference_time != reference_time {
         return Err(VerificationError::ReferenceTimeMismatch);
     }
@@ -439,13 +443,18 @@ pub fn verify_non_inclusion_in(
     seals.ensure_trust_base()?;
 
     let uc = proof.unicity_certificate();
-    let expected_root = match uc.input_record.hash.as_slice() {
-        [] => None,
-        bytes if bytes.len() == 32 => Some(
+    // Only an authenticated native `null` is the empty tree. An empty byte string (`40`), the
+    // all-zero hash and any other length are not: they are rejected, never mapped to "empty".
+    let expected_root = match uc
+        .input_record
+        .root_hash()
+        .map_err(|_| VerificationError::NonInclusionCertificateInvalid)?
+    {
+        None => None,
+        Some(bytes) => Some(
             DataHash::new(HashAlgorithm::Sha256, bytes.to_vec())
                 .map_err(|_| VerificationError::NonInclusionCertificateInvalid)?,
         ),
-        _ => return Err(VerificationError::NonInclusionCertificateInvalid),
     };
 
     if !proof
@@ -678,17 +687,26 @@ mod tests {
 
     /// A unicity certificate committing to `root`, signed by `node`.
     fn signed_uc(node: &Secp256k1Signer, root: [u8; 32]) -> UnicityCertificate {
-        let input_record = InputRecord {
-            round_number: 0,
-            epoch: 0,
-            previous_hash: None,
-            hash: root.to_vec(),
-            summary_value: Vec::new(),
-            timestamp: REFERENCE_TIME,
-            block_hash: None,
-            sum_of_earned_fees: 0,
-            executed_transactions_hash: None,
-        };
+        signed_uc_with(
+            node,
+            InputRecord {
+                round_number: 0,
+                epoch: 0,
+                previous_hash: None,
+                hash: Some(root.to_vec()),
+                summary_value: Some(Vec::new()),
+                timestamp: REFERENCE_TIME,
+                block_hash: None,
+                sum_of_earned_fees: 0,
+                executed_transactions_hash: None,
+            },
+        )
+    }
+
+    /// A unicity certificate carrying exactly `input_record`, independently signed by `node`
+    /// (the signature covers the record as given, so a rejection is never caused by a broken
+    /// signature).
+    fn signed_uc_with(node: &Secp256k1Signer, input_record: InputRecord) -> UnicityCertificate {
         let mut uc = UnicityCertificate {
             input_record,
             technical_record_hash: None,
@@ -1049,7 +1067,7 @@ mod tests {
     fn rule_path_invalid() {
         let (tb, node, _o, transfer, mut proof) = transfer_case();
         // Point the inclusion proof at a different state-tree root.
-        proof.unicity_certificate.input_record.hash = alloc::vec![0xCDu8; 32];
+        proof.unicity_certificate.input_record.hash = Some(alloc::vec![0xCDu8; 32]);
         reseal(&mut proof, &node); // keep the seal consistent so PATH fails first
         assert_eq!(
             verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
@@ -1661,6 +1679,126 @@ mod tests {
         assert_eq!(
             bound.verify_in_context(&tb, &NonInclusionContext::new(3)),
             Err(VerificationError::PartitionMismatch)
+        );
+    }
+
+    // ── nullable input-record fields and the empty-tree identity ─────────────────────────────
+
+    fn ir(round: u64, hash: Option<Vec<u8>>, summary: Option<Vec<u8>>) -> InputRecord {
+        InputRecord {
+            round_number: round,
+            epoch: 0,
+            previous_hash: None,
+            hash,
+            summary_value: summary,
+            timestamp: if round == 0 { 0 } else { REFERENCE_TIME },
+            block_hash: None,
+            sum_of_earned_fees: 0,
+            executed_transactions_hash: None,
+        }
+    }
+
+    fn empty_tree_proof(node: &Secp256k1Signer, record: InputRecord) -> NonInclusionProof {
+        NonInclusionProof::new(
+            NonInclusionCertificate::empty_tree(),
+            signed_uc_with(node, record),
+        )
+    }
+
+    #[test]
+    fn only_an_authenticated_null_hash_is_the_empty_tree() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let target = state_id([0x44; 32]);
+        let verdict = |record: InputRecord| {
+            verify_non_inclusion_proof(&tb, &empty_tree_proof(&node, record), &target)
+        };
+        // the native initial record (round 0, everything null) and its repeats under a new seal
+        assert_eq!(verdict(ir(0, None, None)), Ok(()));
+        // a nonzero-round record with a null hash and a valid (empty) summary value
+        assert_eq!(verdict(ir(5, None, Some(Vec::new()))), Ok(()));
+        // an independently signed empty-byte-string root is NOT the empty tree
+        assert_eq!(
+            verdict(ir(5, Some(Vec::new()), Some(Vec::new()))),
+            Err(VerificationError::NonInclusionCertificateInvalid)
+        );
+        assert_eq!(
+            verdict(ir(0, Some(Vec::new()), None)),
+            Err(VerificationError::NonInclusionCertificateInvalid)
+        );
+        // neither is the all-zero hash, nor any other length
+        for bad in [
+            alloc::vec![0u8; 32],
+            alloc::vec![1u8; 31],
+            alloc::vec![1u8; 33],
+        ] {
+            assert_eq!(
+                verdict(ir(5, Some(bad), Some(Vec::new()))),
+                Err(VerificationError::NonInclusionCertificateInvalid)
+            );
+        }
+    }
+
+    #[test]
+    fn a_nonempty_certificate_never_verifies_against_the_empty_tree() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let proof = NonInclusionProof::new(
+            NonInclusionCertificate::from_parts([0u8; 32], alloc::vec![], [0x55; 32], [0x66; 32])
+                .unwrap(),
+            signed_uc_with(&node, ir(5, None, Some(Vec::new()))),
+        );
+        assert_eq!(
+            verify_non_inclusion_proof(&tb, &proof, &state_id([0x44; 32])),
+            Err(VerificationError::NonInclusionCertificateInvalid)
+        );
+    }
+
+    #[test]
+    fn the_empty_tree_contains_no_inclusion_proof() {
+        let (tb, node, owner, transfer, mut proof) = transfer_case();
+        proof.unicity_certificate = signed_uc_with(&node, ir(5, None, Some(Vec::new())));
+        let _ = (&owner, &tb);
+        let state = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        assert!(proof.verify_for(&state, REFERENCE_TIME, &tb).is_err());
+    }
+
+    #[test]
+    fn nullable_input_record_fields_round_trip_exactly() {
+        for record in [
+            ir(0, None, None),
+            ir(5, None, Some(Vec::new())),
+            ir(5, Some(Vec::new()), Some(Vec::new())),
+            ir(5, Some(alloc::vec![9; 32]), Some(alloc::vec![1, 2])),
+            ir(0, None, Some(Vec::new())),
+        ] {
+            let bytes = record.to_cbor();
+            let back = InputRecord::from_cbor(Decoder::new(&bytes)).unwrap();
+            assert_eq!(back, record);
+            assert_eq!(back.to_cbor(), bytes, "null stays null, 40 stays 40");
+        }
+        // null and the empty byte string encode differently
+        assert_ne!(
+            ir(5, None, Some(Vec::new())).to_cbor(),
+            ir(5, Some(Vec::new()), Some(Vec::new())).to_cbor()
+        );
+        assert_ne!(
+            ir(0, None, None).to_cbor(),
+            ir(0, None, Some(Vec::new())).to_cbor()
+        );
+    }
+
+    #[test]
+    fn the_seal_commits_to_the_exact_nullability_of_the_input_record() {
+        // signing the record with a null hash does not authenticate the same certificate with
+        // the hash re-encoded as 40: the shard-tree hash changes
+        let node = signer(0x11);
+        let a = signed_uc_with(&node, ir(5, None, Some(Vec::new())));
+        let mut b = a.clone();
+        b.input_record.hash = Some(Vec::new());
+        assert_ne!(
+            a.computed_seal_hash().unwrap().data(),
+            b.computed_seal_hash().unwrap().data()
         );
     }
 }
