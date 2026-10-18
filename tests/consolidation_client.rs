@@ -715,7 +715,11 @@ fn integrity_failures_are_never_unavailability() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|x| edit_proof(x, |x| x.unicity_certificate.input_record.hash[0] ^= 1))
+        .map(|x| {
+            edit_proof(x, |x| {
+                x.unicity_certificate.input_record.hash.as_mut().unwrap()[0] ^= 1
+            })
+        })
         .collect();
     p["proofs"] = Value::Array(proofs);
     assert!(matches!(
