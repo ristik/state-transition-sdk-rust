@@ -196,6 +196,7 @@ impl Shard {
 struct Case {
     dir: &'static str,
     topology: PartitionTopology,
+    #[allow(dead_code)]
     partition: u32,
     trust_base: RootTrustBase,
     items: Vec<ProofItem>,
@@ -249,6 +250,10 @@ fn load(dir: &'static str) -> Case {
         })
         .collect();
 
+    assert_eq!(
+        context["partitionId"].as_u64().unwrap(),
+        u64::from(unicity_token::AGGREGATION_PARTITION_ID)
+    );
     Case {
         dir,
         topology,
@@ -313,7 +318,6 @@ fn start(
         .collect();
     let client = ProofClient::with_host_defaults(
         ProofClientConfig {
-            partition_id: case.partition,
             topology: case.topology.clone(),
         },
         endpoints,
@@ -846,7 +850,6 @@ fn configuration_is_validated() {
         )
     };
     let cfg = || ProofClientConfig {
-        partition_id: case.partition,
         topology: case.topology.clone(),
     };
     let build = |eps: Vec<(ShardId, HttpAggregatorClient)>| {

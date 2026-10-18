@@ -57,7 +57,7 @@ use super::batch::{
 };
 use crate::api::bft::{RootTrustBase, ShardId};
 use crate::api::inclusion_proof::InclusionProof;
-use crate::api::StateId;
+use crate::api::{StateId, AGGREGATION_PARTITION_ID};
 use crate::consolidation::{
     distinct_seals, outer_proofs, rebuild_token, replacement_proof, view_policy, PartitionTopology,
     RootRoundBound, ShardRouter,
@@ -76,8 +76,6 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// Trusted routing configuration, fixed once.
 #[derive(Debug, Clone)]
 pub struct ProofClientConfig {
-    /// The partition all tokens of this client belong to.
-    pub partition_id: u32,
     /// The trusted sharding scheme (empty = one shard). Admitted shard
     /// configuration hashes in it are enforced as pins; with none, the seal is
     /// the authority for every leaf's hash. It is never learned from a response.
@@ -249,7 +247,6 @@ pub struct ProofClient<C, K, X> {
 impl<C, K, X> core::fmt::Debug for ProofClient<C, K, X> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ProofClient")
-            .field("partition_id", &self.config.partition_id)
             .field("shards", &self.router.shards().len())
             .field("endpoints", &self.endpoints.len())
             .finish_non_exhaustive()
@@ -291,9 +288,6 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         trust_base
             .validate()
             .map_err(|_| cfg("invalid trust base"))?;
-        if config.partition_id == 0 {
-            return Err(cfg("partition id is zero"));
-        }
         let router = ShardRouter::new(&config.topology)
             .map_err(|e| ConsolidationError::Configuration(e.to_string()))?;
         for (i, (shard, _)) in endpoints.iter().enumerate() {
@@ -645,7 +639,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         };
         for (item, &si) in items.iter().zip(&shard_of) {
             let uc = &item.proof.unicity_certificate;
-            if uc.unicity_tree_certificate.partition_identifier != self.config.partition_id {
+            if uc.unicity_tree_certificate.partition_identifier != AGGREGATION_PARTITION_ID {
                 return Err(context("proof is of another partition"));
             }
             let shard = &uc.shard_tree_certificate.shard;
@@ -710,7 +704,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             // acceptable *as a consolidation target*: the fixed authority's network, exact
             // epoch and start, and the configured policy. Otherwise fall through to fetch
             // a target that is.
-            let policy = view_policy(self.config.partition_id, Some(&self.config.topology));
+            let policy = view_policy(Some(&self.config.topology));
             let seal = &items[0].proof.unicity_certificate.unicity_seal;
             if session.authenticate_seal_under(seal, &policy).is_ok() {
                 summary.already_shared = true;
@@ -765,12 +759,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             );
         };
         let authenticated = view
-            .authenticate(
-                enclosing,
-                self.config.partition_id,
-                Some(&self.config.topology),
-                session,
-            )
+            .authenticate(enclosing, Some(&self.config.topology), session)
             .map_err(|e| Stop::Error(ConsolidationError::Integrity(IntegrityError::View(e))))?;
         let master_round = authenticated.seal().root_chain_round_number;
         if master_round < bound.round() {
@@ -959,13 +948,8 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             return Err(context("unsharded certificate for a sharded configuration"));
         }
         let enclosing = &mbatch.proofs[0].proof.unicity_certificate;
-        let target = DirectTarget::authenticate(
-            enclosing,
-            self.config.partition_id,
-            &self.config.topology,
-            session,
-        )
-        .map_err(|e| Stop::Error(ConsolidationError::Integrity(e)))?;
+        let target = DirectTarget::authenticate(enclosing, &self.config.topology, session)
+            .map_err(|e| Stop::Error(ConsolidationError::Integrity(e)))?;
         let master_round = target.certificate().unicity_seal.root_chain_round_number;
         if master_round < bound.round() {
             // a genuinely signed older snapshot: publication lag, not forgery
