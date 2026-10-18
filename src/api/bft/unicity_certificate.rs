@@ -74,6 +74,38 @@ impl UnicityCertificate {
         )
     }
 
+    /// The body rules of bft-go-base's `UnicityCertificate.IsValid` that do not depend on the
+    /// caller's expectations: the input record's conditional rules (outside round 0 the summary
+    /// value is present and the timestamp assigned; the block hash is empty exactly when the
+    /// state hash is unchanged) and a 32-byte technical record hash. A null summary value is
+    /// legal at round 0, and so is a null hash. `Err` names the violated rule.
+    pub fn check_body(&self) -> Result<(), &'static str> {
+        let ir = &self.input_record;
+        if ir.round_number != 0 {
+            if ir.summary_value.is_none() {
+                return Err("summary value is nil");
+            }
+            if ir.timestamp == 0 {
+                return Err("timestamp is unassigned");
+            }
+        }
+        // Go compares with bytes.Equal and tests len(), so null and empty are the same here.
+        let empty: &[u8] = &[];
+        let same_state =
+            ir.previous_hash.as_deref().unwrap_or(empty) == ir.hash.as_deref().unwrap_or(empty);
+        let block_hash_empty = ir.block_hash.as_deref().map_or(true, <[u8]>::is_empty);
+        if same_state && !block_hash_empty {
+            return Err("state hash didn't change but block hash is not nil");
+        }
+        if !same_state && block_hash_empty {
+            return Err("block hash is nil but state hash changed");
+        }
+        if self.technical_record_hash.as_ref().map(Vec::len) != Some(32) {
+            return Err("technical record hash must be 32 bytes");
+        }
+        Ok(())
+    }
+
     /// Recompute the shard-tree root hash from the input record and shard proof.
     pub fn shard_tree_root_hash(&self) -> Result<DataHash, Error> {
         let mut root = DataHasher::new(HashAlgorithm::Sha256)
@@ -87,9 +119,9 @@ impl UnicityCertificate {
 
         let shard = &self.shard_tree_certificate.shard;
         let siblings = &self.shard_tree_certificate.sibling_hash_list;
-        if siblings.len() > shard.length() {
+        if siblings.len() != shard.length() {
             return Err(Error::UnexpectedValue(
-                "shard sibling count exceeds shard bit length",
+                "shard sibling count differs from shard bit length",
             ));
         }
         for (i, sibling) in siblings.iter().enumerate() {

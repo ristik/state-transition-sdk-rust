@@ -10,6 +10,13 @@
 //! k256 primitives (`AffinePoint::decompress`, `Scalar::invert`, one
 //! `ProjectivePoint::lincomb`), all accelerated by the SP1 k256 patch; no
 //! `recover_from_prehash` and no separate ECDSA verification.
+//!
+//! Public output (committed in this order): `ok`, `mode`, the authority identity
+//! ([`SealSession::authority_identity`], a digest of the trust base: version, network, epoch,
+//! epoch start, threshold and every validator) and the SHA-256 of the payload. The trust base
+//! and payload are private inputs, so a proof of this program is only meaningful together with
+//! these values: the verifier of the proof must compare the identity with the authority it
+//! trusts and the digest with the token or certificate it is about.
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
@@ -18,6 +25,7 @@ use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
 use unicity_token::api::bft::{RootTrustBase, UnicityCertificate};
 use unicity_token::api::NetworkId;
 use unicity_token::cbor::Decoder;
+use unicity_token::crypto::hash::sha256;
 use unicity_token::crypto::signature::PublicKey;
 use unicity_token::transaction::Token;
 use unicity_token::verify::{SealAuthenticator, SealSession};
@@ -69,5 +77,13 @@ fn main() {
         }
         _ => false,
     };
+    let authority: [u8; 32] = SealSession::new(&trust_base).authority_identity();
+    let payload_digest: [u8; 32] = sha256(&input.payload)
+        .data()
+        .try_into()
+        .expect("sha-256 is 32 bytes");
     sp1_zkvm::io::commit(&ok);
+    sp1_zkvm::io::commit(&input.mode);
+    sp1_zkvm::io::commit(&authority);
+    sp1_zkvm::io::commit(&payload_digest);
 }

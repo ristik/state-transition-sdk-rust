@@ -501,6 +501,9 @@ fn verify_unicity_certificate_strict(
     }
     seals.note_body_check();
 
+    // the body is well-formed by bft-go-base's IsValid, as Go's ordinary verifier requires
+    uc.check_body()
+        .map_err(|_| VerificationError::CertificateBodyInvalid)?;
     // the shard path has exactly one sibling per bit of the shard id
     let shard = &uc.shard_tree_certificate.shard;
     if uc.shard_tree_certificate.sibling_hash_list.len() != shard.length() {
@@ -519,16 +522,6 @@ fn verify_unicity_certificate_strict(
         {
             return Err(VerificationError::ConfigurationMismatch);
         }
-        if c.min_root_round()
-            .is_some_and(|min| seal.root_chain_round_number < min)
-        {
-            return Err(VerificationError::SealTooOld);
-        }
-        if c.authority_end_round()
-            .is_some_and(|end| seal.root_chain_round_number >= end)
-        {
-            return Err(VerificationError::SealAfterAuthorityEnd);
-        }
     }
 
     // The recomputed unicity-tree root must equal the signed seal hash.
@@ -540,6 +533,20 @@ fn verify_unicity_certificate_strict(
     }
 
     seals.authenticate_seal_under(seal, &policy)?;
+    // Freshness and the authority's end are statements about an *authenticated* seal: an
+    // unauthenticated certificate must fail authentication, never look like a stale snapshot.
+    if let Some(c) = context {
+        if c.min_root_round()
+            .is_some_and(|min| seal.root_chain_round_number < min)
+        {
+            return Err(VerificationError::SealTooOld);
+        }
+        if c.authority_end_round()
+            .is_some_and(|end| seal.root_chain_round_number >= end)
+        {
+            return Err(VerificationError::SealAfterAuthorityEnd);
+        }
+    }
     seals.remember_body(uc, &policy);
     Ok(())
 }
@@ -696,7 +703,8 @@ mod tests {
                 hash: Some(root.to_vec()),
                 summary_value: Some(Vec::new()),
                 timestamp: REFERENCE_TIME,
-                block_hash: None,
+                // the state hash changed (previous is null), so the block hash is present
+                block_hash: Some(alloc::vec![0x0b; 32]),
                 sum_of_earned_fees: 0,
                 executed_transactions_hash: None,
             },
@@ -709,7 +717,7 @@ mod tests {
     fn signed_uc_with(node: &Secp256k1Signer, input_record: InputRecord) -> UnicityCertificate {
         let mut uc = UnicityCertificate {
             input_record,
-            technical_record_hash: None,
+            technical_record_hash: Some(alloc::vec![0x7c; 32]),
             shard_configuration_hash: alloc::vec![0u8; 32],
             shard_tree_certificate: ShardTreeCertificate {
                 shard: empty_shard(),
@@ -821,6 +829,75 @@ mod tests {
         );
     }
 
+    // --- inclusion-path shard binding ---------------------------------------
+
+    /// A certificate the root signed for a shard that does not own the state id must not verify
+    /// after it is relabelled to a longer label that does (same seal and siblings, no new signature).
+    #[test]
+    fn relabel_without_resealing() {
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        let sid = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        let bit = |i: usize| (sid.bytes()[i / 8] >> (7 - (i % 8))) & 1;
+        let b0 = bit(0);
+        let l = (2..64).find(|&l| bit(l - 1) != b0).unwrap(); // last label bit != first state-id bit
+        let child = |s: &ShardId, b: u8| {
+            let (z, o) = s.split();
+            if b == 0 {
+                z
+            } else {
+                o
+            }
+        };
+        let real = child(&ShardId::root(), 1 - b0); // 1-bit shard that does NOT own sid
+        let mut forged = ShardId::root();
+        for i in 0..l {
+            forged = child(&forged, bit(i)); // l-bit prefix of sid
+        }
+        let uc = &mut proof.unicity_certificate;
+        uc.input_record.block_hash = Some(alloc::vec![5; 32]);
+        uc.technical_record_hash = Some(alloc::vec![6; 32]);
+        uc.shard_tree_certificate.shard = real;
+        uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
+        reseal(&mut proof, &node); // the root certifies shard `real`
+        assert_eq!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+            Err(VerificationError::ShardMismatch)
+        );
+        proof.unicity_certificate.shard_tree_certificate.shard = forged; // no re-signing
+        assert!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME).is_err(),
+            "a relabelled shard with a different sibling count must not verify"
+        );
+    }
+
+    // --- authenticating a proof of other data ------------------------------
+
+    /// `submit_and_wait_verified` believes "another request won the race" only for a proof
+    /// that verifies under the trust base.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_proof_of_other_data_is_believed_only_when_it_verifies() {
+        use crate::client::{conflict_error, HttpError};
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        let sid = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        assert!(matches!(
+            conflict_error(&proof, &sid, &tb),
+            HttpError::StateCertifiedWithOtherData
+        ));
+        // a seal signed by an untrusted key is only an unauthenticated hint
+        assert!(matches!(
+            conflict_error(&proof, &sid, &trust_base(&signer(0x99))),
+            HttpError::ProofOfOtherData
+        ));
+        // so is a certificate whose seal does not cover the contents
+        proof.unicity_certificate.input_record.block_hash = Some(alloc::vec![1; 32]);
+        assert!(matches!(
+            conflict_error(&proof, &sid, &tb),
+            HttpError::ProofOfOtherData
+        ));
+        let _ = node;
+    }
+
     // --- non-inclusion proof rules ----------------------------------------
 
     #[test]
@@ -902,6 +979,7 @@ mod tests {
         // One-bit shard `0`: the target belongs to it, but the authenticated
         // terminal starts with `1` and therefore cannot belong to this root.
         uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
+        uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
         let seal_hash = uc.computed_seal_hash().unwrap().data().to_vec();
         let signature = node
             .sign(&mk_seal(seal_hash.clone(), Vec::new()).calculate_hash())
@@ -1430,6 +1508,79 @@ mod tests {
         verify_non_inclusion_proof_in_context(tb, proof, &state_id([0x44; 32]), ctx)
     }
 
+    /// bft-go-base's `IsValid` conditional rules: reject the malformed combinations, not every
+    /// null field. All variants are validator-signed (re-signed), so only the body rule can fire.
+    #[test]
+    fn non_inclusion_follows_the_go_validity_rules_for_signed_bodies() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        type Edit = Box<dyn Fn(&mut UnicityCertificate)>;
+        let malformed: Vec<(&str, Edit)> = vec![
+            (
+                "nil block hash although the state changed",
+                Box::new(|uc| uc.input_record.block_hash = None),
+            ),
+            (
+                "empty block hash although the state changed",
+                Box::new(|uc| uc.input_record.block_hash = Some(Vec::new())),
+            ),
+            (
+                "block hash although the state is unchanged",
+                Box::new(|uc| uc.input_record.previous_hash = uc.input_record.hash.clone()),
+            ),
+            (
+                "nil summary value after round 0",
+                Box::new(|uc| {
+                    uc.input_record.round_number = 1;
+                    uc.input_record.summary_value = None;
+                }),
+            ),
+            (
+                "unassigned timestamp after round 0",
+                Box::new(|uc| {
+                    uc.input_record.round_number = 1;
+                    uc.input_record.timestamp = 0;
+                }),
+            ),
+            (
+                "31-byte TR hash",
+                Box::new(|uc| uc.technical_record_hash = Some(alloc::vec![1; 31])),
+            ),
+            (
+                "nil TR hash",
+                Box::new(|uc| uc.technical_record_hash = None),
+            ),
+        ];
+        for (name, edit) in &malformed {
+            let proof = ni_proof(&node, |uc| {
+                edit(uc);
+                resign(uc, &node, |_| {});
+            });
+            assert_eq!(
+                verify_ni(&tb, &proof),
+                Err(VerificationError::CertificateBodyInvalid),
+                "{name}"
+            );
+        }
+        // legal null fields: a null summary value at round 0
+        let proof = ni_proof(&node, |uc| {
+            uc.input_record.summary_value = None;
+            resign(uc, &node, |_| {});
+        });
+        assert_eq!(
+            verify_ni(&tb, &proof),
+            Ok(()),
+            "a null summary is legal at round 0"
+        );
+        // an unchanged state hash with an empty (null) block hash is legal
+        let proof = ni_proof(&node, |uc| {
+            uc.input_record.previous_hash = uc.input_record.hash.clone();
+            uc.input_record.block_hash = None;
+            resign(uc, &node, |_| {});
+        });
+        assert_eq!(verify_ni(&tb, &proof), Ok(()));
+    }
+
     #[test]
     fn non_inclusion_enforces_the_exact_epoch_with_reused_keys() {
         let node = signer(0x11);
@@ -1540,6 +1691,26 @@ mod tests {
             Err(VerificationError::SealAfterAuthorityEnd),
             "a seal at the retirement boundary is outside the authority's interval"
         );
+        // freshness is judged only for an authenticated seal: an untrusted authority is an
+        // authority failure, never a "stale snapshot"
+        let rogue = signer(0x12);
+        let forged = ni_proof(&rogue, |_| {});
+        assert_eq!(
+            verify_ni_ctx(
+                &tb,
+                &forged,
+                &NonInclusionContext::new(0).with_min_root_round(3)
+            ),
+            Err(VerificationError::QuorumNotMet)
+        );
+        assert_eq!(
+            verify_ni_ctx(
+                &tb,
+                &forged,
+                &NonInclusionContext::new(0).with_authority_end_round(1)
+            ),
+            Err(VerificationError::QuorumNotMet)
+        );
         // the proof's own claims never substitute for the context
         let other_partition = ni_proof(&node, |uc| {
             uc.unicity_tree_certificate.partition_identifier = 5;
@@ -1565,9 +1736,9 @@ mod tests {
         let node = signer(0x11);
         let tb = trust_base(&node);
         // one-bit shard "0" (the target 0x44.. and terminal 0x22.. both start with 0) but no sibling
+        // (its root can not even be recomputed, so the seal is left as it was)
         let missing = ni_proof(&node, |uc| {
             uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
-            resign(uc, &node, |_| {});
         });
         assert_eq!(
             verify_ni(&tb, &missing),
