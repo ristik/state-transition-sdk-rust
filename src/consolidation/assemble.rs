@@ -9,7 +9,7 @@ use super::topology::PartitionTopology;
 use crate::api::bft::{
     ShardId, ShardTreeCertificate, UnicityCertificate, UnicitySeal, UnicityTreeCertificate,
 };
-use crate::api::NetworkId;
+use crate::api::{NetworkId, AGGREGATION_PARTITION_ID};
 use crate::crypto::hash::{DataHasher, HashAlgorithm};
 use crate::verify::{SealAuthenticator, SealSession};
 
@@ -29,16 +29,16 @@ pub struct ShardCertificate {
 }
 
 impl PartitionView {
-    /// Check that this is a well-formed view of `partition` with exactly the
+    /// Check that this is a well-formed view of the aggregation partition
+    /// ([`AGGREGATION_PARTITION_ID`]) with exactly the
     /// shards of the trusted `topology`, in canonical order, and that every
     /// admitted shard configuration hash matches. No hash tree is touched.
     pub fn validate_structure(
         &self,
-        partition: u32,
         topology: &PartitionTopology,
     ) -> Result<(), PartitionViewError> {
         self.check_bounds()?;
-        if self.partition_id != partition {
+        if self.partition_id != AGGREGATION_PARTITION_ID {
             return Err(PartitionViewError::PartitionMismatch);
         }
         let order = topology.canonical_order()?;
@@ -63,10 +63,9 @@ impl PartitionView {
     /// Validate the structure and rebuild the native shard tree from the leaves.
     pub fn build_shard_tree(
         &self,
-        partition: u32,
         topology: &PartitionTopology,
     ) -> Result<ShardTree, PartitionViewError> {
-        self.validate_structure(partition, topology)?;
+        self.validate_structure(topology)?;
         ShardTree::build(
             self.leaves
                 .iter()
@@ -86,12 +85,11 @@ impl PartitionView {
     pub fn verify_tree(
         &self,
         enclosing: &UnicityCertificate,
-        partition: u32,
         topology: &PartitionTopology,
     ) -> Result<ShardTree, PartitionViewError> {
-        let tree = self.build_shard_tree(partition, topology)?;
+        let tree = self.build_shard_tree(topology)?;
         let utc = &enclosing.unicity_tree_certificate;
-        if utc.partition_identifier != self.partition_id {
+        if utc.partition_identifier != AGGREGATION_PARTITION_ID {
             return Err(PartitionViewError::EnclosingCertificate(
                 "certificate is of another partition",
             ));
@@ -141,7 +139,6 @@ impl PartitionView {
     pub fn assemble_certificates(
         &self,
         enclosing: &UnicityCertificate,
-        partition: u32,
         topology: &PartitionTopology,
         authenticator: &mut impl SealAuthenticator,
     ) -> Result<Vec<ShardCertificate>, PartitionViewError> {
@@ -151,7 +148,7 @@ impl PartitionView {
             }
         }
         // the view never leaves this function, so no authority identity is needed
-        self.authenticate_with(enclosing, partition, Some(topology), authenticator, [0; 32])?
+        self.authenticate_with(enclosing, Some(topology), authenticator, [0; 32])?
             .certificates()
     }
 
@@ -175,12 +172,11 @@ impl PartitionView {
     pub fn authenticate(
         &self,
         enclosing: &UnicityCertificate,
-        partition: u32,
         pins: Option<&PartitionTopology>,
         authority: &mut SealSession<'_>,
     ) -> Result<AuthenticatedView, PartitionViewError> {
         let authority_identity = authority.authority_identity();
-        self.authenticate_with(enclosing, partition, pins, authority, authority_identity)
+        self.authenticate_with(enclosing, pins, authority, authority_identity)
     }
 
     /// The shared procedure. `authority_identity` is bound into the view's
@@ -189,7 +185,6 @@ impl PartitionView {
     fn authenticate_with(
         &self,
         enclosing: &UnicityCertificate,
-        partition: u32,
         pins: Option<&PartitionTopology>,
         authority: &mut impl SealAuthenticator,
         authority_identity: [u8; 32],
@@ -209,9 +204,9 @@ impl PartitionView {
                 &candidate_topology
             }
         };
-        let tree = self.verify_tree(enclosing, partition, topology)?;
+        let tree = self.verify_tree(enclosing, topology)?;
         // the policy this authentication is for namespaces the authority's memo
-        let policy = view_policy(partition, pins);
+        let policy = view_policy(pins);
         authority
             .authenticate_seal_under(&enclosing.unicity_seal, &policy)
             .map_err(PartitionViewError::Seal)?;
@@ -221,7 +216,7 @@ impl PartitionView {
             .expect("sha256")
             .update(b"unicity-token/authenticated-view/v1")
             .update(&authority_identity)
-            .update(&partition.to_be_bytes())
+            .update(&AGGREGATION_PARTITION_ID.to_be_bytes())
             .update(&pins.map_or([0u8; 32], PartitionTopology::digest))
             .update(&[u8::from(pins.is_some())]);
         let seal_bytes = seal.to_cbor();
@@ -244,11 +239,11 @@ impl PartitionView {
 
 /// Digest of the immutable policy (partition, pinned flag and pins) a view is
 /// authenticated for: the namespace of the seal memo.
-pub(crate) fn view_policy(partition: u32, pins: Option<&PartitionTopology>) -> [u8; 32] {
+pub(crate) fn view_policy(pins: Option<&PartitionTopology>) -> [u8; 32] {
     let d = DataHasher::new(HashAlgorithm::Sha256)
         .expect("sha256")
         .update(b"unicity-token/view-policy/v1")
-        .update(&partition.to_be_bytes())
+        .update(&AGGREGATION_PARTITION_ID.to_be_bytes())
         .update(&[u8::from(pins.is_some())])
         .update(&pins.map_or([0u8; 32], PartitionTopology::digest))
         .finalize();

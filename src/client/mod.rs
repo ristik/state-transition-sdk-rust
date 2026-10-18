@@ -67,18 +67,44 @@ pub trait AggregatorClient {
 /// Keeping this separate from [`AggregatorClient`] makes the new API additive:
 /// existing transports and test doubles do not need a meaningless unsupported
 /// method. Implementations should bind successful results with
-/// [`NonInclusionProof::for_state`] so callers can use its one-argument
-/// verification method safely.
+/// [`NonInclusionProof::for_state`], which only records which state id the proof was
+/// requested for: it is request bookkeeping, not evidence, and it makes a returned proof
+/// neither verified nor fresh. Verify it with
+/// [`NonInclusionProof::verify_at_snapshot`] and apply your own policy to the returned
+/// snapshot.
+///
+/// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+/// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+/// snapshot’s network and root round (or its certified seal timestamp under your application's
+/// time policy) with an independently trusted requirement. The seal timestamp is a
+/// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+/// metadata for this check.**
 pub trait NonInclusionAggregatorClient: AggregatorClient {
     /// Fetch a snapshot proof that a state id is absent from the latest
-    /// certified root known to the aggregator.
+    /// certified root known to the aggregator. The proof is unverified.
+    ///
+    /// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+    /// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+    /// snapshot’s network and root round (or its certified seal timestamp under your application's
+    /// time policy) with an independently trusted requirement. The seal timestamp is a
+    /// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+    /// metadata for this check.**
     fn get_non_inclusion_proof(&self, state_id: &StateId)
         -> Result<NonInclusionProof, Self::Error>;
 }
 
 /// Proof-carrying relation returned by a membership-status lookup.
 ///
-/// Callers must still verify the contained proof against their trust base.
+/// Callers must still verify the contained proof against their trust base (an
+/// inclusion proof with `verify_for`, a non-inclusion proof with
+/// [`NonInclusionProof::verify_at_snapshot`]); nothing here is authenticated.
+///
+/// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+/// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+/// snapshot’s network and root round (or its certified seal timestamp under your application's
+/// time policy) with an independently trusted requirement. The seal timestamp is a
+/// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+/// metadata for this check.**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MembershipStatus {
     /// The requested state is claimed present at the root carried by this proof.

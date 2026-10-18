@@ -36,10 +36,6 @@ pub fn load() -> (RootTrustBase, Client) {
     )
     .expect("parse trust base");
 
-    let partition_id: u32 = std::env::var("UNICITY_PARTITION_ID")
-        .expect("UNICITY_PARTITION_ID")
-        .parse()
-        .expect("partition id");
     let spec = std::env::var("UNICITY_SHARD_ENDPOINTS").expect("UNICITY_SHARD_ENDPOINTS");
     let mut endpoints = Vec::new();
     for pair in spec.split(',') {
@@ -58,7 +54,6 @@ pub fn load() -> (RootTrustBase, Client) {
     };
     let client = ProofClient::with_host_defaults(
         ProofClientConfig {
-            partition_id,
             topology: PartitionTopology::new(scheme),
         },
         endpoints,

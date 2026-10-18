@@ -1,0 +1,46 @@
+diff --git a/tests/utils/UnicityCertificateFixture.ts b/tests/utils/UnicityCertificateFixture.ts
+index b526f7e..7291e54 100644
+--- a/tests/utils/UnicityCertificateFixture.ts
++++ b/tests/utils/UnicityCertificateFixture.ts
+@@ -19,8 +19,18 @@ export async function createUnicityCertificate(
+   signingService: SigningService,
+   timestamp: bigint = REFERENCE_TIME,
+ ): Promise<UnicityCertificate> {
+-  const inputRecord = new InputRecord(0n, 0n, null, rootHash.data, new Uint8Array(0), timestamp, null, 0n, null);
+-  const technicalRecordHash = null;
++  const inputRecord = new InputRecord(
++    0n,
++    0n,
++    null,
++    rootHash.data,
++    new Uint8Array(0),
++    timestamp,
++    new Uint8Array(32).fill(5),
++    0n,
++    null,
++  );
++  const technicalRecordHash = new Uint8Array(32).fill(6);
+   const shardConfigurationHash = new Uint8Array(32);
+   const shardTreeCertificate = new ShardTreeCertificate(ShardId.decode(new Uint8Array([0b10000000])), []);
+ 
+@@ -31,7 +41,7 @@ export async function createUnicityCertificate(
+     shardTreeCertificate,
+   );
+ 
+-  const partitionIdentifier = 0n;
++  const partitionIdentifier = 7n;
+ 
+   const key = numberToBytesBE(partitionIdentifier, 4);
+   const shardTreeCertificateRootCborHash = await new DataHasher(HashAlgorithm.SHA256)
+@@ -46,9 +56,9 @@ export async function createUnicityCertificate(
+ 
+   const seal = await UnicitySeal.create(
+     NetworkId.LOCAL,
++    1n,
+     0n,
+-    0n,
+-    0n,
++    timestamp,
+     null,
+     unicitySealHash.data,
+     new Map([['NODE', signingService]]),

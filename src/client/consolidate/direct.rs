@@ -15,6 +15,7 @@
 
 use super::{view_policy, IntegrityError, PartitionTopology, SealAuthenticator, SealSession};
 use crate::api::bft::{ShardId, UnicityCertificate};
+use crate::api::AGGREGATION_PARTITION_ID;
 
 /// A unicity certificate of an unsharded partition, authenticated as the common
 /// target of a consolidation. Immutable; only [`authenticate`](Self::authenticate)
@@ -35,7 +36,6 @@ impl DirectTarget {
     /// comes from `session`, never from the response.
     pub(super) fn authenticate(
         uc: &UnicityCertificate,
-        partition: u32,
         topology: &PartitionTopology,
         session: &mut SealSession<'_>,
     ) -> Result<Self, IntegrityError> {
@@ -47,7 +47,7 @@ impl DirectTarget {
         if !uc.shard_tree_certificate.sibling_hash_list.is_empty() {
             return Err(context("empty shard id with a nonempty shard path"));
         }
-        if uc.unicity_tree_certificate.partition_identifier != partition {
+        if uc.unicity_tree_certificate.partition_identifier != AGGREGATION_PARTITION_ID {
             return Err(context("target is of another partition"));
         }
         if topology
@@ -65,7 +65,7 @@ impl DirectTarget {
             ));
         }
         // the policy identity of every view-less/viewed target of this configuration
-        let policy = view_policy(partition, Some(topology));
+        let policy = view_policy(Some(topology));
         session
             .authenticate_seal_under(&uc.unicity_seal, &policy)
             .map_err(IntegrityError::Target)?;

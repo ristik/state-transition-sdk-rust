@@ -451,7 +451,17 @@ impl HttpAggregatorClient {
     /// RPC, while an included state triggers an inclusion-proof lookup after the
     /// non-inclusion endpoint reports that the relation is false. The two RPCs
     /// are not an atomic read if the certified root advances between them; each
-    /// returned proof authenticates the root it carries.
+    /// returned proof speaks only about the root it carries, once verified.
+    ///
+    /// The result is unverified: verify an `Absent` proof with
+    /// [`NonInclusionProof::verify_at_snapshot`] and judge the returned snapshot yourself.
+    ///
+    /// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+    /// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+    /// snapshot’s network and root round (or its certified seal timestamp under your application's
+    /// time policy) with an independently trusted requirement. The seal timestamp is a
+    /// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+    /// metadata for this check.**
     pub fn membership_status(&self, state_id: &StateId) -> Result<MembershipStatus, HttpError> {
         match NonInclusionAggregatorClient::get_non_inclusion_proof(self, state_id) {
             Ok(proof) => Ok(MembershipStatus::Absent(proof)),
