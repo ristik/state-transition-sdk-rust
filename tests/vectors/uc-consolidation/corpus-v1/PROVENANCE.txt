@@ -1,1 +1,6 @@
 aggregator-go uc-consolidation @ e5bdd7a86d56e2d9a8fbe2ef9a22f777b52a68d2 (PR #195 merged as 7e631ffe; get_inclusion_proofs.v1 shapes pinned to PR #193 head 2b27bad4dcc753a8a9763fedc00188ece2c76b3f)
+
+Regenerated for the fixed aggregation partition 7 (arch-cd C1/C2): vendored byte for byte from the aggregator-go
+fixed-partition fix branch fix/cd-C-partition7-202610182138 (local commit 1c42d4d "testdata: regenerate uc-consolidation
+corpus for partition 7", `testdata/uc-consolidation/v1`, `go run ./cmd/gen-uc-consolidation-fixtures`). Re-vendor from
+the pushed branch head when it lands; the directory must stay identical to that testdata.
