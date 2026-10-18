@@ -501,6 +501,9 @@ fn verify_unicity_certificate_strict(
     }
     seals.note_body_check();
 
+    // the body is well-formed by bft-go-base's IsValid, as Go's ordinary verifier requires
+    uc.check_body()
+        .map_err(|_| VerificationError::CertificateBodyInvalid)?;
     // the shard path has exactly one sibling per bit of the shard id
     let shard = &uc.shard_tree_certificate.shard;
     if uc.shard_tree_certificate.sibling_hash_list.len() != shard.length() {
@@ -700,7 +703,8 @@ mod tests {
                 hash: Some(root.to_vec()),
                 summary_value: Some(Vec::new()),
                 timestamp: REFERENCE_TIME,
-                block_hash: None,
+                // the state hash changed (previous is null), so the block hash is present
+                block_hash: Some(alloc::vec![0x0b; 32]),
                 sum_of_earned_fees: 0,
                 executed_transactions_hash: None,
             },
@@ -713,7 +717,7 @@ mod tests {
     fn signed_uc_with(node: &Secp256k1Signer, input_record: InputRecord) -> UnicityCertificate {
         let mut uc = UnicityCertificate {
             input_record,
-            technical_record_hash: None,
+            technical_record_hash: Some(alloc::vec![0x7c; 32]),
             shard_configuration_hash: alloc::vec![0u8; 32],
             shard_tree_certificate: ShardTreeCertificate {
                 shard: empty_shard(),
@@ -1432,6 +1436,79 @@ mod tests {
         ctx: &NonInclusionContext,
     ) -> Result<(), VerificationError> {
         verify_non_inclusion_proof_in_context(tb, proof, &state_id([0x44; 32]), ctx)
+    }
+
+    /// bft-go-base's `IsValid` conditional rules: reject the malformed combinations, not every
+    /// null field. All variants are validator-signed (re-signed), so only the body rule can fire.
+    #[test]
+    fn non_inclusion_follows_the_go_validity_rules_for_signed_bodies() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        type Edit = Box<dyn Fn(&mut UnicityCertificate)>;
+        let malformed: Vec<(&str, Edit)> = vec![
+            (
+                "nil block hash although the state changed",
+                Box::new(|uc| uc.input_record.block_hash = None),
+            ),
+            (
+                "empty block hash although the state changed",
+                Box::new(|uc| uc.input_record.block_hash = Some(Vec::new())),
+            ),
+            (
+                "block hash although the state is unchanged",
+                Box::new(|uc| uc.input_record.previous_hash = uc.input_record.hash.clone()),
+            ),
+            (
+                "nil summary value after round 0",
+                Box::new(|uc| {
+                    uc.input_record.round_number = 1;
+                    uc.input_record.summary_value = None;
+                }),
+            ),
+            (
+                "unassigned timestamp after round 0",
+                Box::new(|uc| {
+                    uc.input_record.round_number = 1;
+                    uc.input_record.timestamp = 0;
+                }),
+            ),
+            (
+                "31-byte TR hash",
+                Box::new(|uc| uc.technical_record_hash = Some(alloc::vec![1; 31])),
+            ),
+            (
+                "nil TR hash",
+                Box::new(|uc| uc.technical_record_hash = None),
+            ),
+        ];
+        for (name, edit) in &malformed {
+            let proof = ni_proof(&node, |uc| {
+                edit(uc);
+                resign(uc, &node, |_| {});
+            });
+            assert_eq!(
+                verify_ni(&tb, &proof),
+                Err(VerificationError::CertificateBodyInvalid),
+                "{name}"
+            );
+        }
+        // legal null fields: a null summary value at round 0
+        let proof = ni_proof(&node, |uc| {
+            uc.input_record.summary_value = None;
+            resign(uc, &node, |_| {});
+        });
+        assert_eq!(
+            verify_ni(&tb, &proof),
+            Ok(()),
+            "a null summary is legal at round 0"
+        );
+        // an unchanged state hash with an empty (null) block hash is legal
+        let proof = ni_proof(&node, |uc| {
+            uc.input_record.previous_hash = uc.input_record.hash.clone();
+            uc.input_record.block_hash = None;
+            resign(uc, &node, |_| {});
+        });
+        assert_eq!(verify_ni(&tb, &proof), Ok(()));
     }
 
     #[test]
