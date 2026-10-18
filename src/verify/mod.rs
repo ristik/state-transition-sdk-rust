@@ -519,16 +519,6 @@ fn verify_unicity_certificate_strict(
         {
             return Err(VerificationError::ConfigurationMismatch);
         }
-        if c.min_root_round()
-            .is_some_and(|min| seal.root_chain_round_number < min)
-        {
-            return Err(VerificationError::SealTooOld);
-        }
-        if c.authority_end_round()
-            .is_some_and(|end| seal.root_chain_round_number >= end)
-        {
-            return Err(VerificationError::SealAfterAuthorityEnd);
-        }
     }
 
     // The recomputed unicity-tree root must equal the signed seal hash.
@@ -540,6 +530,20 @@ fn verify_unicity_certificate_strict(
     }
 
     seals.authenticate_seal_under(seal, &policy)?;
+    // Freshness and the authority's end are statements about an *authenticated* seal: an
+    // unauthenticated certificate must fail authentication, never look like a stale snapshot.
+    if let Some(c) = context {
+        if c.min_root_round()
+            .is_some_and(|min| seal.root_chain_round_number < min)
+        {
+            return Err(VerificationError::SealTooOld);
+        }
+        if c.authority_end_round()
+            .is_some_and(|end| seal.root_chain_round_number >= end)
+        {
+            return Err(VerificationError::SealAfterAuthorityEnd);
+        }
+    }
     seals.remember_body(uc, &policy);
     Ok(())
 }
@@ -1539,6 +1543,26 @@ mod tests {
             ),
             Err(VerificationError::SealAfterAuthorityEnd),
             "a seal at the retirement boundary is outside the authority's interval"
+        );
+        // freshness is judged only for an authenticated seal: an untrusted authority is an
+        // authority failure, never a "stale snapshot"
+        let rogue = signer(0x12);
+        let forged = ni_proof(&rogue, |_| {});
+        assert_eq!(
+            verify_ni_ctx(
+                &tb,
+                &forged,
+                &NonInclusionContext::new(0).with_min_root_round(3)
+            ),
+            Err(VerificationError::QuorumNotMet)
+        );
+        assert_eq!(
+            verify_ni_ctx(
+                &tb,
+                &forged,
+                &NonInclusionContext::new(0).with_authority_end_round(1)
+            ),
+            Err(VerificationError::QuorumNotMet)
         );
         // the proof's own claims never substitute for the context
         let other_partition = ni_proof(&node, |uc| {
