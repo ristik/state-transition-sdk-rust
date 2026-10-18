@@ -14,6 +14,15 @@ pub mod non_inclusion_proof;
 pub mod proof_status;
 pub mod state_id;
 
+/// The aggregation partition every Unicity network uses (`7`).
+///
+/// This is a fixed protocol constant, not configuration: a proof never selects
+/// its own expected partition. Every application verification path (inclusion,
+/// token including nested proofs, non-inclusion, consolidation and partition
+/// views) rejects an authenticated certificate of any other partition. Generic
+/// BFT codecs stay partition-agnostic and cannot confer verification success.
+pub const AGGREGATION_PARTITION_ID: u32 = 7;
+
 /// Leaf-value width in the Unicity aggregation profile.
 ///
 /// The generic RSMT certificate format permits arbitrary byte-string values;

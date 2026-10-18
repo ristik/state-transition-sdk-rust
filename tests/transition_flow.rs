@@ -119,6 +119,41 @@ fn verifies_against_trust_base() {
     }
 }
 
+/// The same flow certified under partition 0 by the same trusted key: every signature, seal
+/// and path is valid, only the partition is not the aggregation partition.
+#[test]
+fn rejects_validly_signed_tokens_of_another_partition() {
+    const OTHER: &str = include_str!("vectors/transition_flow_partition0.json");
+    let pk =
+        PublicKey::from_bytes(&hex::decode(field(OTHER, "aggregatorPublicKey")).unwrap()).unwrap();
+    let tb = RootTrustBase::new(
+        0,
+        NetworkId::LOCAL,
+        0,
+        0,
+        vec![RootTrustBaseNodeInfo {
+            node_id: "NODE".into(),
+            signing_key: pk,
+            stake: 1,
+        }],
+        1,
+    );
+    for name in [
+        "aliceToken",
+        "bobToken",
+        "carolToken",
+        "explicitTimeoutToken",
+    ] {
+        let token = Token::from_cbor(&hex::decode(field(OTHER, name)).unwrap()).unwrap();
+        // the wrapper names the failing transaction; the cause is the partition rule
+        let err = token.verify(&tb).expect_err(name);
+        assert!(
+            format!("{err:?}").contains("PartitionMismatch"),
+            "{name}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn rejects_wrong_aggregator_key() {
     // A trust base with a different validator key must fail the quorum check:
