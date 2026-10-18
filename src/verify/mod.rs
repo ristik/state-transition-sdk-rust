@@ -466,6 +466,16 @@ pub fn verify_non_inclusion_in(
 ) -> Result<NonInclusionOutcome, VerificationError> {
     seals.ensure_trust_base()?;
 
+    // A client-bound proof keeps its request context on every entry point (free functions,
+    // warm or cold session): a different target is rejected before any result. An unbound,
+    // directly decoded proof takes the explicit target.
+    if proof
+        .requested_state_id()
+        .is_some_and(|requested| requested != target)
+    {
+        return Err(VerificationError::NonInclusionTargetMismatch);
+    }
+
     let uc = proof.unicity_certificate();
     let shard = &uc.shard_tree_certificate.shard;
 
@@ -1016,6 +1026,53 @@ mod tests {
         let decoded = NonInclusionProof::from_cbor(crate::cbor::Decoder::new(&bound.to_cbor()))
             .expect("wire roundtrip");
         assert_eq!(decoded.requested_state_id(), None);
+    }
+
+    #[test]
+    fn free_functions_keep_the_proofs_request_binding_cold_and_warm() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let ctx = NonInclusionContext::new();
+        let a = state_id([0x44; 32]);
+        let b = state_id([0x45; 32]);
+        let unbound = singleton_non_inclusion_proof(&node, [0x22; 32], [0x33; 32]);
+        let bound = unbound.clone().for_state(&a).unwrap();
+
+        // cold: the one-shot free function
+        assert_eq!(
+            verify_non_inclusion_at_snapshot(&tb, &bound, &b, &ctx),
+            Err(VerificationError::NonInclusionTargetMismatch)
+        );
+        // cold: the session free function
+        assert_eq!(
+            verify_non_inclusion_in(&mut SealSession::new(&tb), &bound, &b, &ctx),
+            Err(VerificationError::NonInclusionTargetMismatch)
+        );
+
+        // warm memo: the same session verified `a`, then asks for `b`
+        let mut seals = SealSession::new(&tb);
+        assert!(verify_non_inclusion_in(&mut seals, &bound, &a, &ctx)
+            .unwrap()
+            .is_absent());
+        assert_eq!(
+            verify_non_inclusion_in(&mut seals, &bound, &b, &ctx),
+            Err(VerificationError::NonInclusionTargetMismatch)
+        );
+        // the rejection did not disturb the session
+        assert!(verify_non_inclusion_in(&mut seals, &bound, &a, &ctx)
+            .unwrap()
+            .is_absent());
+
+        // controls: bound + same target, unbound + explicit target, on both entry points
+        assert!(verify_non_inclusion_at_snapshot(&tb, &bound, &a, &ctx).is_ok());
+        assert!(verify_non_inclusion_in(&mut seals, &bound, &a, &ctx).is_ok());
+        assert!(verify_non_inclusion_at_snapshot(&tb, &unbound, &a, &ctx).is_ok());
+        assert!(verify_non_inclusion_in(&mut seals, &unbound, &a, &ctx).is_ok());
+        // an unbound proof is not tied to `a`; `b` is judged on its own merits (no mismatch)
+        assert_ne!(
+            verify_non_inclusion_at_snapshot(&tb, &unbound, &b, &ctx),
+            Err(VerificationError::NonInclusionTargetMismatch)
+        );
     }
 
     #[test]
