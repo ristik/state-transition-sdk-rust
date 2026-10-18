@@ -305,6 +305,8 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             cancel: &options.cancel,
             abort: CancelToken::new(),
         };
+        // a cancelled or already-expired attempt must not pay for the input verification
+        budget.check().map_err(stop_error)?;
         // one operation, one seal session: what the input verification authenticated is
         // not authenticated again by the consolidation steps
         let (input_check, mut session) = verify_token_in_session(
@@ -396,15 +398,9 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         if items.is_empty() {
             return Err(cfg("nothing to consolidate"));
         }
-        // more states than every endpoint's batches could carry: refuse before any work
+        // more distinct states than every endpoint's batches could carry (duplicates are
+        // sent once, so they do not count)
         let cap = self.endpoints.len().saturating_mul(MAX_BATCH_STATE_IDS);
-        if items.len() > cap {
-            return Err(Stop::Error(ConsolidationError::TooManyStates {
-                shard: self.router.shards()[0].clone(),
-                count: items.len(),
-                limit: cap,
-            }));
-        }
         let mut seen: BTreeMap<[u8; 32], usize> = BTreeMap::new();
         let mut first_of = Vec::with_capacity(items.len());
         let mut shard_of = Vec::with_capacity(items.len());
@@ -429,6 +425,13 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 continue;
             }
             seen.insert(*item.state_id.bytes(), i);
+            if seen.len() > cap {
+                return Err(Stop::Error(ConsolidationError::TooManyStates {
+                    shard: self.router.shards()[si].clone(),
+                    count: seen.len(),
+                    limit: cap,
+                }));
+            }
             first_of.push(i);
             work.group_lookups += 1; // one array index per distinct state
             if slots[si].is_none() {
@@ -780,6 +783,12 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             }
             r
         });
+        // a caller-implemented executor must return exactly one result per job
+        if wave.len() != jobs.len() {
+            return Err(Stop::Error(ConsolidationError::Configuration(
+                "the wave executor returned a different number of results than jobs".to_string(),
+            )));
+        }
         // report the originating failure rather than the cancellations it caused
         let mut batches = Vec::with_capacity(wave.len());
         let mut first_stop: Option<Stop> = None;

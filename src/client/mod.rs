@@ -11,6 +11,8 @@ mod batch;
 mod consolidate;
 #[cfg(feature = "http")]
 mod http;
+#[cfg(all(test, feature = "http"))]
+pub(crate) use http::conflict_error;
 #[cfg(feature = "http")]
 pub use http::{HttpAggregatorClient, HttpError, SubmitOutcome, DEFAULT_UNKNOWN_GRACE};
 
