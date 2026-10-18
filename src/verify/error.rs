@@ -76,8 +76,6 @@ pub enum VerificationError {
     NonInclusionTargetMissing,
     /// An explicit target differs from the state id attached by the client.
     NonInclusionTargetMismatch,
-    /// The requested state was present at the certified root.
-    StateIncluded,
     /// The certified shard does not contain the state id.
     ShardMismatch,
     /// The unicity seal's network id does not match the trust base.
@@ -94,15 +92,14 @@ pub enum VerificationError {
     /// The certificate body violates bft-go-base's `IsValid` rules (input record or
     /// technical record hash).
     CertificateBodyInvalid,
-    /// The certificate is of another partition than the verification context expects.
+    /// The certificate is of a partition other than
+    /// [`AGGREGATION_PARTITION_ID`](crate::api::AGGREGATION_PARTITION_ID).
     PartitionMismatch,
     /// The shard tree path of the certificate is malformed (its length differs
     /// from the shard id's), or the certificate is of another shard than expected.
     ShardPathInvalid,
     /// The certificate commits to another shard configuration than the pinned one.
     ConfigurationMismatch,
-    /// The seal's root round is older than the verification context requires.
-    SealTooOld,
     /// The seal's root round is at or after the end of the verifying authority's
     /// interval (a retired authority).
     SealAfterAuthorityEnd,
@@ -224,9 +221,6 @@ impl fmt::Display for VerificationError {
                     "non-inclusion proof target differs from the requested state id"
                 )
             }
-            VerificationError::StateIncluded => {
-                write!(f, "state is included at the certified root")
-            }
             VerificationError::CertificateBodyInvalid => {
                 write!(
                     f,
@@ -248,7 +242,10 @@ impl fmt::Display for VerificationError {
             }
             VerificationError::SealMalformed => write!(f, "malformed unicity seal"),
             VerificationError::PartitionMismatch => {
-                write!(f, "unicity certificate is of another partition")
+                write!(
+                    f,
+                    "certificate is of another partition than the aggregation partition"
+                )
             }
             VerificationError::ShardPathInvalid => {
                 write!(f, "malformed or unexpected shard tree path")
@@ -256,7 +253,6 @@ impl fmt::Display for VerificationError {
             VerificationError::ConfigurationMismatch => {
                 write!(f, "shard configuration differs from the pinned one")
             }
-            VerificationError::SealTooOld => write!(f, "unicity seal is older than required"),
             VerificationError::SealAfterAuthorityEnd => {
                 write!(
                     f,

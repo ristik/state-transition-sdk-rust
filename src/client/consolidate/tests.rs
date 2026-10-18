@@ -172,6 +172,9 @@ struct Sim {
     faults: Faults,
     /// One partition with the empty shard id: no sidecar view is ever served.
     unsharded: bool,
+    /// The partition the simulated network certifies (the fixed one unless a test
+    /// builds a foreign network).
+    partition: u32,
 }
 
 fn shard_of(key: &[u8; 32]) -> usize {
@@ -206,6 +209,10 @@ impl Sim {
     }
 
     fn with_sharding(unsharded: bool) -> Self {
+        Self::with_partition(unsharded, PARTITION)
+    }
+
+    fn with_partition(unsharded: bool, partition: u32) -> Self {
         let signers: Vec<_> = (1..=4u8)
             .map(|i| Secp256k1Signer::from_bytes(&[i; 32]).unwrap())
             .collect();
@@ -230,6 +237,7 @@ impl Sim {
             waits: Vec::new(),
             faults: Faults::default(),
             unsharded,
+            partition,
         };
         sim.advance();
         sim
@@ -270,21 +278,20 @@ impl Sim {
             paths[s] = p;
         }
         let view = PartitionView {
-            partition_id: PARTITION,
+            partition_id: self.partition,
             leaves: view_leaves,
         };
-        let tree = view
-            .build_shard_tree(
-                PARTITION,
-                &if self.unsharded {
-                    unsharded_topology(true)
-                } else {
-                    topology(true)
-                },
-            )
-            .unwrap();
+        // built from the leaves directly: a foreign-partition network must still be able to
+        // produce its (validly signed) evidence, only the verifying paths refuse it
+        let tree = crate::consolidation::ShardTree::build(
+            view.leaves
+                .iter()
+                .map(|l| (l.shard_id.clone(), l.leaf_hash()))
+                .collect(),
+        )
+        .unwrap();
         let utc = UnicityTreeCertificate {
-            partition_identifier: PARTITION,
+            partition_identifier: self.partition,
             steps: vec![HashStep {
                 key: 1,
                 hash: vec![9; 32],
@@ -479,7 +486,6 @@ fn client(sim: &Arc<Mutex<Sim>>, pinned: bool) -> TestClient {
     let tb = sim.lock().unwrap().trust_base.clone();
     ProofClient::with_host_defaults(
         ProofClientConfig {
-            partition_id: PARTITION,
             topology: topology(pinned),
         },
         (0..2)
@@ -1074,17 +1080,13 @@ fn transfer_transaction_bytes_are_preserved() {
 
 fn client_with(
     sim: &Arc<Mutex<Sim>>,
-    partition: u32,
     topology: PartitionTopology,
     mutate_tb: impl Fn(&mut RootTrustBase),
 ) -> TestClient {
     let mut tb = sim.lock().unwrap().trust_base.clone();
     mutate_tb(&mut tb);
     ProofClient::with_host_defaults(
-        ProofClientConfig {
-            partition_id: partition,
-            topology,
-        },
+        ProofClientConfig { topology },
         (0..2)
             .map(|i| {
                 (
@@ -1121,21 +1123,12 @@ fn already_shared_results_are_not_reused_outside_the_configured_policy() {
     assert!(summary.already_shared);
     assert_eq!(sim.lock().unwrap().batch_calls, calls);
 
-    // another partition
-    let other_partition = client_with(&sim, PARTITION + 1, topology(true), |_| {});
-    assert!(matches!(
-        other_partition.consolidate(&shared, &quick()),
-        Err(ConsolidationError::Integrity(
-            IntegrityError::Context { .. }
-        ))
-    ));
-
     // wrong configuration pins
     let mut wrong = PartitionTopology::new(shard_ids().to_vec());
     for s in shard_ids() {
         wrong = wrong.with_shard_conf_hash(&s, [0xee; 32]);
     }
-    let wrong_pins = client_with(&sim, PARTITION, wrong, |_| {});
+    let wrong_pins = client_with(&sim, wrong, |_| {});
     assert!(matches!(
         wrong_pins.consolidate(&shared, &quick()),
         Err(ConsolidationError::Integrity(
@@ -1145,7 +1138,7 @@ fn already_shared_results_are_not_reused_outside_the_configured_policy() {
 
     // another authority epoch: the shared seal is not acceptable as a target, and the
     // network's own latest seal is not authenticated either
-    let other_epoch = client_with(&sim, PARTITION, topology(true), |tb| tb.epoch += 1);
+    let other_epoch = client_with(&sim, topology(true), |tb| tb.epoch += 1);
     let out = other_epoch.consolidate(&shared, &quick());
     assert!(
         matches!(
@@ -1188,7 +1181,6 @@ fn eight_shard_client() -> TestClient {
     let tb = sim.lock().unwrap().trust_base.clone();
     ProofClient::with_host_defaults(
         ProofClientConfig {
-            partition_id: PARTITION,
             topology: PartitionTopology::new(scheme.clone()),
         },
         scheme
@@ -1846,17 +1838,10 @@ fn embedded_tokens_decode_through_the_operation_interner() {
 
 // --------------------------------------------- unsharded direct target ----
 
-fn unsharded_client_with(
-    sim: &Arc<Mutex<Sim>>,
-    partition: u32,
-    topology: PartitionTopology,
-) -> TestClient {
+fn unsharded_client_with(sim: &Arc<Mutex<Sim>>, topology: PartitionTopology) -> TestClient {
     let tb = sim.lock().unwrap().trust_base.clone();
     ProofClient::with_host_defaults(
-        ProofClientConfig {
-            partition_id: partition,
-            topology,
-        },
+        ProofClientConfig { topology },
         vec![(ShardId::root(), node(sim))],
         tb,
         2,
@@ -1865,7 +1850,7 @@ fn unsharded_client_with(
 }
 
 fn unsharded_client(sim: &Arc<Mutex<Sim>>, pinned: bool) -> TestClient {
-    unsharded_client_with(sim, PARTITION, unsharded_topology(pinned))
+    unsharded_client_with(sim, unsharded_topology(pinned))
 }
 
 fn unsharded_token(transfers: usize) -> (Arc<Mutex<Sim>>, Token) {
@@ -2048,11 +2033,34 @@ fn the_direct_target_never_falls_back_or_downgrades() {
     assert!(context(&out), "{out:?}");
 }
 
+/// The network moves to another partition after the token was certified (every signature, seal
+/// and path of the new evidence valid): the fetched consolidation target is rejected.
 #[test]
-fn the_direct_target_is_bound_to_the_configured_partition_and_pins() {
+fn a_target_of_another_partition_is_rejected_sharded_and_unsharded() {
+    let (sim, token) = spread_token(3);
+    {
+        let mut s = sim.lock().unwrap();
+        s.partition = PARTITION + 1;
+        s.advance();
+    }
+    let out = client(&sim, true).consolidate(&token, &quick());
+    assert!(
+        matches!(
+            out,
+            Err(ConsolidationError::Integrity(IntegrityError::View(
+                crate::consolidation::PartitionViewError::PartitionMismatch
+            )))
+        ),
+        "{out:?}"
+    );
+
     let (sim, token) = unsharded_token(2);
-    let other_partition = unsharded_client_with(&sim, PARTITION + 1, unsharded_topology(false));
-    let out = other_partition.consolidate(&token, &quick());
+    {
+        let mut s = sim.lock().unwrap();
+        s.partition = PARTITION + 1;
+        s.advance();
+    }
+    let out = unsharded_client(&sim, false).consolidate(&token, &quick());
     assert!(
         matches!(
             out,
@@ -2062,9 +2070,13 @@ fn the_direct_target_is_bound_to_the_configured_partition_and_pins() {
         ),
         "{out:?}"
     );
+}
+
+#[test]
+fn the_direct_target_is_bound_to_the_configured_pins() {
+    let (sim, token) = unsharded_token(2);
     let wrong_pin = unsharded_client_with(
         &sim,
-        PARTITION,
         PartitionTopology::single_shard().with_shard_conf_hash(&ShardId::root(), [0xee; 32]),
     );
     let out = wrong_pin.consolidate(&token, &quick());
@@ -2178,7 +2190,6 @@ fn a_wave_executor_returning_fewer_results_than_jobs_is_an_error() {
     let tb = sim.lock().unwrap().trust_base.clone();
     let c = ProofClient::new(
         ProofClientConfig {
-            partition_id: PARTITION,
             topology: topology(false),
         },
         (0..2)

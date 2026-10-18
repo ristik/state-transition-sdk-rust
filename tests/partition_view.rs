@@ -86,7 +86,7 @@ fn case(n: usize) -> Case {
             include_str!(
                 "vectors/uc-consolidation/partition-view/v1/derived/shards-1/trust-base.json"
             ),
-            vector!("derived/shards-1/view.cbor"),
+            &vector!("derived/shards-1/view.cbor")[..],
             vector!("derived/shards-1/enclosing-uc.cbor"),
             vec![vector!("derived/shards-1/ucs/00.cbor")],
         ),
@@ -97,7 +97,7 @@ fn case(n: usize) -> Case {
             include_str!(
                 "vectors/uc-consolidation/partition-view/v1/derived/shards-4/trust-base.json"
             ),
-            vector!("derived/shards-4/view.cbor"),
+            &vector!("derived/shards-4/view.cbor")[..],
             vector!("derived/shards-4/enclosing-uc.cbor"),
             vec![
                 vector!("derived/shards-4/ucs/00.cbor"),
@@ -113,7 +113,7 @@ fn case(n: usize) -> Case {
             include_str!(
                 "vectors/uc-consolidation/partition-view/v1/derived/shards-8/trust-base.json"
             ),
-            vector!("derived/shards-8/view.cbor"),
+            &vector!("derived/shards-8/view.cbor")[..],
             vector!("derived/shards-8/enclosing-uc.cbor"),
             vec![
                 vector!("derived/shards-8/ucs/00.cbor"),
@@ -179,12 +179,10 @@ fn case(n: usize) -> Case {
 fn assemble(
     view: &PartitionView,
     enclosing: &UnicityCertificate,
-    partition: u32,
     pins: Option<&PartitionTopology>,
     session: &mut SealSession<'_>,
 ) -> Result<Vec<ShardCertificate>, PartitionViewError> {
-    view.authenticate(enclosing, partition, pins, session)?
-        .certificates()
+    view.authenticate(enclosing, pins, session)?.certificates()
 }
 
 const CASES: [usize; 3] = [1, 4, 8];
@@ -194,9 +192,9 @@ const CASES: [usize; 3] = [1, 4, 8];
 #[test]
 fn golden_files_match_manifest_and_roundtrip_byte_for_byte() {
     let golden: [(usize, &[u8]); 3] = [
-        (1, vector!("golden/shards-1.cbor")),
-        (4, vector!("golden/shards-4.cbor")),
-        (8, vector!("golden/shards-8.cbor")),
+        (1, &vector!("golden/shards-1.cbor")[..]),
+        (4, &vector!("golden/shards-4.cbor")[..]),
+        (8, &vector!("golden/shards-8.cbor")[..]),
     ];
     for (n, bytes) in golden {
         let name = format!("shards-{n}.cbor");
@@ -220,20 +218,35 @@ fn golden_files_match_manifest_and_roundtrip_byte_for_byte() {
     }
 }
 
+/// The golden files are the frozen codec bytes of a test partition (0x0a0b0c0d); the derived
+/// vectors are the same views certified under the fixed aggregation partition. They must be the
+/// same bytes except for the partition id.
 #[test]
-fn derived_views_equal_the_frozen_golden_files() {
-    assert_eq!(
-        vector!("derived/shards-1/view.cbor"),
-        vector!("golden/shards-1.cbor")
-    );
-    assert_eq!(
-        vector!("derived/shards-4/view.cbor"),
-        vector!("golden/shards-4.cbor")
-    );
-    assert_eq!(
-        vector!("derived/shards-8/view.cbor"),
-        vector!("golden/shards-8.cbor")
-    );
+fn derived_views_equal_the_frozen_golden_files_except_the_partition() {
+    for (derived, golden) in [
+        (
+            &vector!("derived/shards-1/view.cbor")[..],
+            &vector!("golden/shards-1.cbor")[..],
+        ),
+        (
+            &vector!("derived/shards-4/view.cbor")[..],
+            &vector!("golden/shards-4.cbor")[..],
+        ),
+        (
+            &vector!("derived/shards-8/view.cbor")[..],
+            &vector!("golden/shards-8.cbor")[..],
+        ),
+    ] {
+        let derived = PartitionView::from_cbor(derived).unwrap();
+        let mut golden = PartitionView::from_cbor(golden).unwrap();
+        assert_eq!(
+            derived.partition_id,
+            unicity_token::AGGREGATION_PARTITION_ID
+        );
+        assert_ne!(golden.partition_id, derived.partition_id);
+        golden.partition_id = derived.partition_id;
+        assert_eq!(derived, golden);
+    }
 }
 
 fn minimal_view() -> PartitionView {
@@ -290,8 +303,8 @@ fn nil_and_empty_stay_distinct() {
 
 #[test]
 fn strict_decode_rejections() {
-    let good = vector!("golden/shards-4.cbor").to_vec();
-    assert!(PartitionView::from_cbor(&good).is_ok());
+    let good = &vector!("golden/shards-4.cbor")[..].to_vec();
+    assert!(PartitionView::from_cbor(good).is_ok());
     let reject = |name: &str, bytes: Vec<u8>| {
         assert!(
             PartitionView::from_cbor(&bytes).is_err(),
@@ -344,7 +357,7 @@ fn strict_decode_rejections() {
         vec![0x83, 0x01, 0x01, 0x9b, 0, 0, 0, 1, 0, 0, 0, 0],
     );
     let mut tagged = vec![0xd9, 0x9a, 0x5a];
-    tagged.extend_from_slice(&good);
+    tagged.extend_from_slice(good);
     reject("tagged view", tagged);
 }
 
@@ -438,7 +451,7 @@ fn canonical_shard_order() {
 fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
     for n in CASES {
         let c = case(n);
-        let tree = c.view.build_shard_tree(c.partition, &c.topology).unwrap();
+        let tree = c.view.build_shard_tree(&c.topology).unwrap();
         assert_eq!(
             tree.root_hash(),
             c.tree_root.as_slice(),
@@ -446,7 +459,7 @@ fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
         );
 
         let mut session = SealSession::new(&c.trust_base);
-        let ucs = assemble(&c.view, &c.uc, c.partition, Some(&c.topology), &mut session)
+        let ucs = assemble(&c.view, &c.uc, Some(&c.topology), &mut session)
             .unwrap_or_else(|e| panic!("{n} shards: {e}"));
         assert_eq!(ucs.len(), n);
         for (i, (sc, expected)) in ucs.iter().zip(&c.expected_ucs).enumerate() {
@@ -488,51 +501,52 @@ fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
 fn structure_rejections() {
     let c = case(4);
     let t = &c.topology;
-    let p = c.partition;
-    assert!(c.view.validate_structure(p, t).is_ok());
+    assert!(c.view.validate_structure(t).is_ok());
+    let mut other_partition = c.view.clone();
+    other_partition.partition_id += 1;
     assert_eq!(
-        c.view.validate_structure(p + 1, t),
+        other_partition.validate_structure(t),
         Err(PartitionViewError::PartitionMismatch)
     );
     let mut missing = c.view.clone();
     missing.leaves.pop();
     assert!(matches!(
-        missing.validate_structure(p, t),
+        missing.validate_structure(t),
         Err(PartitionViewError::LeafSetMismatch(_))
     ));
     let mut extra = c.view.clone();
     extra.leaves.push(c.view.leaves[0].clone());
     assert!(matches!(
-        extra.validate_structure(p, t),
+        extra.validate_structure(t),
         Err(PartitionViewError::LeafSetMismatch(_))
     ));
     let mut dup = c.view.clone();
     dup.leaves[1] = dup.leaves[0].clone();
     assert!(matches!(
-        dup.validate_structure(p, t),
+        dup.validate_structure(t),
         Err(PartitionViewError::LeafSetMismatch(_))
     ));
     let mut reordered = c.view.clone();
     reordered.leaves.swap(0, 1);
     assert!(matches!(
-        reordered.validate_structure(p, t),
+        reordered.validate_structure(t),
         Err(PartitionViewError::LeafSetMismatch(_))
     ));
     let mut conf = c.view.clone();
     conf.leaves[2].shard_conf_hash = vec![9; 32];
     assert_eq!(
-        conf.validate_structure(p, t),
+        conf.validate_structure(t),
         Err(PartitionViewError::ConfigHashMismatch)
     );
     // a view of another topology
     let eight = case(8).topology;
     assert!(matches!(
-        c.view.validate_structure(p, &eight),
+        c.view.validate_structure(&eight),
         Err(PartitionViewError::LeafSetMismatch(_))
     ));
     assert!(matches!(
         c.view
-            .validate_structure(p, &PartitionTopology::single_shard()),
+            .validate_structure(&PartitionTopology::single_shard()),
         Err(PartitionViewError::LeafSetMismatch(_))
     ));
 }
@@ -553,13 +567,13 @@ fn every_committed_field_is_bound_to_the_seal() {
     ];
     for n in CASES {
         let c = case(n);
-        assert!(c.view.verify_tree(&c.uc, c.partition, &c.topology).is_ok());
+        assert!(c.view.verify_tree(&c.uc, &c.topology).is_ok());
         // the enclosing UC's own leaf as well as any other leaf
         for leaf in [0, n - 1] {
             for (name, flip) in &flips {
                 let mut v = c.view.clone();
                 flip(&mut v.leaves[leaf]);
-                let err = v.verify_tree(&c.uc, c.partition, &c.topology).unwrap_err();
+                let err = v.verify_tree(&c.uc, &c.topology).unwrap_err();
                 assert!(
                     matches!(
                         err,
@@ -573,7 +587,7 @@ fn every_committed_field_is_bound_to_the_seal() {
         let mut v = c.view.clone();
         v.leaves[n - 1].shard_conf_hash[0] ^= 1;
         assert_eq!(
-            v.verify_tree(&c.uc, c.partition, &c.topology).unwrap_err(),
+            v.verify_tree(&c.uc, &c.topology).unwrap_err(),
             PartitionViewError::ConfigHashMismatch
         );
         // ... and to the seal, when nothing is admitted for that shard
@@ -583,7 +597,7 @@ fn every_committed_field_is_bound_to_the_seal() {
             c.topology.canonical_order().unwrap()
         });
         assert_eq!(
-            v.verify_tree(&c.uc, c.partition, &unadmitted).unwrap_err(),
+            v.verify_tree(&c.uc, &unadmitted).unwrap_err(),
             PartitionViewError::TreeRootMismatch
         );
     }
@@ -592,7 +606,7 @@ fn every_committed_field_is_bound_to_the_seal() {
 #[test]
 fn enclosing_certificate_is_checked() {
     let c = case(4);
-    let go = |uc: &UnicityCertificate| c.view.verify_tree(uc, c.partition, &c.topology);
+    let go = |uc: &UnicityCertificate| c.view.verify_tree(uc, &c.topology);
     assert!(go(&c.uc).is_ok());
 
     let mut other_partition = c.uc.clone();
@@ -645,10 +659,7 @@ fn enclosing_certificate_is_checked() {
 
     // another partition's certificate over the same view
     let n8 = case(8);
-    assert!(c
-        .view
-        .verify_tree(&n8.uc, c.partition, &c.topology)
-        .is_err());
+    assert!(c.view.verify_tree(&n8.uc, &c.topology).is_err());
 }
 
 #[test]
@@ -671,7 +682,7 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     let c = case(4);
     let assemble = |uc: &UnicityCertificate, tb: &RootTrustBase| {
         let mut s = SealSession::new(tb);
-        assemble(&c.view, uc, c.partition, Some(&c.topology), &mut s)
+        assemble(&c.view, uc, Some(&c.topology), &mut s)
     };
     assert!(assemble(&c.uc, &c.trust_base).is_ok());
 
@@ -775,9 +786,10 @@ fn memo_is_bounded_and_can_be_disabled() {
 fn null_summary_leaves_hash_exactly_and_yield_ordinary_certificates() {
     // a leaf whose summary value is null hashes into the tree exactly and, since the ordinary
     // input record preserves nullable fields, carries it into the derived certificate as null
-    let view = minimal_view();
+    let mut view = minimal_view();
+    view.partition_id = unicity_token::AGGREGATION_PARTITION_ID;
     let topo = PartitionTopology::single_shard().with_shard_conf_hash(&ShardId::root(), [2; 32]);
-    assert!(view.build_shard_tree(1, &topo).is_ok());
+    assert!(view.build_shard_tree(&topo).is_ok());
     let ir = view.leaves[0].input_record.to_input_record();
     assert_eq!(ir.summary_value, None);
     assert_eq!(
@@ -882,7 +894,7 @@ fn weighted_authority_is_unsupported_not_a_bad_signature() {
         Err(VerificationError::UnsupportedAuthority)
     );
     assert_eq!(
-        assemble(&c.view, &uc, c.partition, Some(&c.topology), &mut s),
+        assemble(&c.view, &uc, Some(&c.topology), &mut s),
         Err(PartitionViewError::Seal(
             VerificationError::UnsupportedAuthority
         ))
@@ -916,7 +928,7 @@ fn unpinned_authentication_needs_no_peer_configuration() {
         let mut session = SealSession::new(&c.trust_base);
         let view = c
             .view
-            .authenticate(&c.uc, c.partition, None, &mut session)
+            .authenticate(&c.uc, None, &mut session)
             .unwrap_or_else(|e| panic!("{n} shards: {e}"));
         assert_eq!(view.partition_id(), c.partition);
         assert_eq!(view.network_id(), c.trust_base.network_id);
@@ -937,10 +949,7 @@ fn view_identity_binds_authority_partition_pins_and_seal() {
     let c = case(4);
     let id = |tb: &RootTrustBase, uc: &UnicityCertificate, pins: Option<&PartitionTopology>| {
         let mut s = SealSession::new(tb);
-        *c.view
-            .authenticate(uc, c.partition, pins, &mut s)
-            .unwrap()
-            .identity()
+        *c.view.authenticate(uc, pins, &mut s).unwrap().identity()
     };
     let base = id(&c.trust_base, &c.uc, None);
     assert_eq!(base, id(&c.trust_base, &c.uc, None), "deterministic");
@@ -989,20 +998,22 @@ fn view_identity_binds_authority_partition_pins_and_seal() {
 #[test]
 fn candidate_data_is_never_authority() {
     let c = case(4);
-    let go = |view: &PartitionView, uc: &UnicityCertificate, part: u32| {
+    let go = |view: &PartitionView, uc: &UnicityCertificate| {
         let mut s = SealSession::new(&c.trust_base);
-        let r = view.authenticate(uc, part, None, &mut s).map(|_| ());
+        let r = view.authenticate(uc, None, &mut s).map(|_| ());
         (r, s.stats().quorum_checks)
     };
-    // the wrong expected partition
-    let (r, checks) = go(&c.view, &c.uc, c.partition + 1);
+    // a view of another partition than the fixed aggregation partition
+    let mut other = c.view.clone();
+    other.partition_id += 1;
+    let (r, checks) = go(&other, &c.uc);
     assert_eq!(r, Err(PartitionViewError::PartitionMismatch));
     assert_eq!(checks, 0);
 
     // a changed candidate leaf, including its configuration hash, does not hash into the seal
     let mut v = c.view.clone();
     v.leaves[3].shard_conf_hash[0] ^= 1;
-    let (r, checks) = go(&v, &c.uc, c.partition);
+    let (r, checks) = go(&v, &c.uc);
     assert_eq!(r, Err(PartitionViewError::TreeRootMismatch));
     assert_eq!(checks, 0, "no signature work for an unbound view");
 
@@ -1010,20 +1021,20 @@ fn candidate_data_is_never_authority() {
     let mut v = c.view.clone();
     v.leaves.swap(1, 2);
     assert!(matches!(
-        go(&v, &c.uc, c.partition).0,
+        go(&v, &c.uc).0,
         Err(PartitionViewError::LeafSetMismatch(_))
     ));
     let mut v = c.view.clone();
     v.leaves.pop();
-    assert!(go(&v, &c.uc, c.partition).0.is_err());
+    assert!(go(&v, &c.uc).0.is_err());
     let mut v = c.view.clone();
     v.leaves[1] = v.leaves[0].clone();
-    assert!(go(&v, &c.uc, c.partition).0.is_err());
+    assert!(go(&v, &c.uc).0.is_err());
 
     // a perfect view under a seal the anchor does not authenticate yields no object
     let mut bad = c.uc.clone();
     bad.unicity_seal.signatures[0].1[5] ^= 1;
-    let (r, checks) = go(&c.view, &bad, c.partition);
+    let (r, checks) = go(&c.view, &bad);
     assert_eq!(
         r,
         Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
@@ -1036,9 +1047,7 @@ fn pins_are_a_stricter_policy() {
     let c = case(4);
     let go = |pins: &PartitionTopology| {
         let mut s = SealSession::new(&c.trust_base);
-        c.view
-            .authenticate(&c.uc, c.partition, Some(pins), &mut s)
-            .map(|_| ())
+        c.view.authenticate(&c.uc, Some(pins), &mut s).map(|_| ())
     };
     assert!(go(&c.topology).is_ok());
     let order = c.topology.canonical_order().unwrap();
@@ -1066,7 +1075,7 @@ fn pinned_assembly_api_is_preserved() {
     let mut s = SealSession::new(&c.trust_base);
     let ucs: Vec<ShardCertificate> = c
         .view
-        .assemble_certificates(&c.uc, c.partition, &c.topology, &mut s)
+        .assemble_certificates(&c.uc, &c.topology, &mut s)
         .unwrap();
     for (sc, expected) in ucs.iter().zip(&c.expected_ucs) {
         assert_eq!(&sc.certificate.as_ref().unwrap().to_cbor(), expected);
@@ -1076,7 +1085,7 @@ fn pinned_assembly_api_is_preserved() {
     let mut s = SealSession::new(&c.trust_base);
     let err = c
         .view
-        .assemble_certificates(&c.uc, c.partition, &partial, &mut s)
+        .assemble_certificates(&c.uc, &partial, &mut s)
         .unwrap_err();
     assert!(matches!(err, PartitionViewError::ConfigHashRequired));
     assert_eq!(s.stats().quorum_checks, 0);
@@ -1085,8 +1094,7 @@ fn pinned_assembly_api_is_preserved() {
     bad.unicity_seal.signatures[0].1[5] ^= 1;
     let mut s = SealSession::new(&c.trust_base);
     assert_eq!(
-        c.view
-            .assemble_certificates(&bad, c.partition, &c.topology, &mut s),
+        c.view.assemble_certificates(&bad, &c.topology, &mut s),
         Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
     );
 }
@@ -1099,7 +1107,7 @@ fn signature_memo_is_shared_but_policy_rules_are_not() {
     let c = case(4);
     let mut s = SealSession::new(&c.trust_base);
     let auth = |s: &mut SealSession<'_>, pins: Option<&PartitionTopology>| {
-        c.view.authenticate(&c.uc, c.partition, pins, s).unwrap();
+        c.view.authenticate(&c.uc, pins, s).unwrap();
     };
     auth(&mut s, None);
     assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (1, 0));
@@ -1133,10 +1141,7 @@ fn signature_memo_is_shared_but_policy_rules_are_not() {
     for shard in &order {
         wrong = wrong.with_shard_conf_hash(shard, [0xee; 32]);
     }
-    assert!(c
-        .view
-        .authenticate(&c.uc, c.partition, Some(&wrong), &mut s)
-        .is_err());
+    assert!(c.view.authenticate(&c.uc, Some(&wrong), &mut s).is_err());
     // and the strict authority is checked by every call, whatever was verified before
     let mut tb = c.trust_base.clone();
     tb.epoch += 1;
@@ -1166,7 +1171,7 @@ fn custom_authenticators_cannot_mint_identified_views() {
     let mut custom = Delegating(SealSession::new(&c.trust_base));
     let ucs = c
         .view
-        .assemble_certificates(&c.uc, c.partition, &c.topology, &mut custom)
+        .assemble_certificates(&c.uc, &c.topology, &mut custom)
         .unwrap();
     assert_eq!(ucs.len(), 4);
 
@@ -1181,14 +1186,8 @@ fn custom_authenticators_cannot_mint_identified_views() {
         stake: 1,
     });
     let (mut s1, mut s2) = (SealSession::new(&c.trust_base), SealSession::new(&other));
-    let v1 = c
-        .view
-        .authenticate(&c.uc, c.partition, None, &mut s1)
-        .unwrap();
-    let v2 = c
-        .view
-        .authenticate(&c.uc, c.partition, None, &mut s2)
-        .unwrap();
+    let v1 = c.view.authenticate(&c.uc, None, &mut s1).unwrap();
+    let v2 = c.view.authenticate(&c.uc, None, &mut s2).unwrap();
     assert_ne!(v1.identity(), v2.identity(), "authority separation");
 }
 
@@ -1197,10 +1196,7 @@ fn lazy_certificate_equals_the_eager_one_and_unknown_shards_are_refused() {
     for n in CASES {
         let c = case(n);
         let mut s = SealSession::new(&c.trust_base);
-        let view = c
-            .view
-            .authenticate(&c.uc, c.partition, None, &mut s)
-            .unwrap();
+        let view = c.view.authenticate(&c.uc, None, &mut s).unwrap();
         let all = view.certificates().unwrap();
         assert_eq!(all.len(), n);
         for sc in &all {
