@@ -301,7 +301,7 @@ impl Sim {
         let uc = |s: usize| {
             let leaf = &view.leaves[s];
             UnicityCertificate {
-                input_record: leaf.input_record.to_input_record().unwrap(),
+                input_record: leaf.input_record.to_input_record(),
                 technical_record_hash: Some(leaf.tr_hash.clone()),
                 shard_configuration_hash: leaf.shard_conf_hash.clone(),
                 shard_tree_certificate: tree.certificate(&leaf.shard_id).unwrap(),
@@ -1119,14 +1119,25 @@ fn admission_work_is_linear_in_the_input_and_oversize_is_refused_first() {
         );
     }
 
-    // beyond what 8 endpoints could ever carry: refused before any per-item work
+    // beyond what 8 endpoints could ever carry: refused as soon as the distinct count exceeds it
     let items = synthetic_items(8 * MAX_BATCH_STATE_IDS + 1);
     let mut work = AdmissionWork::default();
     assert!(matches!(
         c.group(&items, &budget, &mut work),
         Err(Stop::Error(ConsolidationError::TooManyStates { .. }))
     ));
-    assert_eq!(work, AdmissionWork::default());
+    assert!(work.steps <= items.len() as u64);
+
+    // duplicates are sent once, so they do not count against the cap
+    let one = synthetic_items(1).remove(0);
+    let copies = vec![one; 8 * MAX_BATCH_STATE_IDS + 5];
+    let mut work = AdmissionWork::default();
+    let (groups, first_of, _) = c
+        .group(&copies, &budget, &mut work)
+        .unwrap_or_else(|_| panic!("one distinct state fits"));
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].ids.len(), 1);
+    assert!(first_of.iter().all(|&f| f == 0));
 
     // a single shard over its limit is refused as soon as it is exceeded
     let one_shard: Vec<ProofItem> = synthetic_items(4_000)
@@ -1419,7 +1430,7 @@ fn memoized_verification_equals_the_reference_on_tampered_tokens() {
         ),
         (
             "ir hash",
-            Box::new(|p| p[3].unicity_certificate.input_record.hash[0] ^= 1),
+            Box::new(|p| p[3].unicity_certificate.input_record.hash.as_mut().unwrap()[0] ^= 1),
         ),
         (
             "swap certificates",
@@ -1837,7 +1848,8 @@ fn the_direct_target_never_falls_back_or_downgrades() {
     ));
 
     // forged material: a changed root, a tampered signature
-    let (_, _, out) = unsharded(|b| each_certificate(b, |uc| uc.input_record.hash[0] ^= 1));
+    let (_, _, out) =
+        unsharded(|b| each_certificate(b, |uc| uc.input_record.hash.as_mut().unwrap()[0] ^= 1));
     assert!(
         matches!(
             out,
@@ -1973,4 +1985,82 @@ fn direct_replacements_share_the_session_memo() {
         distinct_seals(items.iter().map(|i| &i.proof)) as u64 + 1
     );
     assert_eq!(distinct_seals(bundle.proofs.iter()), 1);
+}
+
+/// A cancelled or already-expired attempt returns at once; it does not verify the input token
+/// first (an invalid token must not turn into `InvalidToken` either).
+#[test]
+fn a_cancelled_or_expired_call_does_not_verify_the_input_token_first() {
+    let (sim, token) = spread_token(2);
+    let c = client(&sim, false);
+    let mut proofs: Vec<_> = outer_proofs(&token)
+        .iter()
+        .map(|o| o.proof.clone())
+        .collect();
+    proofs[0]
+        .unicity_certificate
+        .unicity_seal
+        .signatures
+        .clear();
+    let bad = rebuild_token(&token, proofs).unwrap();
+    assert!(matches!(
+        c.consolidate(&bad, &quick()),
+        Err(ConsolidationError::InvalidToken(_))
+    ));
+    for t in [&token, &bad] {
+        let options = quick();
+        options.cancel.cancel();
+        assert!(matches!(
+            c.consolidate(t, &options),
+            Err(ConsolidationError::Cancelled)
+        ));
+        let options = ConsolidateOptions {
+            timeout_ms: 0,
+            ..quick()
+        };
+        assert!(matches!(
+            c.consolidate(t, &options),
+            Err(ConsolidationError::Timeout)
+        ));
+    }
+}
+
+/// An executor that loses results must produce an error, not a panic.
+struct ShortExecutor;
+
+impl WaveExecutor for ShortExecutor {
+    fn run<I: Sync, T: Send>(&self, inputs: &[I], job: &(dyn Fn(&I) -> T + Sync)) -> Vec<T> {
+        inputs.iter().skip(1).map(job).collect()
+    }
+}
+
+#[test]
+fn a_wave_executor_returning_fewer_results_than_jobs_is_an_error() {
+    let (sim, token) = spread_token(2);
+    let tb = sim.lock().unwrap().trust_base.clone();
+    let c = ProofClient::new(
+        ProofClientConfig {
+            partition_id: PARTITION,
+            topology: topology(false),
+        },
+        (0..2)
+            .map(|i| {
+                (
+                    shard_ids()[i].clone(),
+                    Node {
+                        sim: sim.clone(),
+                        shard: i,
+                    },
+                )
+            })
+            .collect(),
+        tb,
+        SystemClock::new(),
+        ShortExecutor,
+    )
+    .unwrap();
+    assert!(matches!(
+        c.consolidate(&token, &quick()),
+        Err(ConsolidationError::Configuration(_))
+    ));
 }

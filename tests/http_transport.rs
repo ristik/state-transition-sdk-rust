@@ -1093,10 +1093,7 @@ fn submit_and_wait_refuses_a_proof_of_another_request() {
     ] {
         let server = MockServer::start(vec![first_reply, proof_of_data.clone()]);
         let err = client(&server.url).submit_and_wait(&other, 1).unwrap_err();
-        assert!(
-            matches!(err, HttpError::StateCertifiedWithOtherData),
-            "{name}: {err}"
-        );
+        assert!(matches!(err, HttpError::ProofOfOtherData), "{name}: {err}");
         assert_eq!(
             server.request_count(),
             2,
@@ -1128,7 +1125,7 @@ fn submit_and_wait_refuses_a_proof_of_another_request() {
             MockServer::start(vec![status_reply("STATE_ID_EXISTS"), proof_of_data.clone()]);
         assert!(matches!(
             client(&server.url).submit_and_wait(&variant, 0),
-            Err(HttpError::StateCertifiedWithOtherData)
+            Err(HttpError::ProofOfOtherData)
         ));
     }
 
@@ -1146,7 +1143,7 @@ fn submit_and_wait_refuses_a_proof_of_another_request() {
     ]);
     assert!(matches!(
         client(&server.url).submit_and_wait(&other, 1),
-        Err(HttpError::StateCertifiedWithOtherData)
+        Err(HttpError::ProofOfOtherData)
     ));
     assert_eq!(server.request_count(), 6);
 }

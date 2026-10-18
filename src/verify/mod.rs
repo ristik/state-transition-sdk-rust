@@ -323,11 +323,15 @@ pub fn verify_membership_under(
         }
     }
 
-    let expected_root = DataHash::new(
-        HashAlgorithm::Sha256,
-        proof.unicity_certificate.input_record.hash.clone(),
-    )
-    .map_err(|_| VerificationError::PathInvalid)?;
+    // An inclusion proof needs a real 32-byte root: the empty tree (null) contains nothing.
+    let root = proof
+        .unicity_certificate
+        .input_record
+        .root_hash()
+        .map_err(|_| VerificationError::PathInvalid)?
+        .ok_or(VerificationError::PathInvalid)?;
+    let expected_root = DataHash::new(HashAlgorithm::Sha256, root.to_vec())
+        .map_err(|_| VerificationError::PathInvalid)?;
     if proof.reference_time != reference_time {
         return Err(VerificationError::ReferenceTimeMismatch);
     }
@@ -398,13 +402,18 @@ pub fn verify_non_inclusion_proof(
     seals.ensure_trust_base()?;
 
     let uc = proof.unicity_certificate();
-    let expected_root = match uc.input_record.hash.as_slice() {
-        [] => None,
-        bytes if bytes.len() == 32 => Some(
+    // Only an authenticated native `null` is the empty tree. An empty byte string (`40`), the
+    // all-zero hash and any other length are not: they are rejected, never mapped to "empty".
+    let expected_root = match uc
+        .input_record
+        .root_hash()
+        .map_err(|_| VerificationError::NonInclusionCertificateInvalid)?
+    {
+        None => None,
+        Some(bytes) => Some(
             DataHash::new(HashAlgorithm::Sha256, bytes.to_vec())
                 .map_err(|_| VerificationError::NonInclusionCertificateInvalid)?,
         ),
-        _ => return Err(VerificationError::NonInclusionCertificateInvalid),
     };
 
     if !proof
@@ -578,17 +587,26 @@ mod tests {
 
     /// A unicity certificate committing to `root`, signed by `node`.
     fn signed_uc(node: &Secp256k1Signer, root: [u8; 32]) -> UnicityCertificate {
-        let input_record = InputRecord {
-            round_number: 0,
-            epoch: 0,
-            previous_hash: None,
-            hash: root.to_vec(),
-            summary_value: Vec::new(),
-            timestamp: REFERENCE_TIME,
-            block_hash: None,
-            sum_of_earned_fees: 0,
-            executed_transactions_hash: None,
-        };
+        signed_uc_with(
+            node,
+            InputRecord {
+                round_number: 0,
+                epoch: 0,
+                previous_hash: None,
+                hash: Some(root.to_vec()),
+                summary_value: Some(Vec::new()),
+                timestamp: REFERENCE_TIME,
+                block_hash: None,
+                sum_of_earned_fees: 0,
+                executed_transactions_hash: None,
+            },
+        )
+    }
+
+    /// A unicity certificate carrying exactly `input_record`, independently signed by `node`
+    /// (the signature covers the record as given, so a rejection is never caused by a broken
+    /// signature).
+    fn signed_uc_with(node: &Secp256k1Signer, input_record: InputRecord) -> UnicityCertificate {
         let mut uc = UnicityCertificate {
             input_record,
             technical_record_hash: None,
@@ -703,6 +721,75 @@ mod tests {
         );
     }
 
+    // --- inclusion-path shard binding ---------------------------------------
+
+    /// A certificate the root signed for a shard that does not own the state id must not verify
+    /// after it is relabelled to a longer label that does (same seal and siblings, no new signature).
+    #[test]
+    fn relabel_without_resealing() {
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        let sid = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        let bit = |i: usize| (sid.bytes()[i / 8] >> (7 - (i % 8))) & 1;
+        let b0 = bit(0);
+        let l = (2..64).find(|&l| bit(l - 1) != b0).unwrap(); // last label bit != first state-id bit
+        let child = |s: &ShardId, b: u8| {
+            let (z, o) = s.split();
+            if b == 0 {
+                z
+            } else {
+                o
+            }
+        };
+        let real = child(&ShardId::root(), 1 - b0); // 1-bit shard that does NOT own sid
+        let mut forged = ShardId::root();
+        for i in 0..l {
+            forged = child(&forged, bit(i)); // l-bit prefix of sid
+        }
+        let uc = &mut proof.unicity_certificate;
+        uc.input_record.block_hash = Some(alloc::vec![5; 32]);
+        uc.technical_record_hash = Some(alloc::vec![6; 32]);
+        uc.shard_tree_certificate.shard = real;
+        uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
+        reseal(&mut proof, &node); // the root certifies shard `real`
+        assert_eq!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+            Err(VerificationError::ShardMismatch)
+        );
+        proof.unicity_certificate.shard_tree_certificate.shard = forged; // no re-signing
+        assert!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME).is_err(),
+            "a relabelled shard with a different sibling count must not verify"
+        );
+    }
+
+    // --- authenticating a proof of other data ------------------------------
+
+    /// `submit_and_wait_verified` believes "another request won the race" only for a proof
+    /// that verifies under the trust base.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_proof_of_other_data_is_believed_only_when_it_verifies() {
+        use crate::client::{conflict_error, HttpError};
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        let sid = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        assert!(matches!(
+            conflict_error(&proof, &sid, &tb),
+            HttpError::StateCertifiedWithOtherData
+        ));
+        // a seal signed by an untrusted key is only an unauthenticated hint
+        assert!(matches!(
+            conflict_error(&proof, &sid, &trust_base(&signer(0x99))),
+            HttpError::ProofOfOtherData
+        ));
+        // so is a certificate whose seal does not cover the contents
+        proof.unicity_certificate.input_record.block_hash = Some(alloc::vec![1; 32]);
+        assert!(matches!(
+            conflict_error(&proof, &sid, &tb),
+            HttpError::ProofOfOtherData
+        ));
+        let _ = node;
+    }
+
     // --- non-inclusion proof rules ----------------------------------------
 
     #[test]
@@ -784,6 +871,7 @@ mod tests {
         // One-bit shard `0`: the target belongs to it, but the authenticated
         // terminal starts with `1` and therefore cannot belong to this root.
         uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
+        uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
         let seal_hash = uc.computed_seal_hash().unwrap().data().to_vec();
         let signature = node
             .sign(&mk_seal(seal_hash.clone(), Vec::new()).calculate_hash())
@@ -949,7 +1037,7 @@ mod tests {
     fn rule_path_invalid() {
         let (tb, node, _o, transfer, mut proof) = transfer_case();
         // Point the inclusion proof at a different state-tree root.
-        proof.unicity_certificate.input_record.hash = alloc::vec![0xCDu8; 32];
+        proof.unicity_certificate.input_record.hash = Some(alloc::vec![0xCDu8; 32]);
         reseal(&mut proof, &node); // keep the seal consistent so PATH fails first
         assert_eq!(
             verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),

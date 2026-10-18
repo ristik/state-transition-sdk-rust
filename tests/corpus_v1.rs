@@ -168,7 +168,6 @@ const POSITIVE: [&str; 6] = [
 
 #[test]
 fn positive_cases_assemble_the_reference_certificates() {
-    let mut skipped = 0;
     for dir in POSITIVE {
         let c = case(dir);
         let tb = trust_base(&format!("{dir}/trust-base.cbor"));
@@ -198,33 +197,17 @@ fn positive_cases_assemble_the_reference_certificates() {
         .unwrap_or_else(|e| panic!("{dir}: {e}"));
         assert_eq!(ucs.len(), expected.len(), "{dir}");
         for (got, want) in ucs.iter().zip(&expected) {
-            match &got.certificate {
-                Some(uc) => assert_eq!(
-                    &uc.to_cbor(),
-                    want,
-                    "{dir}: certificate equals the reference's"
-                ),
-                None => {
-                    // a shard that never certified a state (all-null input record) has no
-                    // ordinary Rust certificate; its path and the master parts must still
-                    // be exactly the reference's
-                    let tail = [
-                        enclosing.unicity_tree_certificate.to_cbor(),
-                        enclosing.unicity_seal.to_cbor(),
-                    ]
-                    .concat();
-                    assert!(
-                        want.ends_with(&tail),
-                        "{dir}: partition path and master seal"
-                    );
-                    let path = got.shard_tree_certificate.to_cbor();
-                    assert!(
-                        want.windows(path.len()).any(|w| w == path.as_slice()),
-                        "{dir}: shard path"
-                    );
-                    skipped += 1;
-                }
-            }
+            // every shard, including one that never certified a state (all-null input record),
+            // has an ordinary certificate byte-identical to the reference's
+            let uc = got
+                .certificate
+                .as_ref()
+                .unwrap_or_else(|| panic!("{dir}: certificate present"));
+            assert_eq!(
+                &uc.to_cbor(),
+                want,
+                "{dir}: certificate equals the reference's"
+            );
         }
         assert_eq!(
             session.stats().quorum_checks,
@@ -232,10 +215,6 @@ fn positive_cases_assemble_the_reference_certificates() {
             "{dir}: one master quorum check"
         );
     }
-    assert!(
-        skipped > 0,
-        "the corpus exercises shards without a certified state"
-    );
 }
 
 fn base_of(neg: &str) -> String {

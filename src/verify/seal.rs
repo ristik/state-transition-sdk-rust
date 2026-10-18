@@ -272,7 +272,7 @@ fn uc_fingerprint(uc: &UnicityCertificate, policy: &[u8; 32]) -> u64 {
     eat(&policy[..8]);
     eat(&uc.unicity_seal.hash);
     eat(&uc.shard_tree_certificate.shard.encode());
-    eat(&uc.input_record.hash);
+    eat(uc.input_record.hash.as_deref().unwrap_or(&[]));
     eat(&uc.input_record.round_number.to_be_bytes());
     eat(&uc.unicity_seal.root_chain_round_number.to_be_bytes());
     h

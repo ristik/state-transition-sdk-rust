@@ -72,8 +72,8 @@ impl PartitionViewInputRecord {
             round_number: ir.round_number,
             epoch: ir.epoch,
             previous_hash: ir.previous_hash.clone(),
-            hash: Some(ir.hash.clone()),
-            summary_value: Some(ir.summary_value.clone()),
+            hash: ir.hash.clone(),
+            summary_value: ir.summary_value.clone(),
             timestamp: ir.timestamp,
             block_hash: ir.block_hash.clone(),
             sum_of_earned_fees: ir.sum_of_earned_fees,
@@ -81,20 +81,19 @@ impl PartitionViewInputRecord {
         }
     }
 
-    /// The ordinary input record, or `None` if the state hash or summary value
-    /// is absent (such a record can not be an ordinary certificate's record).
-    pub fn to_input_record(&self) -> Option<InputRecord> {
-        Some(InputRecord {
+    /// The ordinary input record (every nullable field is preserved as such).
+    pub fn to_input_record(&self) -> InputRecord {
+        InputRecord {
             round_number: self.round_number,
             epoch: self.epoch,
             previous_hash: self.previous_hash.clone(),
-            hash: self.hash.clone()?,
-            summary_value: self.summary_value.clone()?,
+            hash: self.hash.clone(),
+            summary_value: self.summary_value.clone(),
             timestamp: self.timestamp,
             block_hash: self.block_hash.clone(),
             sum_of_earned_fees: self.sum_of_earned_fees,
             executed_transactions_hash: self.executed_transactions_hash.clone(),
-        })
+        }
     }
 
     fn from_cbor(d: Decoder<'_>) -> Result<Self, PartitionViewError> {

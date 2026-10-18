@@ -772,13 +772,18 @@ fn memo_is_bounded_and_can_be_disabled() {
 }
 
 #[test]
-fn unrepresentable_input_records_still_hash_but_have_no_ordinary_certificate() {
-    // a leaf whose summary value is null hashes into the tree exactly, but no
-    // ordinary certificate can carry it (assembly yields `certificate: None`)
+fn null_summary_leaves_hash_exactly_and_yield_ordinary_certificates() {
+    // a leaf whose summary value is null hashes into the tree exactly and, since the ordinary
+    // input record preserves nullable fields, carries it into the derived certificate as null
     let view = minimal_view();
     let topo = PartitionTopology::single_shard().with_shard_conf_hash(&ShardId::root(), [2; 32]);
     assert!(view.build_shard_tree(1, &topo).is_ok());
-    assert!(view.leaves[0].input_record.to_input_record().is_none());
+    let ir = view.leaves[0].input_record.to_input_record();
+    assert_eq!(ir.summary_value, None);
+    assert_eq!(
+        PartitionViewInputRecord::from_input_record(&ir),
+        view.leaves[0].input_record
+    );
 }
 
 fn node(id: &str, key: &str, stake: u64) -> RootTrustBaseNodeInfo {
