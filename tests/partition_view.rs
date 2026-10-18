@@ -86,7 +86,7 @@ fn case(n: usize) -> Case {
             include_str!(
                 "vectors/uc-consolidation/partition-view/v1/derived/shards-1/trust-base.json"
             ),
-            vector!("derived/shards-1/view.cbor"),
+            &vector!("derived/shards-1/view.cbor")[..],
             vector!("derived/shards-1/enclosing-uc.cbor"),
             vec![vector!("derived/shards-1/ucs/00.cbor")],
         ),
@@ -97,7 +97,7 @@ fn case(n: usize) -> Case {
             include_str!(
                 "vectors/uc-consolidation/partition-view/v1/derived/shards-4/trust-base.json"
             ),
-            vector!("derived/shards-4/view.cbor"),
+            &vector!("derived/shards-4/view.cbor")[..],
             vector!("derived/shards-4/enclosing-uc.cbor"),
             vec![
                 vector!("derived/shards-4/ucs/00.cbor"),
@@ -113,7 +113,7 @@ fn case(n: usize) -> Case {
             include_str!(
                 "vectors/uc-consolidation/partition-view/v1/derived/shards-8/trust-base.json"
             ),
-            vector!("derived/shards-8/view.cbor"),
+            &vector!("derived/shards-8/view.cbor")[..],
             vector!("derived/shards-8/enclosing-uc.cbor"),
             vec![
                 vector!("derived/shards-8/ucs/00.cbor"),
@@ -192,9 +192,9 @@ const CASES: [usize; 3] = [1, 4, 8];
 #[test]
 fn golden_files_match_manifest_and_roundtrip_byte_for_byte() {
     let golden: [(usize, &[u8]); 3] = [
-        (1, vector!("golden/shards-1.cbor")),
-        (4, vector!("golden/shards-4.cbor")),
-        (8, vector!("golden/shards-8.cbor")),
+        (1, &vector!("golden/shards-1.cbor")[..]),
+        (4, &vector!("golden/shards-4.cbor")[..]),
+        (8, &vector!("golden/shards-8.cbor")[..]),
     ];
     for (n, bytes) in golden {
         let name = format!("shards-{n}.cbor");
@@ -218,20 +218,35 @@ fn golden_files_match_manifest_and_roundtrip_byte_for_byte() {
     }
 }
 
+/// The golden files are the frozen codec bytes of a test partition (0x0a0b0c0d); the derived
+/// vectors are the same views certified under the fixed aggregation partition. They must be the
+/// same bytes except for the partition id.
 #[test]
-fn derived_views_equal_the_frozen_golden_files() {
-    assert_eq!(
-        vector!("derived/shards-1/view.cbor"),
-        vector!("golden/shards-1.cbor")
-    );
-    assert_eq!(
-        vector!("derived/shards-4/view.cbor"),
-        vector!("golden/shards-4.cbor")
-    );
-    assert_eq!(
-        vector!("derived/shards-8/view.cbor"),
-        vector!("golden/shards-8.cbor")
-    );
+fn derived_views_equal_the_frozen_golden_files_except_the_partition() {
+    for (derived, golden) in [
+        (
+            &vector!("derived/shards-1/view.cbor")[..],
+            &vector!("golden/shards-1.cbor")[..],
+        ),
+        (
+            &vector!("derived/shards-4/view.cbor")[..],
+            &vector!("golden/shards-4.cbor")[..],
+        ),
+        (
+            &vector!("derived/shards-8/view.cbor")[..],
+            &vector!("golden/shards-8.cbor")[..],
+        ),
+    ] {
+        let derived = PartitionView::from_cbor(derived).unwrap();
+        let mut golden = PartitionView::from_cbor(golden).unwrap();
+        assert_eq!(
+            derived.partition_id,
+            unicity_token::AGGREGATION_PARTITION_ID
+        );
+        assert_ne!(golden.partition_id, derived.partition_id);
+        golden.partition_id = derived.partition_id;
+        assert_eq!(derived, golden);
+    }
 }
 
 fn minimal_view() -> PartitionView {
@@ -288,7 +303,7 @@ fn nil_and_empty_stay_distinct() {
 
 #[test]
 fn strict_decode_rejections() {
-    let good = vector!("golden/shards-4.cbor").to_vec();
+    let good = &vector!("golden/shards-4.cbor")[..].to_vec();
     assert!(PartitionView::from_cbor(&good).is_ok());
     let reject = |name: &str, bytes: Vec<u8>| {
         assert!(
@@ -771,7 +786,8 @@ fn memo_is_bounded_and_can_be_disabled() {
 fn null_summary_leaves_hash_exactly_and_yield_ordinary_certificates() {
     // a leaf whose summary value is null hashes into the tree exactly and, since the ordinary
     // input record preserves nullable fields, carries it into the derived certificate as null
-    let view = minimal_view();
+    let mut view = minimal_view();
+    view.partition_id = unicity_token::AGGREGATION_PARTITION_ID;
     let topo = PartitionTopology::single_shard().with_shard_conf_hash(&ShardId::root(), [2; 32]);
     assert!(view.build_shard_tree(&topo).is_ok());
     let ir = view.leaves[0].input_record.to_input_record();

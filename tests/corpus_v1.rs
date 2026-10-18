@@ -112,6 +112,7 @@ fn trust_base(path: &str) -> RootTrustBase {
 }
 
 struct Case {
+    #[allow(dead_code)]
     partition: u32,
     shards: Vec<String>,
     topology: PartitionTopology,
@@ -133,6 +134,11 @@ fn case(dir: &str) -> Case {
     for (id, h) in ids.iter().zip(hashes) {
         topology = topology.with_shard_conf_hash(id, h);
     }
+    // the corpus certifies the fixed aggregation partition
+    assert_eq!(
+        number(&context, "partitionId"),
+        u64::from(unicity_token::AGGREGATION_PARTITION_ID)
+    );
     Case {
         partition: number(&context, "partitionId") as u32,
         shards,

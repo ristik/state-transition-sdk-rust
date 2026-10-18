@@ -196,6 +196,7 @@ impl Shard {
 struct Case {
     dir: &'static str,
     topology: PartitionTopology,
+    #[allow(dead_code)]
     partition: u32,
     trust_base: RootTrustBase,
     items: Vec<ProofItem>,
@@ -249,6 +250,10 @@ fn load(dir: &'static str) -> Case {
         })
         .collect();
 
+    assert_eq!(
+        context["partitionId"].as_u64().unwrap(),
+        u64::from(unicity_token::AGGREGATION_PARTITION_ID)
+    );
     Case {
         dir,
         topology,
