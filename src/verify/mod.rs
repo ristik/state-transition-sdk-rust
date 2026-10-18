@@ -1736,9 +1736,9 @@ mod tests {
         let node = signer(0x11);
         let tb = trust_base(&node);
         // one-bit shard "0" (the target 0x44.. and terminal 0x22.. both start with 0) but no sibling
+        // (its root can not even be recomputed, so the seal is left as it was)
         let missing = ni_proof(&node, |uc| {
             uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
-            resign(uc, &node, |_| {});
         });
         assert_eq!(
             verify_ni(&tb, &missing),
