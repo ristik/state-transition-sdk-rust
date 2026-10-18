@@ -44,7 +44,10 @@ code had drifted together. Pin the checkout to a tag.
 Every application fixture certifies partition 7 (`AGGREGATION_PARTITION_ID`). The JS
 generator's fixture helper (`tests/utils/UnicityCertificateFixture.ts`) uses partition 0
 at v3.0.1, so the vector is generated with its `partitionIdentifier` changed to `7n` (a
-one-line edit of the helper; the JS SDK's own change lands with its fixed-partition PR).
+edit of the helper; the JS SDK's own change lands with its fixed-partition PR). The same edit makes the
+fixture UC satisfy Go's `UnicityCertificate.IsValid` (32-byte technical record hash, non-empty block
+hash for the changed state hash, seal round 1 with a timestamp): apply
+`jsv3.0.1-valid-uc-fixture.patch` to the v3.0.1 checkout before running the generator.
 `transition_flow_partition0.json` is the previous vector: validly signed by the same key but
 certifying partition 0. It is a negative fixture only: every token in it must be rejected
 with `PartitionMismatch`. Never regenerate it.

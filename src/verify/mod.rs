@@ -374,6 +374,12 @@ fn verify_unicity_certificate(
     seals.note_body_check();
     let seal = &uc.unicity_seal;
 
+    // Go's UnicityCertificate.IsValid structure, before any hashing or signature work: the
+    // input record's conditional rules, the technical record hash and the seal's shape.
+    uc.check_body()
+        .map_err(|_| VerificationError::CertificateBodyInvalid)?;
+    check_seal_shape(seal)?;
+
     if seal.network_id != seals.trust_base().network_id {
         return Err(VerificationError::SealNetworkMismatch);
     }
@@ -547,7 +553,7 @@ mod tests {
     fn mk_seal(hash: Vec<u8>, signatures: Vec<(String, Vec<u8>)>) -> UnicitySeal {
         UnicitySeal {
             network_id: NetworkId::LOCAL,
-            root_chain_round_number: 0,
+            root_chain_round_number: 1,
             epoch: 0,
             timestamp: REFERENCE_TIME,
             previous_hash: None,
@@ -600,7 +606,7 @@ mod tests {
                 hash: Some(root.to_vec()),
                 summary_value: Some(Vec::new()),
                 timestamp: REFERENCE_TIME,
-                block_hash: None,
+                block_hash: Some(alloc::vec![5; 32]),
                 sum_of_earned_fees: 0,
                 executed_transactions_hash: None,
             },
@@ -613,7 +619,7 @@ mod tests {
     fn signed_uc_with(node: &Secp256k1Signer, input_record: InputRecord) -> UnicityCertificate {
         let mut uc = UnicityCertificate {
             input_record,
-            technical_record_hash: None,
+            technical_record_hash: Some(alloc::vec![6; 32]),
             shard_configuration_hash: alloc::vec![0u8; 32],
             shard_tree_certificate: ShardTreeCertificate {
                 shard: empty_shard(),
@@ -1160,13 +1166,112 @@ mod tests {
     }
 
     #[test]
-    fn rule_quorum_not_met_without_signatures() {
+    fn rule_seal_without_signatures_is_malformed_before_any_quorum_work() {
         let (tb, _n, _o, transfer, mut proof) = transfer_case();
         proof.unicity_certificate.unicity_seal.signatures = Vec::new();
         assert_eq!(
             verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
-            Err(VerificationError::QuorumNotMet)
+            Err(VerificationError::SealMalformed)
         );
+    }
+
+    /// Go's `UnicityCertificate.IsValid` on the ordinary path, with its conditional semantics.
+    /// Every certificate here is validly signed by the trusted key (re-sealed after the change),
+    /// so only the structural rule can fire, and a rejection is a typed error, never a panic.
+    #[test]
+    fn go_is_valid_rules_on_the_ordinary_path() {
+        let (tb, node, _o, transfer, base) = transfer_case();
+        let check = |change: &dyn Fn(&mut UnicityCertificate)| {
+            let mut proof = base.clone();
+            change(&mut proof.unicity_certificate);
+            reseal(&mut proof, &node);
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME)
+        };
+        assert_eq!(check(&|_| {}), Ok(()));
+        let body = Err(VerificationError::CertificateBodyInvalid);
+        // round != 0: summary value present and timestamp assigned
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.round_number = 1;
+                uc.input_record.summary_value = None;
+            }),
+            body
+        );
+        // an unassigned timestamp: the inclusion path's reference-time rule fires first, so the
+        // structural rule is asserted on the shared helper itself
+        let mut uc = base.unicity_certificate.clone();
+        uc.input_record.round_number = 1;
+        uc.input_record.timestamp = 0;
+        assert!(uc.check_body().is_err());
+        // ... but a null summary value is legal at round 0
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.round_number = 0;
+                uc.input_record.summary_value = None;
+            }),
+            Ok(())
+        );
+        // unchanged state hash => empty block hash; changed => non-empty
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.previous_hash = uc.input_record.hash.clone();
+            }),
+            body
+        );
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.previous_hash = uc.input_record.hash.clone();
+                uc.input_record.block_hash = None;
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.previous_hash = uc.input_record.hash.clone();
+                uc.input_record.block_hash = Some(Vec::new());
+            }),
+            Ok(()),
+            "empty and null block hash are the same for Go"
+        );
+        assert_eq!(check(&|uc| uc.input_record.block_hash = None), body);
+        // technical record hash: exactly 32 bytes
+        assert_eq!(check(&|uc| uc.technical_record_hash = None), body);
+        assert_eq!(
+            check(&|uc| uc.technical_record_hash = Some(alloc::vec![6; 31])),
+            body
+        );
+        // seal shape
+        let malformed = Err(VerificationError::SealMalformed);
+        // (the shape rules run before the signature work, so the seal is changed in place)
+        for change in [
+            (|s: &mut UnicitySeal| s.root_chain_round_number = 0) as fn(&mut UnicitySeal),
+            |s| s.timestamp = 0,
+        ] {
+            let mut proof = base.clone();
+            change(&mut proof.unicity_certificate.unicity_seal);
+            assert_eq!(
+                verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+                malformed
+            );
+        }
+    }
+
+    #[test]
+    fn seal_signature_entries_must_not_be_empty() {
+        let (tb, _n, _o, transfer, base) = transfer_case();
+        for tamper in [0, 1] {
+            let mut proof = base.clone();
+            let sigs = &mut proof.unicity_certificate.unicity_seal.signatures;
+            if tamper == 0 {
+                sigs[0].0 = String::new();
+            } else {
+                sigs[0].1 = Vec::new();
+            }
+            assert_eq!(
+                verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+                Err(VerificationError::SealMalformed)
+            );
+        }
     }
 
     #[test]

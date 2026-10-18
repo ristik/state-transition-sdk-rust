@@ -82,6 +82,9 @@ pub enum VerificationError {
     ShardMismatch,
     /// The unicity seal's network id does not match the trust base.
     SealNetworkMismatch,
+    /// The certificate body violates bft-go-base's `IsValid` rules (input record or
+    /// technical record hash).
+    CertificateBodyInvalid,
     /// The certificate is of a partition other than
     /// [`AGGREGATION_PARTITION_ID`](crate::api::AGGREGATION_PARTITION_ID).
     PartitionMismatch,
@@ -218,6 +221,12 @@ impl fmt::Display for VerificationError {
             VerificationError::ShardMismatch => write!(f, "shard does not contain state id"),
             VerificationError::SealNetworkMismatch => {
                 write!(f, "unicity seal network does not match trust base")
+            }
+            VerificationError::CertificateBodyInvalid => {
+                write!(
+                    f,
+                    "certificate body violates the unicity certificate validity rules"
+                )
             }
             VerificationError::PartitionMismatch => {
                 write!(
