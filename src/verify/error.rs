@@ -91,6 +91,9 @@ pub enum VerificationError {
     SealBeforeEpochStart,
     /// The unicity seal is structurally unusable (no signatures, zero round, ...).
     SealMalformed,
+    /// The certificate body violates bft-go-base's `IsValid` rules (input record or
+    /// technical record hash).
+    CertificateBodyInvalid,
     /// The certificate is of another partition than the verification context expects.
     PartitionMismatch,
     /// The shard tree path of the certificate is malformed (its length differs
@@ -223,6 +226,12 @@ impl fmt::Display for VerificationError {
             }
             VerificationError::StateIncluded => {
                 write!(f, "state is included at the certified root")
+            }
+            VerificationError::CertificateBodyInvalid => {
+                write!(
+                    f,
+                    "certificate body violates the unicity certificate validity rules"
+                )
             }
             VerificationError::ShardMismatch => write!(f, "shard does not contain state id"),
             VerificationError::SealNetworkMismatch => {
