@@ -304,7 +304,7 @@ fn nil_and_empty_stay_distinct() {
 #[test]
 fn strict_decode_rejections() {
     let good = &vector!("golden/shards-4.cbor")[..].to_vec();
-    assert!(PartitionView::from_cbor(&good).is_ok());
+    assert!(PartitionView::from_cbor(good).is_ok());
     let reject = |name: &str, bytes: Vec<u8>| {
         assert!(
             PartitionView::from_cbor(&bytes).is_err(),
@@ -357,7 +357,7 @@ fn strict_decode_rejections() {
         vec![0x83, 0x01, 0x01, 0x9b, 0, 0, 0, 1, 0, 0, 0, 0],
     );
     let mut tagged = vec![0xd9, 0x9a, 0x5a];
-    tagged.extend_from_slice(&good);
+    tagged.extend_from_slice(good);
     reject("tagged view", tagged);
 }
 
