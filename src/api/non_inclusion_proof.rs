@@ -7,7 +7,7 @@ use super::bft::{RootTrustBase, UnicityCertificate};
 use super::{NonInclusionCertificate, StateId};
 use crate::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
 use crate::error::Error;
-use crate::verify::{self, NonInclusionContext, VerificationError};
+use crate::verify::{self, NonInclusionContext, NonInclusionOutcome, VerificationError};
 
 /// CBOR tag for [`NonInclusionProof`].
 pub const NON_INCLUSION_PROOF_TAG: u64 = 39034;
@@ -16,9 +16,14 @@ const VERSION: u64 = 1;
 /// Proof that a state id was absent at the root authenticated by a Unicity
 /// Certificate.
 ///
-/// This is a snapshot statement.  Verification does not assert that the state
-/// remains absent at a later root; callers with freshness requirements must
-/// apply their own certified-round or timestamp policy.
+/// This is a snapshot statement.
+///
+/// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+/// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+/// snapshot’s network and root round (or its certified seal timestamp under your application's
+/// time policy) with an independently trusted requirement. The seal timestamp is a
+/// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+/// metadata for this check.**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NonInclusionProof {
     certificate: NonInclusionCertificate,
@@ -103,48 +108,75 @@ impl NonInclusionProof {
         self.requested_state_id.as_ref()
     }
 
-    /// Verify a client-bound proof against `trust_base`.
+    /// Verify a client-bound proof against `trust_base` and report the authenticated snapshot.
     ///
-    /// The unicity certificate is authenticated strictly (network, exact epoch,
-    /// root round not before the epoch start, quorum), but nothing here says which
-    /// partition, shard or configuration it belongs to or how recent it is: prefer
-    /// [`verify_in_context`](Self::verify_in_context).
+    /// The unicity certificate is authenticated strictly (network, exact epoch, root round
+    /// not before the epoch start, quorum, the fixed aggregation partition and the
+    /// `context` pins) before anything is exposed. A rejection carries no snapshot.
     ///
-    /// Proofs returned by the provided clients are bound automatically. A proof
-    /// decoded directly from untrusted bytes has no request context; use
-    /// [`verify_for`](Self::verify_for) for that case.
-    pub fn verify(&self, trust_base: &RootTrustBase) -> Result<(), VerificationError> {
-        let target = self
-            .requested_state_id
-            .as_ref()
-            .ok_or(VerificationError::NonInclusionTargetMissing)?;
-        verify::verify_non_inclusion_proof(trust_base, self, target)
-    }
-
-    /// Verify a client-bound proof, additionally against the caller's expectations
-    /// (partition, optional shard and configuration pin, minimum root round, end of
-    /// the authority's interval). See [`NonInclusionContext`].
-    pub fn verify_in_context(
+    /// Proofs returned by the provided clients are bound automatically. A proof decoded
+    /// directly from untrusted bytes has no request context; use
+    /// [`verify_for_at_snapshot`](Self::verify_for_at_snapshot) for that case.
+    ///
+    /// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+    /// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+    /// snapshot’s network and root round (or its certified seal timestamp under your application's
+    /// time policy) with an independently trusted requirement. The seal timestamp is a
+    /// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+    /// metadata for this check.**
+    ///
+    /// ```no_run
+    /// # use unicity_token::api::{bft::RootTrustBase, NonInclusionProof};
+    /// # use unicity_token::verify::{NonInclusionContext, NonInclusionOutcome};
+    /// # struct Checkpoint { network_id: u16, required_root_round: u64 }
+    /// # fn policy(
+    /// #     proof: &NonInclusionProof,
+    /// #     trust_base: &RootTrustBase,
+    /// #     checkpoint: &Checkpoint, // obtained independently of the proof and of the server response
+    /// # ) -> Result<(), &'static str> {
+    /// let outcome = proof
+    ///     .verify_at_snapshot(trust_base, &NonInclusionContext::new())
+    ///     .map_err(|_| "no verified absence")?;
+    /// let NonInclusionOutcome::AbsentAtSnapshot { snapshot, .. } = outcome else {
+    ///     return Err("no verified absence");
+    /// };
+    /// if snapshot.network_id().id() != checkpoint.network_id
+    ///     || snapshot.root_round() < checkpoint.required_root_round
+    /// {
+    ///     return Err("snapshot does not meet application policy");
+    /// }
+    /// // Absence at `snapshot` only; any spend/finality decision needs its own policy.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn verify_at_snapshot(
         &self,
         trust_base: &RootTrustBase,
         context: &NonInclusionContext,
-    ) -> Result<(), VerificationError> {
+    ) -> Result<NonInclusionOutcome, VerificationError> {
         let target = self
             .requested_state_id
             .as_ref()
             .ok_or(VerificationError::NonInclusionTargetMissing)?;
-        verify::verify_non_inclusion_proof_in_context(trust_base, self, target, context)
+        verify::verify_non_inclusion_at_snapshot(trust_base, self, target, context)
     }
 
-    /// [`verify_in_context`](Self::verify_in_context) for a directly decoded proof
-    /// and an explicit `target` (a different target than a client-bound one is
-    /// rejected).
-    pub fn verify_for_in_context(
+    /// [`verify_at_snapshot`](Self::verify_at_snapshot) for a directly decoded proof and an
+    /// explicit `target` (a different target than a client-bound one is rejected, so request
+    /// context can not be silently replaced).
+    ///
+    /// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+    /// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+    /// snapshot’s network and root round (or its certified seal timestamp under your application's
+    /// time policy) with an independently trusted requirement. The seal timestamp is a
+    /// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+    /// metadata for this check.**
+    pub fn verify_for_at_snapshot(
         &self,
         target: &StateId,
         trust_base: &RootTrustBase,
         context: &NonInclusionContext,
-    ) -> Result<(), VerificationError> {
+    ) -> Result<NonInclusionOutcome, VerificationError> {
         if self
             .requested_state_id
             .as_ref()
@@ -152,27 +184,7 @@ impl NonInclusionProof {
         {
             return Err(VerificationError::NonInclusionTargetMismatch);
         }
-        verify::verify_non_inclusion_proof_in_context(trust_base, self, target, context)
-    }
-
-    /// Verify a directly decoded proof for an explicit `target` (strict authority
-    /// authentication; see [`verify`](Self::verify)).
-    ///
-    /// If the proof is already client-bound, a different target is rejected so
-    /// request context cannot be silently replaced.
-    pub fn verify_for(
-        &self,
-        target: &StateId,
-        trust_base: &RootTrustBase,
-    ) -> Result<(), VerificationError> {
-        if self
-            .requested_state_id
-            .as_ref()
-            .is_some_and(|requested| requested != target)
-        {
-            return Err(VerificationError::NonInclusionTargetMismatch);
-        }
-        verify::verify_non_inclusion_proof(trust_base, self, target)
+        verify::verify_non_inclusion_at_snapshot(trust_base, self, target, context)
     }
 }
 

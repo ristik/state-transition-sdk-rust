@@ -1,2 +1,0 @@
-Vendored byte for byte from aggregator-go branch non-inclusion @ e82e80fda793d19f1296b3c0fcb9d6835a16aa17 (testdata/non-inclusion/v1).
-manifest.json lists the SHA-256 of every file (checked by tests/non_inclusion_corpus.rs).

@@ -1141,10 +1141,7 @@ fn signature_memo_is_shared_but_policy_rules_are_not() {
     for shard in &order {
         wrong = wrong.with_shard_conf_hash(shard, [0xee; 32]);
     }
-    assert!(c
-        .view
-        .authenticate(&c.uc, c.partition, Some(&wrong), &mut s)
-        .is_err());
+    assert!(c.view.authenticate(&c.uc, Some(&wrong), &mut s).is_err());
     // and the strict authority is checked by every call, whatever was verified before
     let mut tb = c.trust_base.clone();
     tb.epoch += 1;

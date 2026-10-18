@@ -143,6 +143,41 @@ Migration from the previous API:
 - The `UNICITY_PARTITION_ID` variable of the consolidation examples is gone.
 - Certificates, tokens and fixtures that certify another partition (the test value `0`, `0x0a0b0c0d`, `1`) no longer verify. They must be re-signed for partition 7; signed bytes are never patched and there is no test bypass in production verification.
 
+## Non-inclusion (snapshot) verification
+
+`NonInclusionProof::verify_at_snapshot` (and `verify_for_at_snapshot` for a directly decoded proof, `verify::verify_non_inclusion_at_snapshot` / `verify_non_inclusion_in` for explicit sessions) authenticates the unicity certificate (shape, trusted network, authority and epoch interval, quorum, the fixed aggregation partition, the shard and partition commitments with the optional pins of a `NonInclusionContext`, the query binding and the full state-tree relation) and only then returns a `NonInclusionOutcome`:
+
+- `AbsentAtSnapshot { state_id, snapshot }`
+- `IncludedAtSnapshot { state_id, snapshot }` (a valid path proves the exact key present)
+- `Err(VerificationError)`: rejected, no snapshot metadata.
+
+`NonInclusionSnapshot` exposes `network_id`, `partition_id`, `shard_id`, `root_round`, `seal_timestamp_seconds` (Unix seconds), `root_epoch`, `shard_round`, `shard_epoch` and `state_root` (`None` is the certified empty tree), all read from the authenticated certificate, never from the RPC block number or receipt time. It owns copies of its data.
+
+> **Non-inclusion proves absence only at the authenticated snapshot returned by verification. It does not prove absence now, continuous absence, or that a token can be spent. Compare the snapshot’s network and root round (or its certified seal timestamp under your application’s time policy) with an independently trusted requirement. The seal timestamp is a consensus-certified time, not proof of real-time freshness. Do not use unverified response metadata for this check.**
+
+```rust
+// `checkpoint` is obtained independently of the proof and of the server response.
+let outcome = proof.verify_at_snapshot(&trust_base, &NonInclusionContext::new())?;
+let NonInclusionOutcome::AbsentAtSnapshot { snapshot, .. } = outcome else {
+    return Err("no verified absence".into());
+};
+if snapshot.network_id().id() != checkpoint.network_id
+    || snapshot.root_round() < checkpoint.required_root_round
+{
+    return Err("snapshot does not meet application policy".into());
+}
+// Absence at `snapshot` only; any spend/finality decision needs its own policy.
+```
+
+`NonInclusionProof::for_state` only records which state id a proof was requested for; it is request bookkeeping, not evidence.
+
+Migration from the previous API:
+
+- `verify`, `verify_for`, `verify_in_context`, `verify_for_in_context` and the free functions `verify_non_inclusion_proof` / `verify_non_inclusion_proof_in_context` are removed. Use `verify_at_snapshot` / `verify_for_at_snapshot` (the context is now always explicit: `NonInclusionContext::new()` pins nothing).
+- `NonInclusionContext::new` takes no partition (it is `AGGREGATION_PARTITION_ID`) and `with_min_root_round`, `VerificationError::SealTooOld` (the "stale" verdict) are removed: freshness is the caller's decision on the returned snapshot, as above.
+- `VerificationError::StateIncluded` is gone: an included state is the successful outcome `IncludedAtSnapshot`. The transport error `HttpError::StateIncluded` (the server said so; unauthenticated) is unchanged.
+- `NonInclusionCertificate::verify` is replaced by `relation_to_trusted_root` returning `PathRelation::{Absent, Present}` against a root the caller already trusts.
+
 ## Partition views and seal reuse (building blocks)
 
 `unicity_token::consolidation` (pure `no_std + alloc`, no network) decodes the frozen `PartitionViewV1` — the complete shard-leaf vector of a partition under one unicity seal — as an *untrusted candidate*. `PartitionView::authenticate` validates its structure, rebuilds the native shard tree, follows the enclosing certificate's partition path to the seal hash, matches the enclosing leaf exactly and authenticates the complete seal under *your* anchored `RootTrustBase` (network, exact epoch, round ≥ epoch start, quorum); only then it returns an immutable `AuthenticatedView`, the sole input of `certificates()` (ordinary unicity certificates of every shard, all carrying the identical master seal). No peer configuration list is needed: the seal commits to every leaf's configuration hash. Independently pinned shard configuration hashes (`Some(&PartitionTopology)`) are an optional stricter policy and are part of `AuthenticatedView::identity()`. The authority is never taken from a response.
