@@ -169,11 +169,13 @@ if snapshot.network_id().id() != checkpoint.network_id
 // Absence at `snapshot` only; any spend/finality decision needs its own policy.
 ```
 
+`NonInclusionContext::new()` expects the **unsharded** partition (the certificate's shard is the empty shard), like Go's verifier with its empty `Shard`. For a sharded partition pin the shard you serve: `NonInclusionContext::new().with_shard(shard)`; the certificate's shard id and complete shard path must then be that shard's, and the query and terminal must belong to it. The unicity certificate is authenticated first (as in Go), so a rejection class is the certificate's own before the path is judged.
+
 `NonInclusionProof::for_state` only records which state id a proof was requested for; it is request bookkeeping, not evidence.
 
 Migration from the previous API:
 
-- `verify`, `verify_for`, `verify_in_context`, `verify_for_in_context` and the free functions `verify_non_inclusion_proof` / `verify_non_inclusion_proof_in_context` are removed. Use `verify_at_snapshot` / `verify_for_at_snapshot` (the context is now always explicit: `NonInclusionContext::new()` pins nothing).
+- `verify`, `verify_for`, `verify_in_context`, `verify_for_in_context` and the free functions `verify_non_inclusion_proof` / `verify_non_inclusion_proof_in_context` are removed. Use `verify_at_snapshot` / `verify_for_at_snapshot` (the context is now always explicit; `NonInclusionContext::new()` pins the unsharded partition).
 - `NonInclusionContext::new` takes no partition (it is `AGGREGATION_PARTITION_ID`) and `with_min_root_round`, `VerificationError::SealTooOld` (the "stale" verdict) are removed: freshness is the caller's decision on the returned snapshot, as above.
 - `VerificationError::StateIncluded` is gone: an included state is the successful outcome `IncludedAtSnapshot`. The transport error `HttpError::StateIncluded` (the server said so; unauthenticated) is unchanged.
 - `NonInclusionCertificate::verify` is replaced by `relation_to_trusted_root` returning `PathRelation::{Absent, Present}` against a root the caller already trusts.

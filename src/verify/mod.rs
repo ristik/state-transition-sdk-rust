@@ -467,6 +467,13 @@ pub fn verify_non_inclusion_in(
     seals.ensure_trust_base()?;
 
     let uc = proof.unicity_certificate();
+    let shard = &uc.shard_tree_certificate.shard;
+
+    // Authenticate the certificate first (strictly, in the context's namespace), as Go does, so
+    // the rejection class is the certificate's own (uc/authority) before the path is judged and
+    // nothing is exposed for an untrusted certificate.
+    verify_unicity_certificate_strict(seals, uc, context)?;
+
     // Only an authenticated native `null` is the empty tree. An empty byte string (`40`), the
     // all-zero hash and any other length are not: they are rejected, never mapped to "empty".
     let state_root = uc
@@ -487,12 +494,6 @@ pub fn verify_non_inclusion_in(
     {
         return Err(VerificationError::NonInclusionCertificateInvalid);
     }
-
-    let shard = &uc.shard_tree_certificate.shard;
-
-    // Authenticate the certificate (strictly, in the context's namespace) before exposing
-    // anything: an untrusted certificate must never yield a snapshot or a verdict.
-    verify_unicity_certificate_strict(seals, uc, context)?;
 
     // shard membership of the query and of the authenticated terminal, judged against the
     // authenticated certificate's shard
@@ -1070,7 +1071,8 @@ mod tests {
         let mut uc = proof.unicity_certificate().clone();
         // One-bit shard `0`: the target belongs to it, but the authenticated
         // terminal starts with `1` and therefore cannot belong to this root.
-        uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
+        let uc_shard = ShardId::decode(&[0b0100_0000]).unwrap();
+        uc.shard_tree_certificate.shard = uc_shard.clone();
         uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
         let seal_hash = uc.computed_seal_hash().unwrap().data().to_vec();
         let signature = node
@@ -1080,9 +1082,15 @@ mod tests {
         uc.unicity_seal = mk_seal(seal_hash, alloc::vec![("NODE".to_string(), signature)]);
         let proof = NonInclusionProof::new(proof.certificate().clone(), uc);
 
+        let one_bit = NonInclusionContext::new().with_shard(uc_shard);
+        assert_eq!(
+            ni_absent_in(&trust_base(&node), &proof, &state_id([0x00; 32]), &one_bit),
+            Err(VerificationError::ShardMismatch)
+        );
+        // the default context expects the unsharded partition, like Go's empty Shard
         assert_eq!(
             ni_absent(&trust_base(&node), &proof, &state_id([0x00; 32])),
-            Err(VerificationError::ShardMismatch)
+            Err(VerificationError::ShardPathInvalid)
         );
     }
 
@@ -2039,7 +2047,14 @@ mod tests {
             uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![9u8; 32]];
             resign(uc, &node, |_| {});
         });
-        assert_eq!(verify_ni(&tb, &ok), Ok(()));
+        assert_eq!(
+            verify_ni_ctx(
+                &tb,
+                &ok,
+                &NonInclusionContext::new().with_shard(ShardId::decode(&[0b0100_0000]).unwrap())
+            ),
+            Ok(())
+        );
     }
 
     /// Strict verdicts are never inherited from, or by, the legacy inclusion check or
@@ -2065,16 +2080,19 @@ mod tests {
         // one session, one valid certificate: reused under the same context only
         let good = ni_proof(&node, |_| {});
         let mut session = SealSession::new(&tb);
-        let ctx = NonInclusionContext::new().with_shard(ShardId::root());
+        let ctx = NonInclusionContext::new();
         for _ in 0..3 {
             assert!(verify_non_inclusion_in(&mut session, &good, &target, &ctx).is_ok());
         }
         let s = session.stats();
         assert_eq!((s.body_checks, s.body_hits, s.quorum_checks), (1, 2, 1));
-        assert!(
-            verify_non_inclusion_in(&mut session, &good, &target, &NonInclusionContext::new())
-                .is_ok()
-        );
+        assert!(verify_non_inclusion_in(
+            &mut session,
+            &good,
+            &target,
+            &NonInclusionContext::new().with_authority_end_round(10)
+        )
+        .is_ok());
         assert_eq!(
             session.stats().body_checks,
             2,
@@ -2167,25 +2185,29 @@ mod tests {
         assert_eq!(verdict(ir(0, None, None)), Ok(()));
         // a nonzero-round record with a null hash and a valid (empty) summary value
         assert_eq!(verdict(ir(5, None, Some(Vec::new()))), Ok(()));
-        // an independently signed empty-byte-string root is NOT the empty tree
-        assert_eq!(
-            verdict(ir(5, Some(Vec::new()), Some(Vec::new()))),
-            Err(VerificationError::NonInclusionCertificateInvalid)
-        );
-        assert_eq!(
-            verdict(ir(0, Some(Vec::new()), None)),
-            Err(VerificationError::NonInclusionCertificateInvalid)
-        );
+        // an independently signed empty-byte-string root is NOT the empty tree: rejected as an
+        // invalid certificate body (the UC is judged first, as in Go) or as an invalid path
+        for record in [
+            ir(5, Some(Vec::new()), Some(Vec::new())),
+            ir(0, Some(Vec::new()), None),
+        ] {
+            assert!(matches!(
+                verdict(record),
+                Err(VerificationError::CertificateBodyInvalid
+                    | VerificationError::NonInclusionCertificateInvalid)
+            ));
+        }
         // neither is the all-zero hash, nor any other length
         for bad in [
             alloc::vec![0u8; 32],
             alloc::vec![1u8; 31],
             alloc::vec![1u8; 33],
         ] {
-            assert_eq!(
+            assert!(matches!(
                 verdict(ir(5, Some(bad), Some(Vec::new()))),
-                Err(VerificationError::NonInclusionCertificateInvalid)
-            );
+                Err(VerificationError::CertificateBodyInvalid
+                    | VerificationError::NonInclusionCertificateInvalid)
+            ));
         }
     }
 

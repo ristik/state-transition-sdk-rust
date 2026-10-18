@@ -18,23 +18,38 @@ use crate::crypto::hash::{DataHasher, HashAlgorithm};
 /// Built with [`new`](Self::new) and the `with_*` methods; the expectations are
 /// immutable once the verification runs and are part of the identity under which
 /// authentication verdicts are reused, so a verdict reached under one context is
-/// never inherited by another. The default context pins nothing: the network,
-/// authority, epoch interval, quorum and the fixed partition are always enforced.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// never inherited by another.
+///
+/// Like Go's verifier, [`new`](Self::new) expects the **unsharded** partition (the
+/// certificate's shard is the empty shard); pin the shard you serve with
+/// [`with_shard`](Self::with_shard) otherwise. The network, authority, epoch interval,
+/// quorum and the fixed partition are always enforced.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NonInclusionContext {
     shard: Option<ShardId>,
     shard_conf_hash: Option<[u8; 32]>,
     authority_end_round: Option<u64>,
 }
 
+impl Default for NonInclusionContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NonInclusionContext {
-    /// A context without optional pins.
+    /// The unsharded partition (expected shard: the empty shard), without further pins.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            shard: Some(ShardId::root()),
+            shard_conf_hash: None,
+            authority_end_round: None,
+        }
     }
 
-    /// Expect the certificate of exactly this shard (otherwise any shard that
-    /// contains the target passes the existing membership checks).
+    /// Expect the certificate of exactly this shard (instead of the unsharded partition):
+    /// the certificate's shard id and complete shard path must be that shard's, and the query
+    /// and terminal must belong to it.
     pub fn with_shard(mut self, shard: ShardId) -> Self {
         self.shard = Some(shard);
         self
