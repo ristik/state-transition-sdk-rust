@@ -762,6 +762,34 @@ mod tests {
         );
     }
 
+    // --- authenticating a proof of other data ------------------------------
+
+    /// `submit_and_wait_verified` believes "another request won the race" only for a proof
+    /// that verifies under the trust base.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_proof_of_other_data_is_believed_only_when_it_verifies() {
+        use crate::client::{conflict_error, HttpError};
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        let sid = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        assert!(matches!(
+            conflict_error(&proof, &sid, &tb),
+            HttpError::StateCertifiedWithOtherData
+        ));
+        // a seal signed by an untrusted key is only an unauthenticated hint
+        assert!(matches!(
+            conflict_error(&proof, &sid, &trust_base(&signer(0x99))),
+            HttpError::ProofOfOtherData
+        ));
+        // so is a certificate whose seal does not cover the contents
+        proof.unicity_certificate.input_record.block_hash = Some(alloc::vec![1; 32]);
+        assert!(matches!(
+            conflict_error(&proof, &sid, &tb),
+            HttpError::ProofOfOtherData
+        ));
+        let _ = node;
+    }
+
     // --- non-inclusion proof rules ----------------------------------------
 
     #[test]

@@ -17,6 +17,7 @@ use std::io::Read;
 use std::time::Duration;
 use zeroize::Zeroize;
 
+use crate::api::bft::RootTrustBase;
 use crate::api::certification_request::CertificationRequest;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::{
@@ -90,10 +91,19 @@ pub enum HttpError {
     /// the request was admitted but dropped before inclusion, because its timeout
     /// passed. Waiting can not help; the caller may resubmit the same signed request.
     StateExpired,
-    /// A proof certifies this state id, but **not the submitted request** (different
-    /// transaction hash, unlock script or deadline): another request, typically a
-    /// conflicting spend of the same state, won the race. Not retryable; the
-    /// submission must not be treated as certified.
+    /// The aggregator returned a proof for this state id whose certification data is
+    /// **not the submitted request** (different transaction hash, unlock script or
+    /// deadline), and the proof was **not authenticated**: it may be a forged answer
+    /// from a faulty aggregator, so this is only a hint that a conflicting spend won the
+    /// race. The submission must not be treated as certified. Authenticate the proof
+    /// (see [`submit_and_wait_verified`](HttpAggregatorClient::submit_and_wait_verified))
+    /// before concluding that the race was lost; resubmitting or asking another
+    /// aggregator is safe.
+    ProofOfOtherData,
+    /// A proof that **verifies under the trust base** certifies this state id, but not
+    /// the submitted request: another request, typically a conflicting spend of the same
+    /// state, won the race. Not retryable. Returned only by
+    /// [`submit_and_wait_verified`](HttpAggregatorClient::submit_and_wait_verified).
     StateCertifiedWithOtherData,
     /// The aggregator reports (an unauthenticated hint, see [`ProofStatus`]) that
     /// it does not know the state id, beyond the configured grace period. This is
@@ -122,6 +132,11 @@ impl fmt::Display for HttpError {
             HttpError::Rejected(s) => write!(f, "certification rejected: {s:?}"),
             HttpError::Timeout => write!(f, "timed out waiting for inclusion proof"),
             HttpError::StateNotFound => write!(f, "state is not known to the aggregator"),
+            HttpError::ProofOfOtherData => write!(
+                f,
+                "the returned proof is for a different request than the one submitted \
+                 (unauthenticated hint)"
+            ),
             HttpError::StateCertifiedWithOtherData => write!(
                 f,
                 "the state id is certified with a different request than the one submitted"
@@ -146,6 +161,20 @@ impl fmt::Display for HttpError {
 }
 
 impl std::error::Error for HttpError {}
+
+/// The error for a proof that certifies other data than the submitted request: authenticated
+/// (`StateCertifiedWithOtherData`) only when the proof verifies under `trust_base` for
+/// `state_id`, at the reference time the proof itself commits to.
+pub(crate) fn conflict_error(
+    proof: &InclusionProof,
+    state_id: &StateId,
+    trust_base: &RootTrustBase,
+) -> HttpError {
+    match proof.verify_for(state_id, proof.reference_time, trust_base) {
+        Ok(()) => HttpError::StateCertifiedWithOtherData,
+        Err(_) => HttpError::ProofOfOtherData,
+    }
+}
 
 /// A blocking JSON-RPC aggregator client.
 #[derive(Clone)]
@@ -332,10 +361,40 @@ impl HttpAggregatorClient {
     /// restarts. A resubmission that meets a request still held elsewhere is
     /// [`AlreadySubmitted`](SubmitOutcome::AlreadySubmitted), not an error. The status
     /// is an unauthenticated hint: the returned proof still has to be verified.
+    ///
+    /// A returned proof whose certification data differs from `data` is reported as
+    /// [`HttpError::ProofOfOtherData`], an **unauthenticated** hint (this method has no
+    /// trust base); use [`submit_and_wait_verified`](Self::submit_and_wait_verified) to
+    /// learn whether a conflicting spend really won.
     pub fn submit_and_wait(
         &self,
         data: &CertificationData,
         max_resubmits: u32,
+    ) -> Result<InclusionProof, HttpError> {
+        self.submit_and_wait_with(data, max_resubmits, |_, _| HttpError::ProofOfOtherData)
+    }
+
+    /// Like [`submit_and_wait`](Self::submit_and_wait), but a proof for other data is
+    /// authenticated under `trust_base` before it is believed: only a proof that verifies
+    /// gives [`HttpError::StateCertifiedWithOtherData`] (the race is lost, not retryable);
+    /// a proof that does not verify gives the unauthenticated
+    /// [`HttpError::ProofOfOtherData`].
+    pub fn submit_and_wait_verified(
+        &self,
+        data: &CertificationData,
+        max_resubmits: u32,
+        trust_base: &RootTrustBase,
+    ) -> Result<InclusionProof, HttpError> {
+        self.submit_and_wait_with(data, max_resubmits, |proof, state_id| {
+            conflict_error(proof, state_id, trust_base)
+        })
+    }
+
+    fn submit_and_wait_with(
+        &self,
+        data: &CertificationData,
+        max_resubmits: u32,
+        on_other_data: impl Fn(&InclusionProof, &StateId) -> HttpError,
     ) -> Result<InclusionProof, HttpError> {
         let state_id = StateId::derive(data.lock_script(), data.source_state_hash());
         self.resubmit_certification_request(data)?;
@@ -349,7 +408,7 @@ impl HttpAggregatorClient {
                     self.resubmit_certification_request(data)?;
                 }
                 Ok(proof) if proof.certification_data != *data => {
-                    return Err(HttpError::StateCertifiedWithOtherData)
+                    return Err(on_other_data(&proof, &state_id))
                 }
                 other => return other,
             }
