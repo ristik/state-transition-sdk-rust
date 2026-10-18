@@ -703,6 +703,47 @@ mod tests {
         );
     }
 
+    // --- inclusion-path shard binding ---------------------------------------
+
+    /// A certificate the root signed for a shard that does not own the state id must not verify
+    /// after it is relabelled to a longer label that does (same seal and siblings, no new signature).
+    #[test]
+    fn relabel_without_resealing() {
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        let sid = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        let bit = |i: usize| (sid.bytes()[i / 8] >> (7 - (i % 8))) & 1;
+        let b0 = bit(0);
+        let l = (2..64).find(|&l| bit(l - 1) != b0).unwrap(); // last label bit != first state-id bit
+        let child = |s: &ShardId, b: u8| {
+            let (z, o) = s.split();
+            if b == 0 {
+                z
+            } else {
+                o
+            }
+        };
+        let real = child(&ShardId::root(), 1 - b0); // 1-bit shard that does NOT own sid
+        let mut forged = ShardId::root();
+        for i in 0..l {
+            forged = child(&forged, bit(i)); // l-bit prefix of sid
+        }
+        let uc = &mut proof.unicity_certificate;
+        uc.input_record.block_hash = Some(alloc::vec![5; 32]);
+        uc.technical_record_hash = Some(alloc::vec![6; 32]);
+        uc.shard_tree_certificate.shard = real;
+        uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
+        reseal(&mut proof, &node); // the root certifies shard `real`
+        assert_eq!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+            Err(VerificationError::ShardMismatch)
+        );
+        proof.unicity_certificate.shard_tree_certificate.shard = forged; // no re-signing
+        assert!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME).is_err(),
+            "a relabelled shard with a different sibling count must not verify"
+        );
+    }
+
     // --- non-inclusion proof rules ----------------------------------------
 
     #[test]
@@ -784,6 +825,7 @@ mod tests {
         // One-bit shard `0`: the target belongs to it, but the authenticated
         // terminal starts with `1` and therefore cannot belong to this root.
         uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
+        uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
         let seal_hash = uc.computed_seal_hash().unwrap().data().to_vec();
         let signature = node
             .sign(&mk_seal(seal_hash.clone(), Vec::new()).calculate_hash())

@@ -87,9 +87,9 @@ impl UnicityCertificate {
 
         let shard = &self.shard_tree_certificate.shard;
         let siblings = &self.shard_tree_certificate.sibling_hash_list;
-        if siblings.len() > shard.length() {
+        if siblings.len() != shard.length() {
             return Err(Error::UnexpectedValue(
-                "shard sibling count exceeds shard bit length",
+                "shard sibling count differs from shard bit length",
             ));
         }
         for (i, sibling) in siblings.iter().enumerate() {
