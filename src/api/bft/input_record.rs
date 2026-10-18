@@ -99,3 +99,51 @@ impl InputRecord {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(hash: Option<Vec<u8>>, summary_value: Option<Vec<u8>>) -> InputRecord {
+        InputRecord {
+            round_number: 0,
+            epoch: 0,
+            previous_hash: None,
+            hash,
+            summary_value,
+            timestamp: 1,
+            block_hash: None,
+            sum_of_earned_fees: 0,
+            executed_transactions_hash: None,
+        }
+    }
+
+    /// Go-valid round-0 records carry a null hash and/or summary value; they must decode and
+    /// re-encode byte-identically (the shard-tree leaf hashes the exact encoding).
+    #[test]
+    fn null_hash_and_summary_value_decode_and_roundtrip() {
+        for (hash, summary) in [
+            (None, None),
+            (None, Some(Vec::new())),
+            (Some(alloc::vec![9; 32]), None),
+            (Some(alloc::vec![9; 32]), Some(Vec::new())),
+        ] {
+            let ir = record(hash, summary);
+            let bytes = ir.to_cbor();
+            let decoded = InputRecord::from_cbor(Decoder::new(&bytes)).unwrap();
+            assert_eq!(decoded, ir);
+            assert_eq!(decoded.to_cbor(), bytes);
+        }
+    }
+
+    #[test]
+    fn only_null_or_32_bytes_is_a_root_hash() {
+        assert_eq!(record(None, None).root_hash(), Ok(None));
+        assert_eq!(
+            record(Some(alloc::vec![1; 32]), None).root_hash(),
+            Ok(Some([1; 32]))
+        );
+        assert!(record(Some(Vec::new()), None).root_hash().is_err());
+        assert!(record(Some(alloc::vec![1; 31]), None).root_hash().is_err());
+    }
+}
