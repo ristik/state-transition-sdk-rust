@@ -45,7 +45,7 @@ pub use seal::{SealAuthenticator, SealSession, SealStats, DEFAULT_SEAL_MEMO_CAPA
 use crate::api::bft::{RootTrustBase, UnicityCertificate};
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::leaf_value::calculate_leaf_value;
-use crate::api::{NonInclusionProof, StateId};
+use crate::api::{NonInclusionProof, StateId, AGGREGATION_PARTITION_ID};
 use crate::crypto::hash::{DataHash, HashAlgorithm};
 use crate::predicate::builtin::SignaturePredicate;
 use crate::predicate::unlock::verify_signature_unlock;
@@ -363,7 +363,11 @@ fn verify_unicity_certificate(
     // certificate that already passed in this operation is not recomputed. Only
     // complete equality (seal witness included) hits; every per-proof check -
     // request, expiry, reference time, leaf path, shard membership, predicate - is
-    // done by the caller for each proof.
+    // done by the caller for each proof. The fixed partition is checked first, so
+    // a memo hit can never carry a certificate of another partition.
+    if uc.unicity_tree_certificate.partition_identifier != AGGREGATION_PARTITION_ID {
+        return Err(VerificationError::PartitionMismatch);
+    }
     if seals.body_verified(uc, policy) {
         return Ok(());
     }
@@ -616,7 +620,7 @@ mod tests {
                 sibling_hash_list: Vec::new(),
             },
             unicity_tree_certificate: UnicityTreeCertificate {
-                partition_identifier: 0,
+                partition_identifier: crate::api::AGGREGATION_PARTITION_ID,
                 steps: Vec::new(),
             },
             unicity_seal: mk_seal(alloc::vec![0u8; 32], Vec::new()),
@@ -1055,6 +1059,83 @@ mod tests {
         assert_eq!(
             verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
             Err(VerificationError::ShardMismatch)
+        );
+    }
+
+    #[test]
+    fn the_aggregation_partition_is_fixed_at_seven() {
+        assert_eq!(crate::api::AGGREGATION_PARTITION_ID, 7);
+        assert_eq!(crate::AGGREGATION_PARTITION_ID, 7);
+    }
+
+    /// A certificate of another partition, validly signed by the trusted root (so only the
+    /// partition rule can fire), is rejected by every application verification path.
+    #[test]
+    fn rule_partition_mismatch_is_enforced_on_a_validly_signed_proof() {
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        for other in [0u32, 1, 6, 8, 0x0a0b_0c0d] {
+            proof
+                .unicity_certificate
+                .unicity_tree_certificate
+                .partition_identifier = other;
+            reseal(&mut proof, &node);
+            assert_eq!(
+                verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+                Err(VerificationError::PartitionMismatch),
+                "partition {other}"
+            );
+        }
+    }
+
+    /// A seal memo hit for a certificate of the fixed partition never lets another partition's
+    /// certificate through in the same session, and the rejected one is not remembered.
+    #[test]
+    fn partition_is_checked_on_a_session_with_a_warm_seal_memo() {
+        let (tb, node, _o, transfer, proof) = transfer_case();
+        let mut session = SealSession::new(&tb);
+        assert_eq!(
+            super::verify_inclusion_proof(&mut session, &proof, &transfer, REFERENCE_TIME),
+            Ok(())
+        );
+        let mut foreign = proof.clone();
+        foreign
+            .unicity_certificate
+            .unicity_tree_certificate
+            .partition_identifier += 1;
+        reseal(&mut foreign, &node);
+        assert_eq!(
+            super::verify_inclusion_proof(&mut session, &foreign, &transfer, REFERENCE_TIME),
+            Err(VerificationError::PartitionMismatch)
+        );
+        // the same session keeps accepting the real partition (a memo hit)
+        assert_eq!(
+            super::verify_inclusion_proof(&mut session, &proof, &transfer, REFERENCE_TIME),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn non_inclusion_rejects_a_validly_signed_foreign_partition() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let mut proof = singleton_non_inclusion_proof(&node, [0x10; 32], [0x20; 32]);
+        let target = state_id([0x30; 32]);
+        assert_eq!(
+            super::verify_non_inclusion_proof(&tb, &proof, &target),
+            Ok(())
+        );
+        let mut uc = proof.unicity_certificate().clone();
+        uc.unicity_tree_certificate.partition_identifier = 8;
+        let seal_hash = uc.computed_seal_hash().unwrap().data().to_vec();
+        let signature = node
+            .sign(&mk_seal(seal_hash.clone(), Vec::new()).calculate_hash())
+            .encode()
+            .to_vec();
+        uc.unicity_seal = mk_seal(seal_hash, alloc::vec![("NODE".to_string(), signature)]);
+        proof = NonInclusionProof::new(proof.certificate().clone(), uc);
+        assert_eq!(
+            super::verify_non_inclusion_proof(&tb, &proof, &target),
+            Err(VerificationError::PartitionMismatch)
         );
     }
 

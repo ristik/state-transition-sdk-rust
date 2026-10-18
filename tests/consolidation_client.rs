@@ -313,7 +313,6 @@ fn start(
         .collect();
     let client = ProofClient::with_host_defaults(
         ProofClientConfig {
-            partition_id: case.partition,
             topology: case.topology.clone(),
         },
         endpoints,
@@ -846,7 +845,6 @@ fn configuration_is_validated() {
         )
     };
     let cfg = || ProofClientConfig {
-        partition_id: case.partition,
         topology: case.topology.clone(),
     };
     let build = |eps: Vec<(ShardId, HttpAggregatorClient)>| {

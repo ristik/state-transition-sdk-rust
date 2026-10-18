@@ -82,6 +82,9 @@ pub enum VerificationError {
     ShardMismatch,
     /// The unicity seal's network id does not match the trust base.
     SealNetworkMismatch,
+    /// The certificate is of a partition other than
+    /// [`AGGREGATION_PARTITION_ID`](crate::api::AGGREGATION_PARTITION_ID).
+    PartitionMismatch,
     /// The authority uses a configuration this verifier can not judge (stake
     /// weights other than one); not a statement about any signature.
     UnsupportedAuthority,
@@ -215,6 +218,12 @@ impl fmt::Display for VerificationError {
             VerificationError::ShardMismatch => write!(f, "shard does not contain state id"),
             VerificationError::SealNetworkMismatch => {
                 write!(f, "unicity seal network does not match trust base")
+            }
+            VerificationError::PartitionMismatch => {
+                write!(
+                    f,
+                    "certificate is of another partition than the aggregation partition"
+                )
             }
             VerificationError::UnsupportedAuthority => {
                 write!(f, "unsupported authority configuration (non-unit stake)")

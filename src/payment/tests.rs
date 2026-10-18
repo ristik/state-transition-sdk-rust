@@ -111,7 +111,7 @@ fn signed_uc(node: &Secp256k1Signer, root: [u8; 32]) -> UnicityCertificate {
             sibling_hash_list: Vec::new(),
         },
         unicity_tree_certificate: UnicityTreeCertificate {
-            partition_identifier: 0,
+            partition_identifier: crate::api::AGGREGATION_PARTITION_ID,
             steps: Vec::new(),
         },
         unicity_seal: mk_seal(vec![0u8; 32], Vec::new()),

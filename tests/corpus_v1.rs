@@ -23,12 +23,10 @@ use unicity_token::verify::{SealSession, VerificationError};
 fn assemble(
     view: &PartitionView,
     enclosing: &UnicityCertificate,
-    partition: u32,
     pins: Option<&PartitionTopology>,
     session: &mut SealSession<'_>,
 ) -> Result<Vec<ShardCertificate>, PartitionViewError> {
-    view.authenticate(enclosing, partition, pins, session)?
-        .certificates()
+    view.authenticate(enclosing, pins, session)?.certificates()
 }
 
 fn root() -> PathBuf {
@@ -187,14 +185,8 @@ fn positive_cases_assemble_the_reference_certificates() {
         let enclosing = enclosing(dir, &c.shards);
 
         let mut session = SealSession::new(&tb);
-        let ucs = assemble(
-            &view,
-            &enclosing,
-            c.partition,
-            Some(&c.topology),
-            &mut session,
-        )
-        .unwrap_or_else(|e| panic!("{dir}: {e}"));
+        let ucs = assemble(&view, &enclosing, Some(&c.topology), &mut session)
+            .unwrap_or_else(|e| panic!("{dir}: {e}"));
         assert_eq!(ucs.len(), expected.len(), "{dir}");
         for (got, want) in ucs.iter().zip(&expected) {
             // every shard, including one that never certified a state (all-null input record),
@@ -253,13 +245,7 @@ fn negative_view_cases_are_refused() {
         }
         if let Ok(view) = decoded {
             let mut session = SealSession::new(&tb);
-            let r = assemble(
-                &view,
-                &enclosing,
-                c.partition,
-                Some(&c.topology),
-                &mut session,
-            );
+            let r = assemble(&view, &enclosing, Some(&c.topology), &mut session);
             assert!(r.is_err(), "{name}: assembly must be refused");
         }
         checked += 1;
@@ -290,13 +276,7 @@ fn other_authorities_do_not_authenticate_the_master_seal() {
         let enclosing = enclosing(&base, &c.shards);
         let mut session = SealSession::new(&tb);
         assert_eq!(
-            assemble(
-                &view,
-                &enclosing,
-                c.partition,
-                Some(&c.topology),
-                &mut session
-            ),
+            assemble(&view, &enclosing, Some(&c.topology), &mut session),
             Err(PartitionViewError::Seal(want)),
             "{name}"
         );

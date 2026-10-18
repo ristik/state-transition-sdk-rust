@@ -38,3 +38,13 @@ of the TypeScript SDK, which left the Rust SDK encoding tokens at wire version 1
 with a three-element certified transaction while the shipped SDKs had moved to
 version 2 and two elements. Every Rust test passed, because the fixture and the
 code had drifted together. Pin the checkout to a tag.
+
+## Partition
+
+Every application fixture certifies partition 7 (`AGGREGATION_PARTITION_ID`). The JS
+generator's fixture helper (`tests/utils/UnicityCertificateFixture.ts`) uses partition 0
+at v3.0.1, so the vector is generated with its `partitionIdentifier` changed to `7n` (a
+one-line edit of the helper; the JS SDK's own change lands with its fixed-partition PR).
+`transition_flow_partition0.json` is the previous vector: validly signed by the same key but
+certifying partition 0. It is a negative fixture only: every token in it must be rejected
+with `PartitionMismatch`. Never regenerate it.

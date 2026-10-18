@@ -49,6 +49,7 @@ pub mod rsmst;
 pub mod transaction;
 pub mod verify;
 
+pub use api::AGGREGATION_PARTITION_ID;
 pub use error::{Error, Result};
 pub use transaction::Token;
 pub use verify::VerificationError;
