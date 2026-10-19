@@ -1,10 +1,8 @@
 {
-  "changeRecordHash": null,
+  "version": 2,
+  "networkId": 3,
   "epoch": 1,
   "epochStartRound": 1,
-  "networkId": 3,
-  "previousEntryId": "0x0000000000000000000000000000000000000000000000000000000000000000",
-  "quorumThreshold": 3,
   "rootNodes": [
     {
       "nodeId": "16Uiu2HAmADjC8ePMAUS4FmhdTgwwQBwj6xKDk4JxLJF6MBnqYiSo",
@@ -27,7 +25,9 @@
       "stake": 1
     }
   ],
-  "signatures": null,
-  "stateHash": null,
-  "version": 2
+  "quorumThreshold": 3,
+  "stateHash": "",
+  "changeRecordHash": "",
+  "previousEntryId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "signatures": null
 }
