@@ -302,8 +302,10 @@ impl HttpAggregatorClient {
     /// With long poll on (the default, see [`with_long_poll`](Self::with_long_poll)) the
     /// budget is a total deadline of [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
     /// (`interval * attempts`), within which the aggregator may hold each request, so
-    /// far fewer than `attempts` requests are sent. With long poll off it is the
-    /// classic count: up to `attempts` probes, `interval` apart.
+    /// far fewer than `attempts` requests are sent; a plain probe keeps the client's full
+    /// request timeout whatever the budget. With long poll off, or a zero budget (zero
+    /// `interval` or `attempts`), it is the classic count: up to `attempts` probes,
+    /// `interval` apart.
     pub fn with_polling(mut self, interval: Duration, attempts: u32) -> Self {
         self.poll_interval = interval;
         self.poll_attempts = attempts;
@@ -898,9 +900,14 @@ impl AggregatorClient for HttpAggregatorClient {
     /// The status is an unauthenticated hint: a certified proof is returned
     /// whatever the status says, and the caller must still verify it.
     fn get_inclusion_proof(&self, state_id: &StateId) -> Result<InclusionProof, HttpError> {
-        if self.long_poll {
-            let total = self.poll_interval.saturating_mul(self.poll_attempts);
-            return self.wait_for_inclusion_proof(state_id, &WaitOptions::new(total));
+        // A zero budget (no pause between probes, or no attempts) has nothing to hold a
+        // request for: the classic loop below sends exactly the probes it always did.
+        let total = self.poll_interval.saturating_mul(self.poll_attempts);
+        if self.long_poll && !total.is_zero() {
+            return self.wait_for_inclusion_proof(
+                state_id,
+                &WaitOptions::new(total).keep_plain_request_timeout(),
+            );
         }
         let params = serde_json::json!({
             "stateId": hex::encode(state_id.bytes()),
