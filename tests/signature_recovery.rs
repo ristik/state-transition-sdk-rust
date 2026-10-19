@@ -150,7 +150,7 @@ mod native_seal_rule {
         for i in (0..32).rev() {
             let d = i32::from(N[i]) - i32::from(wire[32 + i]) - borrow;
             borrow = i32::from(d < 0);
-            high[32 + i] = (d + 256) as u8 & 0xff;
+            high[32 + i] = (d + 256) as u8;
         }
         assert_ne!(high[32..64], wire[32..64]);
         assert_eq!(
