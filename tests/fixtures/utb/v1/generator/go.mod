@@ -6,7 +6,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.7.0
 	github.com/libp2p/go-libp2p v0.37.0
 	github.com/unicitynetwork/bft-core v1.1.1-0.20261019184919-a20708b64a1c
-	github.com/unicitynetwork/bft-go-base v1.1.1-0.20261019185200-6174434eeb99
+	github.com/unicitynetwork/bft-go-base v1.1.1-0.20261019192448-f1fc4e5784b3
 )
 
 require (
@@ -143,5 +143,5 @@ require (
 
 replace (
 	github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261019184919-a20708b64a1c
-	github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261019185200-6174434eeb99
+	github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261019192448-f1fc4e5784b3
 )
