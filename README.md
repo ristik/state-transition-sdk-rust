@@ -71,6 +71,8 @@ The SDK handles cryptography and token encoding. Your application manages keys, 
 
 `client::mint` and `client::transfer` submit the transaction, wait for its unicity proof (`InclusionProof` in the API), and return the verified token. The [split example](./examples/split.rs) includes payment verifier setup.
 
+While waiting, the client stops early with `HttpError::StateExpired` or `HttpError::StateUnknown` when the aggregator reports that it dropped the request or does not know it. The same signed request can then be submitted again. See the [API reference](./docs/api-reference.md#1-waiting-for-inclusion-proofs).
+
 ### Store, send, and receive
 
 Serialize with `token.to_cbor()` to save or send a token, and deserialize with `Token::from_cbor(bytes)` to load it. Verify received tokens before accepting them:
@@ -84,6 +86,14 @@ token.verify(&trust_base)?;
 ```
 
 `Token::verify` checks cryptographic history; application data remains opaque. Use `Token::verify_with` for registered mint justifications and `payment::verify_payment_token` for payments.
+
+### Proof consolidation
+
+Each transaction in a token's history has its own unicity proof, usually certified in a different round. Verifying the history in a constrained environment, such as a smart contract or a zkVM guest, means authenticating every one of those certificates. `client::ProofClient::consolidate` fetches new proofs for the token's history so that they share one unicity certificate, which then has to be authenticated only once. It is optional and the SDK never calls it on its own. See the [API reference](./docs/api-reference.md#4-proof-consolidation) and [`examples/consolidate_for_zkvm.rs`](./examples/consolidate_for_zkvm.rs).
+
+### Non-inclusion proofs
+
+A non-inclusion proof shows that a state ID was absent from the aggregator's state tree at one certified snapshot. It does not show that the state is absent now or that a token can be spent. `AggregatorClient::get_non_inclusion_proof` fetches the proof, and `NonInclusionProof::verify_at_snapshot` verifies it and returns the authenticated snapshot. Before relying on the result, compare the snapshot's network and round with a checkpoint your application trusts independently. See the [API reference](./docs/api-reference.md#5-non-inclusion-proofs).
 
 ### Run the examples
 
@@ -122,76 +132,6 @@ unicity-token = { version = "0.1", default-features = false, features = ["alloc"
 
 Token and payment verification remain available in this configuration. Construct the trust base with `RootTrustBase::try_new`; JSON parsing requires `std`.
 
-## Proof status hints (unauthenticated)
-
-`HttpAggregatorClient` asks aggregators for a status hint (`includeStatus` on `get_inclusion_proof.v2`; aggregator-go issue #209). While waiting for a proof, `pending` keeps polling at the configured cadence, `expired` stops at once with `HttpError::StateExpired` (the same signed request may be resubmitted) and `unknown` stops with `HttpError::StateUnknown` after a short grace (`with_unknown_grace`, default 2 answers: right after a submission another replica may not have seen the request yet). `lookup_inclusion_proof` returns the hint next to the response without waiting. Servers that predate the hint answer with a plain string and everything behaves as before, as it does for status values this version does not know.
-
-The status is **only a hint for control flow and user feedback**. It is not a proof of anything: `unknown` does not show a state was never certified or is unspent, `expired` does not show it is unspent, and an `included` hint is worth nothing without a proof that verifies. A certified proof is returned whatever the hint says, and no token, proof or certificate verification ever depends on it. In batch consolidation the details `state_pending` (retryable), `state_expired`, `state_unknown` and `state_not_in_root` (not retryable) map to `UnavailableReason::{StatePending, StateExpired, StateUnknown, StateNotInRoot}`.
-
-**Resubmitting after `unknown`/`expired`.** A request is signed and deterministic, so sending it again is the same request: the aggregator never creates a second leaf. `resubmit_certification_request` is the idempotent form of the submission: it returns `SubmitOutcome::AlreadySubmitted` instead of an error when the aggregator already holds a record for the state id, which the server reports in two ways (by state id alone, so a *different* request for the same state, such as a conflicting spend, is reported the same way): the Mongo-backed queue refuses the copy of a still-pending request with an internal error (code -32603) whose data names a *duplicate key* (recognized by that text, as the server has no machine code for it; the Redis-backed queue silently accepts and drops the copy), and `STATE_ID_EXISTS` when it is already certified. Every other rejection, such as `REQUEST_EXPIRED`, stays an error, and the plain `submit_certification_request` keeps reporting both duplicate responses as errors. `submit_and_wait(data, max_resubmits)` combines submission, waiting and at most `max_resubmits` resubmissions after `StateUnknown`/`StateExpired`, and requires the proof to certify exactly the submitted data: if the state id was certified with another request it fails with `HttpError::ProofOfOtherData` (an unauthenticated hint, no resubmission) instead of returning the other transaction's proof; `submit_and_wait_verified(data, max_resubmits, &trust_base)` authenticates that proof first and reports `HttpError::StateCertifiedWithOtherData` (the race is really lost) only if it verifies. With several aggregator instances behind a load balancer a node that did not admit the request may answer `unknown`; after a restart the in-memory status is empty, so queued requests answer `unknown` until a round pulls them.
-
-## Aggregation partition
-
-All Unicity networks use one aggregation partition, exported as `unicity_token::AGGREGATION_PARTITION_ID` (`u32`, value `7`; also `unicity_token::api::AGGREGATION_PARTITION_ID`). It is a protocol constant, not configuration: there is no environment, constructor or per-network override, and a proof never selects its own expected partition. Network authentication stays mandatory (the trust base fixes the network, authority and epoch).
-
-Every application verification path requires the authenticated unicity certificate to be of that partition and otherwise fails with `VerificationError::PartitionMismatch`: ordinary inclusion verification, token verification (genesis, transfers and nested source tokens), non-inclusion verification, and consolidation (input proofs, partition views, enclosing certificates and the unsharded direct target). The check runs before the seal memo is consulted, so a cached seal can not carry a certificate of another partition. Generic codecs (`UnicityTreeCertificate`, `PartitionView::from_cbor`) stay partition-agnostic and never confer verification success.
-
-Migration from the previous API:
-
-- `ProofClientConfig.partition_id` is removed; construct `ProofClientConfig { topology }`.
-- `PartitionView::{validate_structure, build_shard_tree, verify_tree, authenticate, assemble_certificates}` lost their `partition: u32` argument.
-- The `UNICITY_PARTITION_ID` variable of the consolidation examples is gone.
-- Certificates, tokens and fixtures that certify another partition (the test value `0`, `0x0a0b0c0d`, `1`) no longer verify. They must be re-signed for partition 7; signed bytes are never patched and there is no test bypass in production verification.
-
-## Non-inclusion (snapshot) verification
-
-`NonInclusionProof::verify_at_snapshot` (and `verify_for_at_snapshot` for a directly decoded proof, `verify::verify_non_inclusion_at_snapshot` / `verify_non_inclusion_in` for explicit sessions) authenticates the unicity certificate (shape, trusted network, authority and epoch interval, quorum, the fixed aggregation partition, the shard and partition commitments with the optional pins of a `NonInclusionContext`, the query binding and the full state-tree relation) and only then returns a `NonInclusionOutcome`:
-
-- `AbsentAtSnapshot { state_id, snapshot }`
-- `IncludedAtSnapshot { state_id, snapshot }` (a valid path proves the exact key present)
-- `Err(VerificationError)`: rejected, no snapshot metadata.
-
-`NonInclusionSnapshot` exposes `network_id`, `partition_id`, `shard_id`, `root_round`, `seal_timestamp_seconds` (Unix seconds), `root_epoch`, `shard_round`, `shard_epoch` and `state_root` (`None` is the certified empty tree), all read from the authenticated certificate, never from the RPC block number or receipt time. It owns copies of its data.
-
-> **Non-inclusion proves absence only at the authenticated snapshot returned by verification. It does not prove absence now, continuous absence, or that a token can be spent. Compare the snapshot’s network and root round (or its certified seal timestamp under your application’s time policy) with an independently trusted requirement. The seal timestamp is a consensus-certified time, not proof of real-time freshness. Do not use unverified response metadata for this check.**
-
-```rust
-// `checkpoint` is obtained independently of the proof and of the server response.
-let outcome = proof.verify_at_snapshot(&trust_base, &NonInclusionContext::new())?;
-let NonInclusionOutcome::AbsentAtSnapshot { snapshot, .. } = outcome else {
-    return Err("no verified absence".into());
-};
-if snapshot.network_id().id() != checkpoint.network_id
-    || snapshot.root_round() < checkpoint.required_root_round
-{
-    return Err("snapshot does not meet application policy".into());
-}
-// Absence at `snapshot` only; any spend/finality decision needs its own policy.
-```
-
-`NonInclusionContext::new()` expects the **unsharded** partition (the certificate's shard is the empty shard), like Go's verifier with its empty `Shard`. For a sharded partition pin the shard you serve: `NonInclusionContext::new().with_shard(shard)`; the certificate's shard id and complete shard path must then be that shard's, and the query and terminal must belong to it. The unicity certificate is authenticated first (as in Go), so a rejection class is the certificate's own before the path is judged.
-
-`NonInclusionProof::for_state` only records which state id a proof was requested for; it is request bookkeeping, not evidence.
-
-Migration from the previous API:
-
-- `verify`, `verify_for`, `verify_in_context`, `verify_for_in_context` and the free functions `verify_non_inclusion_proof` / `verify_non_inclusion_proof_in_context` are removed. Use `verify_at_snapshot` / `verify_for_at_snapshot` (the context is now always explicit; `NonInclusionContext::new()` pins the unsharded partition).
-- `NonInclusionContext::new` takes no partition (it is `AGGREGATION_PARTITION_ID`) and `with_min_root_round`, `VerificationError::SealTooOld` (the "stale" verdict) are removed: freshness is the caller's decision on the returned snapshot, as above.
-- `VerificationError::StateIncluded` is gone: an included state is the successful outcome `IncludedAtSnapshot`. The transport error `HttpError::StateIncluded` (the server said so; unauthenticated) is unchanged.
-- `NonInclusionCertificate::verify` is replaced by `relation_to_trusted_root` returning `PathRelation::{Absent, Present}` against a root the caller already trusts.
-
-## Partition views and seal reuse (building blocks)
-
-`unicity_token::consolidation` (pure `no_std + alloc`, no network) decodes the frozen `PartitionViewV1` — the complete shard-leaf vector of a partition under one unicity seal — as an *untrusted candidate*. `PartitionView::authenticate` validates its structure, rebuilds the native shard tree, follows the enclosing certificate's partition path to the seal hash, matches the enclosing leaf exactly and authenticates the complete seal under *your* anchored `RootTrustBase` (network, exact epoch, round ≥ epoch start, quorum); only then it returns an immutable `AuthenticatedView`, the sole input of `certificates()` (ordinary unicity certificates of every shard, all carrying the identical master seal). No peer configuration list is needed: the seal commits to every leaf's configuration hash. Independently pinned shard configuration hashes (`Some(&PartitionTopology)`) are an optional stricter policy and are part of `AuthenticatedView::identity()`. The authority is never taken from a response.
-
-Verification of tokens authenticates each distinct complete seal once per operation (`verify::SealSession`, a bounded memo of successful quorum checks bound to one trust base). Only the quorum-signature check is reused; paths, reference times, predicates and application rules run for every proof. `verify::verify_token_with_seal_stats` reports the signature work performed. This does not shrink tokens or change their format, and nested proofs that carry other seals still need their own check. Nothing here contacts an aggregator or consolidates a token automatically.
-
-## Explicit proof consolidation (opt-in)
-
-With the `client` feature, `client::ProofClient::consolidate(&token, &options)` returns a *new*, fully verified token whose replaceable outer-history proofs share one unicity seal — useful before EVM / bridge-back or zkVM verification, where a verifier that reuses a successful quorum check pays for the signatures once. It is never automatic (nothing in mint, transfer, receive, import, serialization or `Token::verify` calls it), needs no signing key, and never submits or resubmits a transaction. The token format and size do not change, and proofs nested in signed mint justifications or split/burn dependencies stay byte-identical (they may still need their own seals; the summary reports outer-history and whole-verification quorum checks separately).
-
-An attempt asks the *master* shard (the one with the newest authenticated evidence) for its latest batch and partition view, authenticates it under your trust base and configured topology, then fetches the exact roots the authenticated view names from the other participating shards (bounded parallel on a host), all under one deadline and one `CancelToken`. The batch call is the optional `client::BatchAggregatorClient` capability (`get_inclusion_proofs.v1`), implemented by `HttpAggregatorClient`; it is never emulated from single-proof calls. Results are typed: `Consolidated`, or `Unavailable { reason, retryable }` for missing capability / unretained or not-yet-published views / busy (the original token is untouched), versus errors for integrity failures, transport and server failures, timeouts and cancellation. See `examples/consolidate_for_bridge.rs` and `examples/consolidate_for_zkvm.rs`. Pure planning and checked reconstruction (`consolidation::{ShardRouter, outer_proofs, rebuild_token, ..}`) are `no_std + alloc`.
-
 ## Development
 
 ```bash
@@ -211,6 +151,7 @@ cargo test --features http --test e2e -- --ignored --nocapture
 ## Resources
 
 - [Unicity Network](https://github.com/unicitynetwork/)
+- [API reference](./docs/api-reference.md)
 - [Examples](./examples) and [standalone demo](./e2e/README.md)
 - [Report an issue](https://github.com/unicitynetwork/state-transition-sdk-rust/issues)
 
