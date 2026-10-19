@@ -12,8 +12,6 @@ use unicity_token::predicate::builtin::SignaturePredicate;
 use unicity_token::transaction::ids::{StateMask, TokenSalt, TokenType};
 use unicity_token::transaction::Token;
 
-const DEFAULT_GATEWAY: &str = "https://gateway.testnet2.unicity.network/";
-const DEFAULT_TRUSTBASE: &str = "bft-trustbase.testnet2.json";
 const DEFAULT_OUTPUT_DIR: &str = "artifacts";
 
 fn request_timeout() -> Result<u64, Box<dyn Error>> {
@@ -107,9 +105,9 @@ struct Config {
 
 impl Config {
     fn load() -> Result<Self, Box<dyn Error>> {
-        let gateway = env::var("UNICITY_GATEWAY")
-            .ok()
-            .unwrap_or_else(|| DEFAULT_GATEWAY.to_owned());
+        let gateway = env::var("UNICITY_GATEWAY").map_err(|_| {
+            "set UNICITY_GATEWAY to your deployment's aggregator URL (testnet2's V1 trust base is not supported by this major version)"
+        })?;
         let api_key = env::var("UNICITY_API_KEY")
             .ok()
             .filter(|value| !value.is_empty())
@@ -118,9 +116,9 @@ impl Config {
         Ok(Self {
             gateway,
             api_key,
-            trustbase: env::var_os("UNICITY_TRUSTBASE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_TRUSTBASE)),
+            trustbase: env::var_os("UNICITY_TRUSTBASE").map(PathBuf::from).ok_or(
+                "set UNICITY_TRUSTBASE to your deployment's V2 genesis (JSON or CBOR) or release bundle; dev/ has a development fixture",
+            )?,
             output_dir: env::var_os("UNICITY_OUTPUT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_DIR)),
