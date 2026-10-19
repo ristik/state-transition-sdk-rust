@@ -91,6 +91,18 @@ fn every_case_has_the_b1_verdict() {
     for c in v["cases"].as_array().unwrap() {
         let id = c["id"].as_str().unwrap();
         let verdict = c["verdict"].as_str().unwrap();
+        // B1 re-encodes byte-exactly: a decoded `null` path collection stays `null`
+        // (two of the valid certificates carry one), whatever else is encoded
+        if verdict == "valid" {
+            let uc =
+                UnicityCertificate::from_cbor(unicity_token::cbor::Decoder::new(&bytes(&c["uc"])))
+                    .unwrap();
+            assert_eq!(
+                uc.to_cbor(),
+                bytes(&c["uc"]),
+                "{id}: re-encoding is byte-exact"
+            );
+        }
         let history = history(c);
         let partition = c["expectedPartition"].as_u64().unwrap() as u32;
         let got =

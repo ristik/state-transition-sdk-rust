@@ -121,12 +121,15 @@ pub fn update_trust_base<S: TrustBaseSource>(
             .epoch
             .checked_add(1)
             .ok_or(UpdateError::Protocol("epoch overflow"))?;
+        // never ask for more than the per-call cap still allows
+        let remaining = limits.total_entries.saturating_sub(added).max(1);
+        let asked = page_entries.min(u32::try_from(remaining).unwrap_or(u32::MAX));
         let page = source
             .get_trust_bases(&TrustBaseRequest {
                 from,
                 to: None,
                 snapshot,
-                max_entries: page_entries,
+                max_entries: asked,
             })
             .map_err(UpdateError::Source)?;
         if page.network_id != history.network_id() {
@@ -153,7 +156,7 @@ pub fn update_trust_base<S: TrustBaseSource>(
                 "the page does not start at the requested epoch",
             ));
         }
-        if page.entries.len() > page_entries as usize {
+        if page.entries.len() > asked as usize {
             return Err(UpdateError::Protocol("more entries than requested"));
         }
         if page.entries.is_empty() && page.next_epoch.is_some() {
@@ -279,6 +282,7 @@ mod waiting {
         let start = Instant::now();
         let mut attempts = 0u32;
         let mut added_total = 0usize;
+        let mut capped = false;
         loop {
             let err = match crate::verify::verify_token(token, history) {
                 Ok(()) => return Ok(()),
@@ -287,6 +291,14 @@ mod waiting {
             let Some(wanted) = err.unknown_trust_epoch() else {
                 return Err(VerifyUpdateError::Verification(err));
             };
+            if capped {
+                // the entry cap was reached and the last page did not bring the epoch
+                return Err(VerifyUpdateError::EpochUnavailable {
+                    held: history.latest().epoch,
+                    wanted,
+                    attempts,
+                });
+            }
             let remaining = policy.limits.total_entries.saturating_sub(added_total);
             let limits = UpdateLimits {
                 total_entries: remaining.max(1),
@@ -297,13 +309,9 @@ mod waiting {
             {
                 UpdateOutcome::Extended { added } => {
                     added_total += added;
-                    if added_total >= policy.limits.total_entries {
-                        return Err(VerifyUpdateError::EpochUnavailable {
-                            held: history.latest().epoch,
-                            wanted,
-                            attempts,
-                        });
-                    }
+                    // at the cap: verify once more (the last page may have brought the epoch),
+                    // then give up
+                    capped = added_total >= policy.limits.total_entries;
                 }
                 UpdateOutcome::NotYetAvailable { held, added } => {
                     added_total += added;
@@ -325,5 +333,273 @@ mod waiting {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "client"))]
+mod tests {
+    //! The guards of `update_trust_base` against a scripted source. Each test violates exactly
+    //! one of them, so removing that guard makes it fail.
+    use super::*;
+    use crate::api::bft::{TrustBaseEntry, TrustBaseMember};
+    use crate::api::NetworkId;
+    use crate::crypto::signer::{Secp256k1Signer, Signer};
+    use alloc::collections::VecDeque;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    /// One validator, so a single signature is a quorum: epochs `1..=n`.
+    fn chain(n: u64) -> Vec<TrustBaseEntry> {
+        let s = Secp256k1Signer::from_bytes(&[5; 32]).unwrap();
+        let members = || vec![TrustBaseMember::new("n0", s.public_key(), 1)];
+        let mut out = vec![TrustBaseEntry::genesis(NetworkId::LOCAL, 1, 1, members())];
+        for e in 2..=n {
+            let prev = out.last().unwrap();
+            let mut next = TrustBaseEntry::new(
+                NetworkId::LOCAL,
+                e,
+                prev.epoch_start + 10,
+                members(),
+                1,
+                None,
+                None,
+                prev.entry_id(),
+            );
+            next.sign("n0", &s);
+            out.push(next);
+        }
+        out
+    }
+
+    fn history() -> TrustBaseHistory {
+        TrustBaseHistory::from_genesis(chain(1).remove(0), None).unwrap()
+    }
+
+    fn page(
+        from: u64,
+        end: u64,
+        entries: Vec<TrustBaseEntry>,
+        next: Option<u64>,
+        status: TrustBaseStatus,
+    ) -> TrustBasePage {
+        TrustBasePage {
+            network_id: NetworkId::LOCAL,
+            status,
+            from_epoch: from,
+            effective_end: end,
+            end_entry_id: Some([7; 32]),
+            entries,
+            next_epoch: next,
+        }
+    }
+
+    struct Script {
+        pages: RefCell<VecDeque<TrustBasePage>>,
+        requests: RefCell<Vec<TrustBaseRequest>>,
+    }
+
+    impl Script {
+        fn new(pages: Vec<TrustBasePage>) -> Self {
+            Script {
+                pages: RefCell::new(pages.into()),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TrustBaseSource for Script {
+        type Error = &'static str;
+        fn get_trust_bases(&self, r: &TrustBaseRequest) -> Result<TrustBasePage, &'static str> {
+            self.requests.borrow_mut().push(r.clone());
+            self.pages
+                .borrow_mut()
+                .pop_front()
+                .ok_or("script exhausted")
+        }
+    }
+
+    fn run(
+        h: &mut TrustBaseHistory,
+        pages: Vec<TrustBasePage>,
+        want: u64,
+        limits: UpdateLimits,
+    ) -> (Result<UpdateOutcome, UpdateError<&'static str>>, Script) {
+        let s = Script::new(pages);
+        let r = update_trust_base(h, &s, want, &limits);
+        (r, s)
+    }
+
+    fn ok(from: u64, entries: Vec<TrustBaseEntry>, next: Option<u64>) -> TrustBasePage {
+        page(from, 9, entries, next, TrustBaseStatus::Ok)
+    }
+
+    #[test]
+    fn a_page_must_start_at_the_requested_epoch() {
+        let c = chain(3);
+        let mut h = history();
+        let (r, _) = run(
+            &mut h,
+            vec![ok(3, vec![c[1].clone()], None)], // asked from 2
+            2,
+            UpdateLimits::default(),
+        );
+        assert!(
+            matches!(r, Err(UpdateError::Protocol(m)) if m.contains("start")),
+            "{r:?}"
+        );
+        assert_eq!(h.latest().epoch, 1);
+    }
+
+    #[test]
+    fn a_page_may_not_carry_more_entries_than_asked() {
+        let c = chain(3);
+        let mut h = history();
+        let limits = UpdateLimits {
+            page_entries: 1,
+            total_entries: 100,
+        };
+        let (r, s) = run(
+            &mut h,
+            vec![ok(2, vec![c[1].clone(), c[2].clone()], None)],
+            3,
+            limits,
+        );
+        assert!(
+            matches!(r, Err(UpdateError::Protocol(m)) if m.contains("more entries")),
+            "{r:?}"
+        );
+        assert_eq!(s.requests.borrow()[0].max_entries, 1);
+        assert_eq!(h.latest().epoch, 1);
+    }
+
+    #[test]
+    fn an_empty_page_with_a_continuation_is_refused() {
+        let mut h = history();
+        let (r, _) = run(
+            &mut h,
+            vec![ok(2, vec![], Some(2))],
+            2,
+            UpdateLimits::default(),
+        );
+        assert!(
+            matches!(r, Err(UpdateError::Protocol(m)) if m.contains("empty page")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_held_entry_is_refused() {
+        let c = chain(2);
+        let mut h = history();
+        // a page that starts where asked but carries the entry already held
+        let (r, _) = run(
+            &mut h,
+            vec![ok(2, vec![c[0].clone()], None)],
+            2,
+            UpdateLimits::default(),
+        );
+        assert!(
+            matches!(r, Err(UpdateError::Protocol(m)) if m.contains("repeated")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_continuation_may_not_skip_an_epoch() {
+        let c = chain(4);
+        let mut h = history();
+        let (r, _) = run(
+            &mut h,
+            vec![ok(2, vec![c[1].clone()], Some(4))], // the next page should start at 3
+            4,
+            UpdateLimits::default(),
+        );
+        assert!(
+            matches!(r, Err(UpdateError::Protocol(m)) if m.contains("skips")),
+            "{r:?}"
+        );
+        assert_eq!(h.latest().epoch, 2, "the verified entry stays");
+    }
+
+    #[test]
+    fn a_page_of_another_network_is_refused() {
+        let c = chain(2);
+        let mut h = history();
+        let mut p = ok(2, vec![c[1].clone()], None);
+        p.network_id = NetworkId::MAINNET;
+        let (r, _) = run(&mut h, vec![p], 2, UpdateLimits::default());
+        assert_eq!(r, Err(UpdateError::Entry(HistoryError::WrongNetwork)));
+        assert_eq!(h.latest().epoch, 1);
+    }
+
+    #[test]
+    fn a_changed_chain_restarts_the_pagination_once_and_only_with_a_snapshot() {
+        let c = chain(6);
+        let mismatch = |from| page(from, 9, vec![], None, TrustBaseStatus::HistoryMismatch);
+
+        // one restart is allowed: snapshot, mismatch, restart without snapshot, snapshot, mismatch
+        let mut h = history();
+        let (r, s) = run(
+            &mut h,
+            vec![
+                ok(2, vec![c[1].clone()], Some(3)),
+                mismatch(3),
+                ok(3, vec![c[2].clone()], Some(4)),
+                mismatch(4),
+                ok(4, vec![c[3].clone()], None), // never reached: a second restart is refused
+            ],
+            6,
+            UpdateLimits::default(),
+        );
+        assert_eq!(
+            r,
+            Err(UpdateError::Status(TrustBaseStatus::HistoryMismatch))
+        );
+        let requests = s.requests.borrow();
+        assert_eq!(requests.len(), 4, "exactly one restart");
+        assert!(requests[0].snapshot.is_none());
+        assert!(requests[1].snapshot.is_some());
+        assert!(
+            requests[2].snapshot.is_none(),
+            "the restart drops the snapshot"
+        );
+        assert!(requests[3].snapshot.is_some());
+
+        // a mismatch on a request that carried no snapshot is not a restart
+        let mut h = history();
+        let (r, s) = run(
+            &mut h,
+            vec![mismatch(2), ok(2, vec![c[1].clone()], None)],
+            2,
+            UpdateLimits::default(),
+        );
+        assert_eq!(
+            r,
+            Err(UpdateError::Status(TrustBaseStatus::HistoryMismatch))
+        );
+        assert_eq!(s.requests.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_per_call_cap_limits_what_is_asked() {
+        let c = chain(5);
+        let mut h = history();
+        let limits = UpdateLimits {
+            page_entries: 64,
+            total_entries: 2,
+        };
+        let (r, s) = run(
+            &mut h,
+            vec![ok(2, vec![c[1].clone(), c[2].clone()], Some(4))],
+            5,
+            limits,
+        );
+        assert_eq!(r, Ok(UpdateOutcome::Extended { added: 2 }));
+        assert_eq!(
+            s.requests.borrow()[0].max_entries,
+            2,
+            "no overshoot by a page"
+        );
     }
 }

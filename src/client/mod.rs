@@ -227,6 +227,11 @@ pub fn mint<A: AggregatorClient>(
 /// application shipped with), fetches the missing entries from the aggregator, appends them to
 /// `history` in place (verified from the latest held entry) and verifies again, within the
 /// bounds of `policy` (see [`verify_token_updating`]). Host only.
+///
+/// On [`ClientError::EpochUnavailable`] the token **is certified** (the request was submitted
+/// and its proof received) but not yet verifiable here: the token is not returned. Recover it
+/// later by fetching the proof again for the same transaction (`get_inclusion_proof` with the
+/// state id) and verifying with [`verify_token_updating`] once the epoch is available.
 #[cfg(feature = "std")]
 #[allow(clippy::too_many_arguments)]
 pub fn mint_updating<A>(

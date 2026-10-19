@@ -395,3 +395,129 @@ fn a_genesis_json_loads_to_the_pinned_identity() {
     assert!(TrustBaseEntry::from_json(&json.replace("\"version\":2", "\"version\":1")).is_err());
     assert!(TrustBaseEntry::from_json("{}").is_err());
 }
+
+// `from_trusted_chain` verifies no signature, so each structural check of the chain is the
+// only thing between a gap or a misordered list and a wrong committee judging a seal
+// (`TrustBaseHistory::get` finds an entry by its position). One violation per test.
+
+fn chain_entry(epoch: u64, start: u64, prev: [u8; 32], net: u16) -> TrustBaseEntry {
+    let mut e = TrustBaseEntry::genesis(NetworkId::new(net).unwrap(), epoch, start, members(&FOUR));
+    e.previous_entry_id = prev;
+    if prev != [0; 32] {
+        e.add_signature("a", vec![0; 65]); // a placeholder witness: the chain is trusted
+    }
+    e
+}
+
+#[test]
+fn a_trusted_chain_with_every_link_in_order_is_accepted() {
+    let e1 = chain_entry(1, 1, [0; 32], NET);
+    let e2 = chain_entry(2, 5, e1.entry_id(), NET);
+    let e3 = chain_entry(3, 9, e2.entry_id(), NET);
+    let h = TrustBaseHistory::from_trusted_chain(vec![e1, e2, e3]).unwrap();
+    assert_eq!((h.genesis().epoch, h.latest().epoch), (1, 3));
+    assert_eq!(h.get(2).unwrap().epoch, 2);
+}
+
+#[test]
+fn a_trusted_chain_refuses_another_predecessor() {
+    let e1 = chain_entry(1, 1, [0; 32], NET);
+    let e2 = chain_entry(2, 5, [9; 32], NET); // not e1's identity
+    assert!(matches!(
+        TrustBaseHistory::from_trusted_chain(vec![e1, e2]),
+        Err(HistoryError::Entry(TrustBaseError::Chain(m))) if m.contains("previous entry id")
+    ));
+}
+
+#[test]
+fn a_trusted_chain_refuses_a_gap_in_the_epochs() {
+    let e1 = chain_entry(1, 1, [0; 32], NET);
+    let e3 = chain_entry(3, 5, e1.entry_id(), NET); // epoch 2 is missing
+    assert_eq!(
+        TrustBaseHistory::from_trusted_chain(vec![e1, e3]),
+        Err(HistoryError::Gap {
+            held: 1,
+            offered: 3
+        })
+    );
+}
+
+#[test]
+fn a_trusted_chain_refuses_a_start_round_that_does_not_rise() {
+    let e1 = chain_entry(1, 5, [0; 32], NET);
+    let e2 = chain_entry(2, 5, e1.entry_id(), NET); // same start as its predecessor
+    assert!(matches!(
+        TrustBaseHistory::from_trusted_chain(vec![e1, e2]),
+        Err(HistoryError::Entry(TrustBaseError::Chain(m))) if m.contains("start")
+    ));
+}
+
+#[test]
+fn a_trusted_chain_refuses_another_network() {
+    let e1 = chain_entry(1, 1, [0; 32], NET);
+    let e2 = chain_entry(2, 5, e1.entry_id(), NET + 1);
+    assert_eq!(
+        TrustBaseHistory::from_trusted_chain(vec![e1, e2]),
+        Err(HistoryError::WrongNetwork)
+    );
+}
+
+// ---- the GetTrustBase page decoder: bounds and strictness that only one check can catch ----
+
+use unicity_token::api::bft::TrustBasePage;
+use unicity_token::cbor::{encode_array, encode_byte_string, encode_null, encode_tag, encode_uint};
+
+fn page_bytes(network: u16, from: u64, end: u64, entries: &[Vec<u8>]) -> Vec<u8> {
+    let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+    encode_tag(
+        39015,
+        &encode_array(&[
+            &encode_uint(1),
+            &encode_uint(u64::from(network)),
+            &encode_uint(0),
+            &encode_uint(from),
+            &encode_uint(end),
+            &encode_byte_string(&[7; 32]),
+            &encode_array(&refs),
+            &encode_null(),
+        ]),
+    )
+}
+
+/// `n` contiguous, valid, signed entries from epoch 2 (successors of the test genesis).
+fn successors(n: usize) -> Vec<Vec<u8>> {
+    let mut prev = genesis();
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let next = successor(&prev, &FOUR, &ABC);
+        out.push(next.to_cbor());
+        prev = next;
+    }
+    out
+}
+
+#[test]
+fn a_page_holds_at_most_64_entries() {
+    let entries = successors(65);
+    let ok = TrustBasePage::from_cbor(&page_bytes(NET, 2, 66, &entries[..64])).unwrap();
+    assert_eq!(ok.entries.len(), 64);
+    // 65 valid contiguous entries: only the entry cap refuses them
+    assert!(TrustBasePage::from_cbor(&page_bytes(NET, 2, 66, &entries)).is_err());
+}
+
+#[test]
+fn a_page_is_one_item_without_trailing_bytes() {
+    let entries = successors(2);
+    let mut bytes = page_bytes(NET, 2, 3, &entries);
+    assert!(TrustBasePage::from_cbor(&bytes).is_ok());
+    bytes.push(0);
+    assert!(TrustBasePage::from_cbor(&bytes).is_err());
+}
+
+#[test]
+fn the_entries_of_a_page_are_of_the_pages_network() {
+    let entries = successors(1);
+    // the entries are of network NET, the header says another one
+    assert!(TrustBasePage::from_cbor(&page_bytes(NET, 2, 2, &entries)).is_ok());
+    assert!(TrustBasePage::from_cbor(&page_bytes(NET + 1, 2, 2, &entries)).is_err());
+}

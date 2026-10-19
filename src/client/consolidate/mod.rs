@@ -698,8 +698,8 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         };
         if before == 1 {
             // Already under one seal. Reuse is only sound when that shared seal is also
-            // acceptable *as a consolidation target*: the fixed authority's network, exact
-            // epoch and start, and the configured policy. Otherwise fall through to fetch
+            // acceptable *as a consolidation target*: judged by the entry of its own epoch
+            // (network, epoch window, quorum), and the configured policy. Otherwise fall through to fetch
             // a target that is.
             let policy = view_policy(Some(&self.config.topology));
             let seal = &items[0].proof.unicity_certificate.unicity_seal;

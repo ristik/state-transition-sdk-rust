@@ -223,8 +223,21 @@ fn the_history_is_extended_from_the_genesis_over_http() {
 
 #[test]
 fn bad_answers_are_errors() {
-    let wrong_type = serve(Box::new(|_| {
-        (200, "application/json".into(), b"{}".to_vec())
+    // a perfectly good page, served under the wrong content type: only the header check refuses it
+    let (network, _) = chain();
+    let valid = response(network, 3, 9, 4, None, &[], None);
+    let wrong_type = {
+        let valid = valid.clone();
+        serve(Box::new(move |_| {
+            (200, "application/json".into(), valid.clone())
+        }))
+    };
+    let right_type = serve(Box::new(move |_| {
+        (
+            200,
+            "application/cbor; charset=binary".into(),
+            valid.clone(),
+        )
     }));
     let bad_request = serve(Box::new(|_| {
         (400, "text/plain".into(), b"bad from".to_vec())
@@ -245,6 +258,10 @@ fn bad_answers_are_errors() {
         HttpAggregatorClient::new_insecure_http(url.to_string()).get_trust_bases(&request)
     };
     assert!(matches!(get(&wrong_type.0), Err(HttpError::Decode(_))));
+    assert_eq!(
+        get(&right_type.0).unwrap().status,
+        TrustBaseStatus::NotYetAvailable
+    );
     assert!(matches!(
         get(&bad_request.0),
         Err(HttpError::Http { status: 400, .. })

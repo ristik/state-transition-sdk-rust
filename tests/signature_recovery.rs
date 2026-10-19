@@ -139,6 +139,30 @@ mod native_seal_rule {
             Err(SealSignatureError::Format)
         );
 
+        // a high-s copy of a valid signature (s' = n - s) is valid ECDSA but not canonical
+        const N: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ];
+        let mut high = wire.clone();
+        let mut borrow = 0i32;
+        for i in (0..32).rev() {
+            let d = i32::from(N[i]) - i32::from(wire[32 + i]) - borrow;
+            borrow = i32::from(d < 0);
+            high[32 + i] = (d + 256) as u8;
+        }
+        assert_ne!(high[32..64], wire[32..64]);
+        assert_eq!(
+            verify_seal_signature(&high, d, &key),
+            Err(SealSignatureError::Range),
+            "high-s"
+        );
+        assert_eq!(
+            verify_seal_signature(&high[..64], d, &key),
+            Err(SealSignatureError::Range)
+        );
+
         // r = 0 and s = 0 are out of range
         let mut zero_r = wire.clone();
         zero_r[..32].fill(0);

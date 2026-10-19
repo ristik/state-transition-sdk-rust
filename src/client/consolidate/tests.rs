@@ -2515,3 +2515,62 @@ fn mint_and_transfer_update_the_history_for_a_fresh_proof() {
     .unwrap_or_else(|e| panic!("transfer_updating: {e}"));
     assert_eq!(moved.transactions().len(), 1);
 }
+
+#[test]
+fn the_deadline_bounds_the_wait_before_the_attempts_do() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    sim.lock().unwrap().upgrade_epoch();
+    let token = make_token(&sim, 31, None, 0);
+    sim.lock().unwrap().tb_serve_until = Some(1);
+    let mut history = old_history(&sim);
+    // 100 attempts of 50 ms would take 5 s; the 120 ms deadline ends it after a few
+    let policy = crate::client::UpdatePolicy {
+        interval: std::time::Duration::from_millis(50),
+        attempts: 100,
+        deadline: std::time::Duration::from_millis(120),
+        limits: crate::client::UpdateLimits::default(),
+    };
+    let started = std::time::Instant::now();
+    let err = crate::client::verify_token_updating(&token, &mut history, &node(&sim), &policy)
+        .unwrap_err();
+    let crate::client::VerifyUpdateError::EpochUnavailable { attempts, .. } = err else {
+        panic!("expected EpochUnavailable, got {err:?}");
+    };
+    assert!((1..=4).contains(&attempts), "attempts {attempts}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn at_the_entry_cap_the_token_is_verified_once_more() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    for _ in 0..3 {
+        sim.lock().unwrap().upgrade_epoch();
+    }
+    let token = make_token(&sim, 32, None, 0); // sealed in epoch 4: needs exactly 3 entries
+    let capped = |total_entries| crate::client::UpdatePolicy {
+        limits: crate::client::UpdateLimits {
+            page_entries: 64,
+            total_entries,
+        },
+        ..fast_policy()
+    };
+    // the cap is exactly what is needed: the last page brings the epoch, verification succeeds
+    let mut history = old_history(&sim);
+    crate::client::verify_token_updating(&token, &mut history, &node(&sim), &capped(3)).unwrap();
+    assert_eq!(history.latest().epoch, 4);
+    // one entry short: unavailable within the cap, and nothing more than the cap was asked
+    let mut history = old_history(&sim);
+    let before = sim.lock().unwrap().tb_requests.len();
+    let err = crate::client::verify_token_updating(&token, &mut history, &node(&sim), &capped(2))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::client::VerifyUpdateError::EpochUnavailable {
+            held: 3,
+            wanted: 4,
+            ..
+        }
+    ));
+    let requests = sim.lock().unwrap().tb_requests.clone();
+    assert!(requests[before..].iter().all(|r| r.max_entries <= 2));
+}
