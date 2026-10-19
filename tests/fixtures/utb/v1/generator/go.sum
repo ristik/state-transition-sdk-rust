@@ -372,8 +372,8 @@ github.com/raulk/go-watchdog v1.3.0 h1:oUmdlHxdkXRJlwfG0O9omj8ukerm8MEQavSiDTEtB
 github.com/raulk/go-watchdog v1.3.0/go.mod h1:fIvOnLbF0b0ZwkB9YU4mOW9Did//4vPZtDqv66NfsMU=
 github.com/ristik/bft-core v1.1.1-0.20261019184919-a20708b64a1c h1:DnbJuJkIm9qnoAJ39goBQn0YOciOALaJqEVz8XRdN2s=
 github.com/ristik/bft-core v1.1.1-0.20261019184919-a20708b64a1c/go.mod h1:du8qG5qrJ3QnQMLZ8/gnbETP6kryod/StsFTUZaSfSI=
-github.com/ristik/bft-go-base v1.1.1-0.20261019185200-6174434eeb99 h1:R3DO7ZNRQbByK2eGkhb2rheTqf/x7lfXzSu+Ve1uCQs=
-github.com/ristik/bft-go-base v1.1.1-0.20261019185200-6174434eeb99/go.mod h1:hBnOG52VRy/vpgIBUulTgk7PBTwODZ2xkVjCEu5yRcQ=
+github.com/ristik/bft-go-base v1.1.1-0.20261019192448-f1fc4e5784b3 h1:A/k6NnD4HLqsucCYU+gAen1fDQPNDRDqkSQEy9BEwjo=
+github.com/ristik/bft-go-base v1.1.1-0.20261019192448-f1fc4e5784b3/go.mod h1:hBnOG52VRy/vpgIBUulTgk7PBTwODZ2xkVjCEu5yRcQ=
 github.com/rogpeppe/go-internal v1.13.1 h1:KvO1DLK/DRN07sQ1LQKScxyZJuNnedQ5/wKSR38lUII=
 github.com/rogpeppe/go-internal v1.13.1/go.mod h1:uMEvuHeurkdAXX61udpOXGD/AzZDWNMNyH2VO9fmH0o=
 github.com/russross/blackfriday v1.5.2/go.mod h1:JO/DiYxRf+HjHt06OyowR9PTA263kcR/rfWxYHBV53g=
