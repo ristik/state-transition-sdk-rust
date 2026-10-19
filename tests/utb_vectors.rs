@@ -221,3 +221,39 @@ fn trust_base_pages_are_decoded_strictly() {
         "trailing byte"
     );
 }
+
+/// The development fixture of the `e2e/` demo (`e2e/dev`) is the shared test chain: its genesis
+/// (JSON and the pinned identity) and its release bundle load, and the bundle is the Go
+/// generator's `bundle.complete` byte for byte.
+#[test]
+fn the_dev_fixture_of_the_demo_loads() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/e2e/dev");
+    let pin: [u8; 32] = hex::decode(
+        std::fs::read_to_string(format!("{dir}/bft-trustbase.dev.genesis.entryid"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let genesis = std::fs::read(format!("{dir}/bft-trustbase.dev.genesis.json")).unwrap();
+    let from_json = TrustBaseHistory::from_file(&genesis, Some(pin)).unwrap();
+    assert_eq!(from_json.latest().epoch, 1);
+    assert_eq!(
+        TrustBaseHistory::from_file(&genesis, Some([1; 32])),
+        Err(HistoryError::PinMismatch)
+    );
+
+    let bundle = std::fs::read(format!("{dir}/bft-trustbase.dev.bundle.cbor")).unwrap();
+    let history = TrustBaseHistory::from_file(&bundle, Some(pin)).unwrap();
+    assert_eq!(history.latest().epoch, 4);
+    assert_eq!(history.genesis_id(), pin);
+    let v = load();
+    let go = v["bundleCases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "bundle.complete")
+        .unwrap();
+    assert_eq!(bundle, bytes(&go["input"]));
+}

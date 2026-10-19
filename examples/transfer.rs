@@ -19,16 +19,17 @@ use unicity_token::predicate::builtin::SignaturePredicate;
 use unicity_token::transaction::ids::{StateMask, TokenSalt, TokenType};
 use unicity_token::transaction::Token;
 
-const DEFAULT_GATEWAY: &str = "https://gateway.testnet2.unicity.network/";
-const DEFAULT_TRUSTBASE: &str = "bft-trustbase.testnet2.json";
-
 /// Build an aggregator client and its trust base from `e2e/.env`.
 fn load() -> (HttpAggregatorClient, TrustBaseHistory) {
     dotenvy::from_path("e2e/.env").ok();
 
-    let gateway = std::env::var("UNICITY_GATEWAY").unwrap_or_else(|_| DEFAULT_GATEWAY.to_string());
+    let gateway = std::env::var("UNICITY_GATEWAY").unwrap_or_else(|_| {
+        panic!("set UNICITY_GATEWAY to your deployment's aggregator URL (testnet2's V1 trust base is not supported by this major version)")
+    });
     let trustbase =
-        std::env::var("UNICITY_TRUSTBASE").unwrap_or_else(|_| DEFAULT_TRUSTBASE.to_string());
+        std::env::var("UNICITY_TRUSTBASE").unwrap_or_else(|_| {
+        panic!("set UNICITY_TRUSTBASE to your deployment's V2 genesis (JSON or CBOR) or release bundle; e2e/dev has a development fixture")
+    });
     let trustbase_path = if Path::new(&trustbase).is_absolute() {
         trustbase
     } else {

@@ -25,9 +25,9 @@ Connection parameters are read from `e2e/.env` (copy `e2e/.env.example` and set
 your key):
 
 ```
-UNICITY_GATEWAY=https://gateway.testnet2.unicity.network/
+UNICITY_GATEWAY=https://your-aggregator.example/
 UNICITY_API_KEY=sk_…
-UNICITY_TRUSTBASE=bft-trustbase.testnet2.json  # a V2 genesis JSON, a genesis entry or a release bundle
+UNICITY_TRUSTBASE=/path/to/bft-trustbase.bundle.cbor  # your deployment's V2 genesis (JSON or CBOR) or release bundle
 ```
 
 Values already present in the process environment take precedence. The examples

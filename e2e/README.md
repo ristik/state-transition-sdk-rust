@@ -1,7 +1,7 @@
-# Live testnet2 end-to-end demo
+# Live end-to-end demo
 
 This standalone program exercises the Rust State Transition SDK against the
-Unicity testnet2 gateway. It:
+gateway of your own deployment. This major version verifies **V2** trust bases only; testnet2's V1 trust base is not supported. It:
 
 1. Generates fresh Alice and Bob secp256k1 wallets in memory.
 2. Mints a token to Alice and waits for its inclusion proof.
@@ -16,7 +16,7 @@ From this directory:
 
 ```sh
 cp .env.example .env
-# Edit .env and set UNICITY_API_KEY.
+# Edit .env: UNICITY_GATEWAY, UNICITY_API_KEY and UNICITY_TRUSTBASE (your deployment's V2 genesis or bundle).
 cargo run --release
 ```
 
@@ -26,14 +26,14 @@ environments. `.env` is git-ignored and the credential is never written to the
 generated token files. Mint and transfer requests set an exclusive
 `expiresAt` deadline one hour ahead of the current Unix time.
 
-Defaults:
+Configuration (no network defaults: the demo talks to your deployment):
 
-- Gateway: `https://gateway.testnet2.unicity.network/`
-- Trustbase: `./bft-trustbase.testnet2.json`
-- Output directory: `./artifacts`
-
-Configure or override these with `UNICITY_GATEWAY`, `UNICITY_API_KEY`,
-`UNICITY_TRUSTBASE`, and `UNICITY_OUTPUT_DIR`.
+- `UNICITY_GATEWAY` (required): the aggregator URL.
+- `UNICITY_API_KEY` (required).
+- `UNICITY_TRUSTBASE` (required): the deployment's V2 genesis (JSON or CBOR) or release bundle.
+  [`dev/`](./dev) holds a development fixture (public test keys) that shows the formats; it only
+  verifies against an aggregator whose validators use those keys.
+- `UNICITY_OUTPUT_DIR` (optional): default `./artifacts`.
 
 The generated wallets are intentionally ephemeral. Their private keys remain
 in process memory and are discarded when the demo exits.
