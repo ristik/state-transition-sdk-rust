@@ -461,3 +461,63 @@ fn a_trusted_chain_refuses_another_network() {
         Err(HistoryError::WrongNetwork)
     );
 }
+
+// ---- the GetTrustBase page decoder: bounds and strictness that only one check can catch ----
+
+use unicity_token::api::bft::TrustBasePage;
+use unicity_token::cbor::{encode_array, encode_byte_string, encode_null, encode_tag, encode_uint};
+
+fn page_bytes(network: u16, from: u64, end: u64, entries: &[Vec<u8>]) -> Vec<u8> {
+    let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+    encode_tag(
+        39015,
+        &encode_array(&[
+            &encode_uint(1),
+            &encode_uint(u64::from(network)),
+            &encode_uint(0),
+            &encode_uint(from),
+            &encode_uint(end),
+            &encode_byte_string(&[7; 32]),
+            &encode_array(&refs),
+            &encode_null(),
+        ]),
+    )
+}
+
+/// `n` contiguous, valid, signed entries from epoch 2 (successors of the test genesis).
+fn successors(n: usize) -> Vec<Vec<u8>> {
+    let mut prev = genesis();
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let next = successor(&prev, &FOUR, &ABC);
+        out.push(next.to_cbor());
+        prev = next;
+    }
+    out
+}
+
+#[test]
+fn a_page_holds_at_most_64_entries() {
+    let entries = successors(65);
+    let ok = TrustBasePage::from_cbor(&page_bytes(NET, 2, 66, &entries[..64])).unwrap();
+    assert_eq!(ok.entries.len(), 64);
+    // 65 valid contiguous entries: only the entry cap refuses them
+    assert!(TrustBasePage::from_cbor(&page_bytes(NET, 2, 66, &entries)).is_err());
+}
+
+#[test]
+fn a_page_is_one_item_without_trailing_bytes() {
+    let entries = successors(2);
+    let mut bytes = page_bytes(NET, 2, 3, &entries);
+    assert!(TrustBasePage::from_cbor(&bytes).is_ok());
+    bytes.push(0);
+    assert!(TrustBasePage::from_cbor(&bytes).is_err());
+}
+
+#[test]
+fn the_entries_of_a_page_are_of_the_pages_network() {
+    let entries = successors(1);
+    // the entries are of network NET, the header says another one
+    assert!(TrustBasePage::from_cbor(&page_bytes(NET, 2, 2, &entries)).is_ok());
+    assert!(TrustBasePage::from_cbor(&page_bytes(NET + 1, 2, 2, &entries)).is_err());
+}

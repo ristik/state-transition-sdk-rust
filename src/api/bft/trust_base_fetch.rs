@@ -132,9 +132,8 @@ impl TrustBasePage {
         if bytes.len() > MAX_PAGE_BYTES.min(MAX_BUNDLE_BYTES) {
             return Err(e("page exceeds the size bound"));
         }
-        let top = Decoder::new(bytes);
-        top.finish().map_err(|_| e("malformed CBOR"))?;
-        let inner = top
+        // (the tag and array accessors refuse bytes after the item, so a trailing byte is an error)
+        let inner = Decoder::new(bytes)
             .expect_tag(GET_TRUST_BASE_RESPONSE_TAG)
             .map_err(|_| e("not a GetTrustBase response (tag)"))?;
         let f = inner
