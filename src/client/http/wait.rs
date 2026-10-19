@@ -1,8 +1,9 @@
 //! Deadline-based inclusion-proof waiting with optional long-poll (`waitMs`).
 //!
-//! The legacy [`AggregatorClient::get_inclusion_proof`] keeps its attempts-based
-//! polling untouched. [`HttpAggregatorClient::wait_for_inclusion_proof`] is the
-//! separately selected policy: one total deadline, a per-call wait clamped to the
+//! [`AggregatorClient::get_inclusion_proof`] (and so `client::mint` / `client::transfer`)
+//! delegates here by default, with the total deadline `interval * attempts` of
+//! [`HttpAggregatorClient::with_polling`]; [`HttpAggregatorClient::with_long_poll`]`(false)`
+//! restores the attempts-based polling loop. The policy: one total deadline, a per-call wait clamped to the
 //! remaining time, a per-call transport timeout of `wait + margin` inside that
 //! deadline, and pacing that never turns a missing or zero echo into a tight loop.
 //!
@@ -34,6 +35,10 @@ pub struct WaitOptions {
     poll_interval: Option<Duration>,
     unknown_grace: Option<u32>,
     cancel: Option<CancelToken>,
+    /// Plain (no-wait) calls keep the full request timeout instead of being capped by the
+    /// remaining deadline. Set by the trait's `get_inclusion_proof`, whose budget is derived
+    /// from `with_polling` and must not shrink the client's request timeout.
+    plain_calls_keep_request_timeout: bool,
 }
 
 impl WaitOptions {
@@ -49,7 +54,13 @@ impl WaitOptions {
             poll_interval: None,
             unknown_grace: None,
             cancel: None,
+            plain_calls_keep_request_timeout: false,
         }
+    }
+
+    pub(super) fn keep_plain_request_timeout(mut self) -> Self {
+        self.plain_calls_keep_request_timeout = true;
+        self
     }
 
     /// Ask the aggregator to hold requests while the state is pending (default
@@ -135,9 +146,20 @@ pub(super) fn plan_call(remaining_ms: u64, options: &WaitOptions, send_wait: boo
     } else {
         CallPlan {
             wait_ms: None,
-            timeout_ms: max.min(remaining_ms).max(1),
+            timeout_ms: if options.plain_calls_keep_request_timeout {
+                max.max(1)
+            } else {
+                max.min(remaining_ms).max(1)
+            },
         }
     }
+}
+
+/// `from + span`, saturating to roughly thirty years ahead where the clock can not represent it.
+fn far_deadline(from: Instant, span: Duration) -> Instant {
+    from.checked_add(span)
+        .or_else(|| from.checked_add(Duration::from_secs(30 * 365 * 86_400)))
+        .unwrap_or(from)
 }
 
 /// Request accounting of a wait, in counts rather than times.
@@ -175,8 +197,8 @@ enum Pace {
 impl HttpAggregatorClient {
     /// Wait for the certified proof of `state_id` until `options`' total deadline.
     ///
-    /// Unlike the legacy [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
-    /// (an attempts count) this is bounded by time alone, so a long server wait can
+    /// Unlike the attempts loop of [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
+    /// with long poll off, this is bounded by time alone, so a long server wait can
     /// never multiply into minutes. Each call asks for
     /// `floor(max(0, min(preferred, remaining - margin, max_request - margin)))`
     /// milliseconds of server-side waiting, with a call timeout of `wait + margin`
@@ -224,7 +246,8 @@ impl HttpAggregatorClient {
         stats: &mut WaitStats,
     ) -> Result<InclusionProof, HttpError> {
         let started = Instant::now();
-        let deadline = started + options.total;
+        // a total too large for the clock (`Duration::MAX`) saturates to a far deadline
+        let deadline = far_deadline(started, options.total);
         let interval = options.poll_interval.unwrap_or(self.poll_interval);
         let grace = options.unknown_grace.unwrap_or(self.unknown_grace);
         let cancelled = || {
@@ -356,7 +379,7 @@ impl HttpAggregatorClient {
     /// Sleep (cancel-aware, never past the deadline).
     fn pause(&self, pace: Pace, deadline: Instant, options: &WaitOptions) -> Result<(), HttpError> {
         let Pace::Sleep(total) = pace;
-        let end = (Instant::now() + total).min(deadline);
+        let end = far_deadline(Instant::now(), total).min(deadline);
         loop {
             if options
                 .cancel
