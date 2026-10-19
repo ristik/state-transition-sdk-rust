@@ -395,3 +395,69 @@ fn a_genesis_json_loads_to_the_pinned_identity() {
     assert!(TrustBaseEntry::from_json(&json.replace("\"version\":2", "\"version\":1")).is_err());
     assert!(TrustBaseEntry::from_json("{}").is_err());
 }
+
+// `from_trusted_chain` verifies no signature, so each structural check of the chain is the
+// only thing between a gap or a misordered list and a wrong committee judging a seal
+// (`TrustBaseHistory::get` finds an entry by its position). One violation per test.
+
+fn chain_entry(epoch: u64, start: u64, prev: [u8; 32], net: u16) -> TrustBaseEntry {
+    let mut e = TrustBaseEntry::genesis(NetworkId::new(net).unwrap(), epoch, start, members(&FOUR));
+    e.previous_entry_id = prev;
+    if prev != [0; 32] {
+        e.add_signature("a", vec![0; 65]); // a placeholder witness: the chain is trusted
+    }
+    e
+}
+
+#[test]
+fn a_trusted_chain_with_every_link_in_order_is_accepted() {
+    let e1 = chain_entry(1, 1, [0; 32], NET);
+    let e2 = chain_entry(2, 5, e1.entry_id(), NET);
+    let e3 = chain_entry(3, 9, e2.entry_id(), NET);
+    let h = TrustBaseHistory::from_trusted_chain(vec![e1, e2, e3]).unwrap();
+    assert_eq!((h.genesis().epoch, h.latest().epoch), (1, 3));
+    assert_eq!(h.get(2).unwrap().epoch, 2);
+}
+
+#[test]
+fn a_trusted_chain_refuses_another_predecessor() {
+    let e1 = chain_entry(1, 1, [0; 32], NET);
+    let e2 = chain_entry(2, 5, [9; 32], NET); // not e1's identity
+    assert!(matches!(
+        TrustBaseHistory::from_trusted_chain(vec![e1, e2]),
+        Err(HistoryError::Entry(TrustBaseError::Chain(m))) if m.contains("previous entry id")
+    ));
+}
+
+#[test]
+fn a_trusted_chain_refuses_a_gap_in_the_epochs() {
+    let e1 = chain_entry(1, 1, [0; 32], NET);
+    let e3 = chain_entry(3, 5, e1.entry_id(), NET); // epoch 2 is missing
+    assert_eq!(
+        TrustBaseHistory::from_trusted_chain(vec![e1, e3]),
+        Err(HistoryError::Gap {
+            held: 1,
+            offered: 3
+        })
+    );
+}
+
+#[test]
+fn a_trusted_chain_refuses_a_start_round_that_does_not_rise() {
+    let e1 = chain_entry(1, 5, [0; 32], NET);
+    let e2 = chain_entry(2, 5, e1.entry_id(), NET); // same start as its predecessor
+    assert!(matches!(
+        TrustBaseHistory::from_trusted_chain(vec![e1, e2]),
+        Err(HistoryError::Entry(TrustBaseError::Chain(m))) if m.contains("start")
+    ));
+}
+
+#[test]
+fn a_trusted_chain_refuses_another_network() {
+    let e1 = chain_entry(1, 1, [0; 32], NET);
+    let e2 = chain_entry(2, 5, e1.entry_id(), NET + 1);
+    assert_eq!(
+        TrustBaseHistory::from_trusted_chain(vec![e1, e2]),
+        Err(HistoryError::WrongNetwork)
+    );
+}
