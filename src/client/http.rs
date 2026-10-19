@@ -258,7 +258,7 @@ impl HttpAggregatorClient {
                 .redirects(0)
                 .build(),
             poll_interval: Duration::from_secs(1),
-            poll_attempts: 60,
+            poll_attempts: 15,
             long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: false,
@@ -283,7 +283,7 @@ impl HttpAggregatorClient {
                 .redirects(0)
                 .build(),
             poll_interval: Duration::from_secs(1),
-            poll_attempts: 60,
+            poll_attempts: 15,
             long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: true,
@@ -297,7 +297,7 @@ impl HttpAggregatorClient {
     }
 
     /// Configure inclusion-proof waiting: the pause `interval` between probes and an
-    /// overall budget of `interval * attempts` (defaults: 1 s, 60 attempts).
+    /// overall budget of `interval * attempts` (defaults: 1 s, 15 attempts, 15 s in total).
     ///
     /// With long poll on (the default, see [`with_long_poll`](Self::with_long_poll)) the
     /// budget is a total deadline of [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
