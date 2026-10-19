@@ -156,3 +156,69 @@ fn long_poll_off_sends_no_waitms() {
         assert!(p.iter().all(|x| x.get("waitMs").is_none()));
     }
 }
+
+// --- budget edge cases of the default `get_inclusion_proof` --------------------------
+
+use unicity_token::client::{AggregatorClient, HttpError};
+
+fn pending_then_proof(pending: usize) -> Scripted {
+    let (proof, _) = fixture_proof_and_data();
+    let (empty, full) = (empty_proof_response_hex(&proof), proof_response_hex(&proof));
+    Scripted::start(move |i, _| {
+        if i < pending {
+            Reply::result(obj(&empty, "pending", None))
+        } else {
+            Reply::result(obj(&full, "included", None))
+        }
+    })
+}
+
+#[test]
+fn a_zero_budget_makes_the_probes_of_the_classic_loop() {
+    // zero interval: 4 immediate probes, then Timeout
+    let server = pending_then_proof(usize::MAX);
+    let c = HttpAggregatorClient::new_insecure_http(&server.url).with_polling(Duration::ZERO, 4);
+    assert!(matches!(
+        c.get_inclusion_proof(&state_id(7)),
+        Err(HttpError::Timeout)
+    ));
+    assert_eq!(server.count(), 4);
+    // ... and the proof is found when it arrives on the third
+    let server = pending_then_proof(2);
+    let c = HttpAggregatorClient::new_insecure_http(&server.url).with_polling(Duration::ZERO, 4);
+    assert!(c.get_inclusion_proof(&state_id(7)).is_ok());
+    assert_eq!(server.count(), 3);
+    // zero attempts: no request at all, as before
+    let server = pending_then_proof(0);
+    let c = HttpAggregatorClient::new_insecure_http(&server.url)
+        .with_polling(Duration::from_millis(10), 0);
+    assert!(matches!(
+        c.get_inclusion_proof(&state_id(7)),
+        Err(HttpError::Timeout)
+    ));
+    assert_eq!(server.count(), 0);
+}
+
+#[test]
+fn an_enormous_budget_does_not_overflow_the_clock() {
+    let server = pending_then_proof(0);
+    let c =
+        HttpAggregatorClient::new_insecure_http(&server.url).with_polling(Duration::MAX, u32::MAX);
+    assert!(c.get_inclusion_proof(&state_id(7)).is_ok());
+    assert_eq!(server.count(), 1);
+}
+
+#[test]
+fn a_small_budget_does_not_shrink_the_request_timeout() {
+    let (proof, _) = fixture_proof_and_data();
+    let full = proof_response_hex(&proof);
+    // answers after 700 ms; the budget is 3 x 100 ms. The classic loop (30 s transport
+    // timeout) gets the proof, so must the default.
+    let server = Scripted::start(move |_, _| {
+        Reply::result(obj(&full, "included", None)).after(Duration::from_millis(700))
+    });
+    let c = HttpAggregatorClient::new_insecure_http(&server.url)
+        .with_polling(Duration::from_millis(100), 3);
+    assert!(c.get_inclusion_proof(&state_id(7)).is_ok());
+    assert_eq!(server.count(), 1);
+}
