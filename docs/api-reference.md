@@ -18,6 +18,19 @@ The hint is unauthenticated and is used only for control flow and user feedback.
 
 With several aggregator instances behind a load balancer, an instance that did not admit the request may answer `unknown`. After a restart, the in-memory status is empty, so queued requests answer `unknown` until a round picks them up.
 
+### Long polling
+
+`client::mint`, `client::transfer` and `AggregatorClient::get_inclusion_proof` use attempt-based polling (`with_polling(interval, attempts)`), which is unchanged. `HttpAggregatorClient::wait_for_inclusion_proof(&state_id, &WaitOptions::new(total))` is a separate, time-bounded wait that by default asks the aggregator to hold each request while the state is pending (`waitMs`). This reduces the number of requests and returns the proof soon after certification.
+
+- The wait never exceeds `total`. Each request asks for at most the preferred wait (`with_preferred_wait`, default 20 s) and leaves a response margin (`with_margin`, default 2 s) within the remaining time and the per-call limit (`with_max_request_timeout`, default 30 s).
+- `with_long_poll(false)` sends no `waitMs` and polls at the interval (`with_poll_interval`, default the client's interval).
+- An answer without the `waitedMs` echo to a request that asked for a wait means the server does not support long polling; the rest of that call polls at the interval. Nothing is remembered across calls.
+- The echo is unauthenticated and never extends the deadline. The returned proof is unverified, as with `get_inclusion_proof`.
+- `with_unknown_grace` overrides the client's `unknown` grace for this wait. `with_cancel` is checked before every call and during pauses; a call already in flight ends at its own timeout, because a blocking transport cannot be interrupted.
+- `wait_for_inclusion_proof_with_stats` also returns request counts (`WaitStats`).
+
+For batches, `BatchAggregatorClient::get_inclusion_proofs_with_wait(&request, &options, &WaitRequest::new(wait_ms))` applies the wait to a latest-root request; it is never sent for an exact root. `get_latest_negotiating_wait` repeats the request once without `waitMs` when a server rejects the unknown field as `malformed_params`. Consolidation waits only when enabled with `ProofClient::with_master_long_poll(MasterLongPoll::default())`, and then only on the master's latest request.
+
 ### Resubmission
 
 A certification request is signed and deterministic, so sending it again is the same request; the aggregator never creates a second leaf for it.
