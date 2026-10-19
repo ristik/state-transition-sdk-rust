@@ -34,8 +34,6 @@ pub enum Error {
     OutOfRange(&'static str),
     /// A field held an unexpected discriminant (engine, predicate type, ...).
     UnexpectedValue(&'static str),
-    /// A root trust base is structurally unsafe for quorum verification.
-    InvalidTrustBase(&'static str),
 }
 
 /// Detailed CBOR decoding error.
@@ -104,7 +102,6 @@ impl fmt::Display for Error {
             Error::Crypto(m) => write!(f, "crypto error: {m}"),
             Error::OutOfRange(m) => write!(f, "value out of range: {m}"),
             Error::UnexpectedValue(m) => write!(f, "unexpected value: {m}"),
-            Error::InvalidTrustBase(m) => write!(f, "invalid root trust base: {m}"),
         }
     }
 }

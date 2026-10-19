@@ -30,9 +30,13 @@ impl ShardTreeCertificate {
             ));
         }
         let shard = ShardId::decode(items[1].bytes_value()?)?;
+        // the native encoders write an empty path collection as `null` or as an empty array:
+        // both are zero siblings
         let mut sibling_hash_list = Vec::new();
-        for s in items[2].array(None)? {
-            sibling_hash_list.push(s.bytes_value()?.to_vec());
+        if !items[2].is_null() {
+            for s in items[2].array(None)? {
+                sibling_hash_list.push(s.bytes_value()?.to_vec());
+            }
         }
         Ok(ShardTreeCertificate {
             shard,

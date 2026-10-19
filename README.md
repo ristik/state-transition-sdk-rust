@@ -32,16 +32,17 @@ Pass your gateway API key through `HttpAggregatorClient::with_api_key`. The publ
 
 ### Client setup
 
-Download the testnet2 trust base above as `bft-trustbase.testnet2.json` in your working directory. Configure the client and load the trust base:
+Put your network's trust base file (a release bundle, a genesis entry, or a V2 genesis JSON) in your working directory as `bft-trustbase.json`. Configure the client and load the trust base history:
 
 ```rust
 use std::time::Duration;
-use unicity_token::api::bft::RootTrustBase;
+use unicity_token::api::bft::TrustBaseHistory;
 use unicity_token::client::HttpAggregatorClient;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let trust_base = RootTrustBase::from_json(
-        &std::fs::read_to_string("bft-trustbase.testnet2.json")?,
+    let trust_base = TrustBaseHistory::from_file(
+        &std::fs::read("bft-trustbase.json")?,
+        None, // the deployment's genesis identity, when it has one
     )?;
     let _aggregator = HttpAggregatorClient::new(
         "https://gateway.testnet2.unicity.network",
@@ -49,12 +50,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_api_key("sk_ddc3cfcc001e4a28ac3fad7407f99590") // Public testnet2 key
     .with_polling(Duration::from_secs(2), 90);
 
-    println!("Network ID: {}", trust_base.network_id.id());
+    println!("Network ID: {}", trust_base.network_id().id());
     Ok(())
 }
 ```
 
-The trust base identifies the Consensus Layer (BFT Core) instance. Pin a trusted copy in your application for production. Use `trust_base.network_id` when creating tokens so they match your gateway; testnet2 is network ID `4` (`NetworkId::TESTNET` is `2`).
+The trust base history identifies the Consensus Layer (BFT Core) instance and holds one signed entry per epoch. Ship the complete history known at release time with your application: the latest held entry is effectively the pin, held entries are never replaced, and newer entries are verified from it (see `docs/api-reference.md` §6). Use `trust_base.network_id()` when creating tokens so they match your gateway; testnet2 is network ID `4` (`NetworkId::TESTNET` is `2`).
 
 `HttpAggregatorClient` provides a blocking HTTP transport. Applications can implement the `AggregatorClient` trait to supply their own transport.
 
@@ -119,7 +120,7 @@ Verify tokens against the correct trust base and configure accepted issuers thro
 | Feature | Default | Purpose |
 | --- | --- | --- |
 | `alloc` | Via `std` and `client` | Allocated structures used by the verification core. |
-| `std` | Yes | Standard library integration, key generation, and JSON trust-base parsing. |
+| `std` | Yes | Standard library integration, key generation, and the V2 genesis JSON loader. |
 | `client` | Yes | Transaction construction, signing, minting, transfers, and split construction. |
 | `http` | No | Blocking HTTP client for host applications. Enables `std` and `client`. |
 
@@ -130,7 +131,7 @@ For verification in a `no_std` environment, including WASM and zkVM guests:
 unicity-token = { version = "0.1", default-features = false, features = ["alloc"] }
 ```
 
-Token and payment verification remain available in this configuration. Construct the trust base with `RootTrustBase::try_new`; JSON parsing requires `std`.
+Token and payment verification remain available in this configuration. Build the history from a release bundle (`TrustBaseHistory::from_bundle`) or a genesis entry (`TrustBaseEntry::from_cbor`, `TrustBaseHistory::from_genesis`); the file and JSON loaders require `std`.
 
 ## Development
 

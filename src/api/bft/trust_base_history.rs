@@ -126,6 +126,67 @@ impl TrustBaseHistory {
         })
     }
 
+    /// Load a history from the contents of a trust base file: a release bundle (tag-39015
+    /// response, see [`from_bundle`](Self::from_bundle)), a single tagged entry (a genesis,
+    /// tag 39000), or the V2 JSON form of a genesis (see [`TrustBaseEntry::from_json`]). `pin`
+    /// is the deployment's genesis identity, when it has one. Host only.
+    #[cfg(feature = "std")]
+    pub fn from_file(contents: &[u8], pin: Option<[u8; ID_LEN]>) -> Result<Self, HistoryError> {
+        let first = contents.iter().find(|b| !b.is_ascii_whitespace());
+        match first {
+            Some(b'{') => {
+                let text = core::str::from_utf8(contents)
+                    .map_err(|_| HistoryError::Bundle("trust base JSON is not UTF-8"))?;
+                Self::from_genesis(TrustBaseEntry::from_json(text)?, pin)
+            }
+            Some(0xd9) if contents.get(1..3) == Some(&[0x98, 0x58]) => {
+                Self::from_genesis(TrustBaseEntry::from_cbor(contents)?, pin)
+            }
+            _ => Self::from_bundle(contents, pin),
+        }
+    }
+
+    /// A history from entries the caller already trusts: the chain is checked (each entry's
+    /// structure, same network, epoch plus one, rising start rounds, the predecessor's identity)
+    /// but **no signature is verified**. For a history authenticated by other means (a release
+    /// bundle shipped with the application, a conformance fixture); anything received from a
+    /// peer goes through [`append`](Self::append) or [`install_bundle`](Self::install_bundle),
+    /// which verify the predecessor's quorum. Unlike every other entry point it admits epoch 0
+    /// (test environments and conformance fixtures, never a real network).
+    pub fn from_trusted_chain(entries: Vec<TrustBaseEntry>) -> Result<Self, HistoryError> {
+        let mut it = entries.into_iter();
+        let genesis = it.next().ok_or(HistoryError::Bundle("no entries"))?;
+        genesis.validate_inner(true)?;
+        let mut h = TrustBaseHistory {
+            entries: alloc::vec![genesis],
+        };
+        for e in it {
+            e.validate_inner(true)?;
+            let prev = h.latest();
+            if e.network_id != prev.network_id {
+                return Err(HistoryError::WrongNetwork);
+            }
+            if prev.epoch.checked_add(1) != Some(e.epoch) {
+                return Err(HistoryError::Gap {
+                    held: prev.epoch,
+                    offered: e.epoch,
+                });
+            }
+            if e.epoch_start <= prev.epoch_start {
+                return Err(HistoryError::Entry(TrustBaseError::Chain(
+                    "epoch start does not increase",
+                )));
+            }
+            if e.previous_entry_id != prev.entry_id() {
+                return Err(HistoryError::Entry(TrustBaseError::Chain(
+                    "previous entry id does not match",
+                )));
+            }
+            h.entries.push(e);
+        }
+        Ok(h)
+    }
+
     /// Decode a tagged `GetTrustBase` response used as a release bundle: status OK, entries
     /// contiguous from a genesis entry to the release tip, no continuation. The chain is
     /// verified link by link (weighted quorum of each predecessor included); the genesis is

@@ -22,13 +22,12 @@ use crate::crypto::hash::{DataHasher, HashAlgorithm};
 ///
 /// Like Go's verifier, [`new`](Self::new) expects the **unsharded** partition (the
 /// certificate's shard is the empty shard); pin the shard you serve with
-/// [`with_shard`](Self::with_shard) otherwise. The network, authority, epoch interval,
-/// quorum and the fixed partition are always enforced.
+/// [`with_shard`](Self::with_shard) otherwise. The network, the authority of the seal's
+/// epoch (including its epoch interval), the quorum and the fixed partition are always enforced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NonInclusionContext {
     shard: Option<ShardId>,
     shard_conf_hash: Option<[u8; 32]>,
-    authority_end_round: Option<u64>,
 }
 
 impl Default for NonInclusionContext {
@@ -43,7 +42,6 @@ impl NonInclusionContext {
         Self {
             shard: Some(ShardId::root()),
             shard_conf_hash: None,
-            authority_end_round: None,
         }
     }
 
@@ -61,25 +59,12 @@ impl NonInclusionContext {
         self
     }
 
-    /// The first root round that is *not* governed by the verifying authority: from
-    /// the authenticated authority history (the next epoch's start, or a known
-    /// retirement boundary). A seal at or after it is rejected. Never infer it from
-    /// the proof.
-    pub fn with_authority_end_round(mut self, round: u64) -> Self {
-        self.authority_end_round = Some(round);
-        self
-    }
-
     pub(crate) fn shard(&self) -> Option<&ShardId> {
         self.shard.as_ref()
     }
 
     pub(crate) fn shard_conf_hash(&self) -> Option<&[u8; 32]> {
         self.shard_conf_hash.as_ref()
-    }
-
-    pub(crate) fn authority_end_round(&self) -> Option<u64> {
-        self.authority_end_round
     }
 }
 
@@ -222,10 +207,6 @@ pub(crate) fn digest_of(c: &NonInclusionContext) -> [u8; 32] {
     h = h.update(&opt(c.shard_conf_hash.is_some()));
     if let Some(x) = &c.shard_conf_hash {
         h = h.update(x);
-    }
-    h = h.update(&opt(c.authority_end_round.is_some()));
-    if let Some(r) = c.authority_end_round {
-        h = h.update(&r.to_be_bytes());
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(h.finalize().data());

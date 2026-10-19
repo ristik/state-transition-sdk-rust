@@ -15,7 +15,7 @@
 #[path = "common/consolidation.rs"]
 mod common;
 
-use unicity_token::api::bft::RootTrustBase;
+use unicity_token::api::bft::TrustBaseHistory;
 use unicity_token::client::{ConsolidateOptions, ConsolidationOutcome};
 use unicity_token::transaction::Token;
 use unicity_token::verify::{
@@ -24,7 +24,7 @@ use unicity_token::verify::{
 
 /// Everything the guest does: decode, verify with an operation-scoped session
 /// (repeated seals are authenticated once *inside the guest*), commit the result.
-fn guest_verify(token_bytes: &[u8], trust_base: &RootTrustBase) -> bool {
+fn guest_verify(token_bytes: &[u8], trust_base: &TrustBaseHistory) -> bool {
     let Ok(token) = Token::from_cbor(token_bytes) else {
         return false;
     };

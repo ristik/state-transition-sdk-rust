@@ -6,9 +6,13 @@
 //! trust bases and the certificates the reference derives from them. See that
 //! directory's `manifest.json` for the provenance commit.
 
-use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
+mod trust_support;
+
 use unicity_token::api::bft::unicity_tree::UNICITY_TREE_CERTIFICATE_TAG;
-use unicity_token::api::bft::{RootTrustBase, ShardId, UnicityCertificate, UnicityTreeCertificate};
+use unicity_token::api::bft::{
+    ShardId, TrustBaseEntry, TrustBaseHistory, TrustBaseMember, UnicityCertificate,
+    UnicityTreeCertificate,
+};
 use unicity_token::api::NetworkId;
 use unicity_token::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
 use unicity_token::consolidation::{
@@ -65,7 +69,7 @@ struct Case {
     view: PartitionView,
     uc: UnicityCertificate,
     topology: PartitionTopology,
-    trust_base: RootTrustBase,
+    trust_base: TrustBaseHistory,
     partition: u32,
     expected_ucs: Vec<&'static [u8]>,
     tree_root: Vec<u8>,
@@ -150,19 +154,22 @@ fn case(n: usize) -> Case {
         &hex::decode(field(tb_json, "sigKey").trim_start_matches("0x")).unwrap(),
     )
     .unwrap();
-    let trust_base = RootTrustBase::try_new(
+    assert_eq!(
         number(tb_json, "version"),
+        1,
+        "the corpus trust base is a V1 record"
+    );
+    let trust_base = trust_support::history(
         NetworkId::new(number(tb_json, "networkId") as u16).unwrap(),
         number(tb_json, "epoch"),
         number(tb_json, "epochStartRound"),
-        vec![RootTrustBaseNodeInfo {
-            node_id: field(tb_json, "nodeId").into(),
-            signing_key: key,
-            stake: number(tb_json, "stake"),
-        }],
+        vec![(field(tb_json, "nodeId"), key, number(tb_json, "stake"))],
+    );
+    assert_eq!(
+        trust_base.latest().quorum_threshold,
         number(tb_json, "quorumThreshold"),
-    )
-    .unwrap();
+        "the corpus threshold is the V2 one"
+    );
 
     Case {
         view_bytes,
@@ -680,30 +687,29 @@ fn nil_unicity_tree_path_steps_do_not_decode() {
 #[test]
 fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     let c = case(4);
-    let assemble = |uc: &UnicityCertificate, tb: &RootTrustBase| {
+    let assemble = |uc: &UnicityCertificate, tb: &TrustBaseHistory| {
         let mut s = SealSession::new(tb);
         assemble(&c.view, uc, Some(&c.topology), &mut s)
     };
     assert!(assemble(&c.uc, &c.trust_base).is_ok());
 
-    let mut tb = c.trust_base.clone();
-    tb.network_id = NetworkId::TESTNET;
+    let tb = tweak(&c.trust_base, |e| e.network_id = NetworkId::TESTNET);
     assert_eq!(
         assemble(&c.uc, &tb),
         Err(PartitionViewError::Seal(
             VerificationError::SealNetworkMismatch
         ))
     );
-    let mut tb = c.trust_base.clone();
-    tb.epoch += 1;
+    let tb = tweak(&c.trust_base, |e| e.epoch += 1);
     assert_eq!(
         assemble(&c.uc, &tb),
         Err(PartitionViewError::Seal(
-            VerificationError::SealEpochMismatch
+            VerificationError::EpochBeforeGenesis
         ))
     );
-    let mut tb = c.trust_base.clone();
-    tb.epoch_start_round = c.uc.unicity_seal.root_chain_round_number + 1;
+    let tb = tweak(&c.trust_base, |e| {
+        e.epoch_start = c.uc.unicity_seal.root_chain_round_number + 1
+    });
     assert_eq!(
         assemble(&c.uc, &tb),
         Err(PartitionViewError::Seal(
@@ -712,14 +718,18 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     );
 
     // wrong authority (a different key): no quorum
-    let mut tb = c.trust_base.clone();
-    tb.root_nodes[0].signing_key = PublicKey::from_bytes(
-        &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap(),
-    )
-    .unwrap();
+    let tb = tweak(&c.trust_base, |e| {
+        e.members[0].signing_key = PublicKey::from_bytes(
+            &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        )
+        .unwrap();
+    });
     assert_eq!(
         assemble(&c.uc, &tb),
-        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
+        Err(PartitionViewError::Seal(
+            VerificationError::SealSignerInvalid
+        ))
     );
 
     // tampered / missing / empty signatures
@@ -727,7 +737,9 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     bad.unicity_seal.signatures[0].1[10] ^= 1;
     assert_eq!(
         assemble(&bad, &c.trust_base),
-        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
+        Err(PartitionViewError::Seal(
+            VerificationError::SealSignerInvalid
+        ))
     );
     let mut none = c.uc.clone();
     none.unicity_seal.signatures.clear();
@@ -748,7 +760,7 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     s.authenticate_seal(&c.uc.unicity_seal).unwrap();
     assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (1, 1));
     let mut other_witness = c.uc.unicity_seal.clone();
-    other_witness.signatures.push(("extra".into(), vec![1; 65]));
+    other_witness.signatures[0].1.truncate(64); // the 64-byte form of the same signature
     s.authenticate_seal(&other_witness).unwrap(); // still a quorum, but a different witness
     assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (2, 1));
     let mut tampered = c.uc.unicity_seal.clone();
@@ -774,7 +786,7 @@ fn memo_is_bounded_and_can_be_disabled() {
     let mut s = SealSession::with_capacity(&c.trust_base, 1);
     let a = c.uc.unicity_seal.clone();
     let mut b = a.clone();
-    b.signatures.push(("extra".into(), vec![1; 65]));
+    b.signatures[0].1.truncate(64); // another witness: the 64-byte form of the same signature
     s.authenticate_seal(&a).unwrap();
     s.authenticate_seal(&b).unwrap(); // evicts a
     s.authenticate_seal(&b).unwrap();
@@ -798,73 +810,31 @@ fn null_summary_leaves_hash_exactly_and_yield_ordinary_certificates() {
     );
 }
 
-fn node(id: &str, key: &str, stake: u64) -> RootTrustBaseNodeInfo {
-    RootTrustBaseNodeInfo {
-        node_id: id.into(),
-        signing_key: PublicKey::from_bytes(&hex::decode(key).unwrap()).unwrap(),
+fn node(id: &str, key: &str, stake: u64) -> TrustBaseMember {
+    TrustBaseMember::new(
+        id,
+        PublicKey::from_bytes(&hex::decode(key).unwrap()).unwrap(),
         stake,
-    }
+    )
 }
 
-/// The public session entry points refuse an unsafe authority and never cache
-/// a verdict obtained under one.
-#[test]
-fn invalid_authorities_never_succeed_or_enter_the_memo() {
-    let c = case(1);
-    let seal = c.uc.unicity_seal.clone();
-    let mut unsigned = seal.clone();
-    unsigned.signatures.clear();
-
-    let mut bad: Vec<(&str, RootTrustBase)> = Vec::new();
-    let mut empty = c.trust_base.clone();
-    empty.root_nodes.clear();
-    empty.quorum_threshold = 0;
-    bad.push(("no validators, zero threshold", empty));
-    let mut zero_threshold = c.trust_base.clone();
-    zero_threshold.quorum_threshold = 0;
-    bad.push(("zero threshold", zero_threshold));
-    let mut zero_stake = c.trust_base.clone();
-    zero_stake.root_nodes[0].stake = 0;
-    bad.push(("zero stake", zero_stake));
-    let mut dup = c.trust_base.clone();
-    dup.root_nodes.push(dup.root_nodes[0].clone());
-    bad.push(("duplicate validator", dup));
-
-    for (name, tb) in &bad {
-        assert!(tb.validate().is_err(), "{name}");
-        let mut s = SealSession::new(tb);
-        for seal in [&unsigned, &seal] {
-            for _ in 0..2 {
-                assert!(
-                    matches!(
-                        s.verify_quorum(seal),
-                        Err(VerificationError::InvalidTrustBase(_))
-                    ),
-                    "{name}"
-                );
-                assert!(
-                    matches!(
-                        s.authenticate_seal(seal),
-                        Err(VerificationError::InvalidTrustBase(_))
-                    ),
-                    "{name}"
-                );
-            }
-        }
-        assert_eq!(
-            (s.stats().quorum_checks, s.stats().memo_hits),
-            (0, 0),
-            "{name}"
-        );
-    }
+/// The one-entry history `tb` with its entry changed by `f` (threshold re-derived from the
+/// members' weights): a different authority for the same certificate.
+fn tweak(tb: &TrustBaseHistory, f: impl FnOnce(&mut TrustBaseEntry)) -> TrustBaseHistory {
+    let mut e = tb.latest().clone();
+    f(&mut e);
+    e.members
+        .sort_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
+    e.quorum_threshold =
+        TrustBaseEntry::threshold_for(e.members.iter().map(|m| m.weight).sum()).unwrap();
+    TrustBaseHistory::from_trusted_chain(vec![e]).unwrap()
 }
 
-/// Stake-weighted authorities are refused by the strict policy as an
-/// unsupported configuration (the Rust quorum rule counts signers), not
-/// misreported as a signature failure. The reference accepts this very seal:
-/// stakes [2,1,1], threshold 3, signed by the first two validators.
+/// Stake-weighted authorities are judged by weight: the reference accepts this very seal
+/// (stakes [2,1,1], threshold 3, signed by the first two validators), and so does the
+/// weighted quorum; with unit stakes the same two signatures are below the threshold.
 #[test]
-fn weighted_authority_is_unsupported_not_a_bad_signature() {
+fn weighted_authority_is_judged_by_weight() {
     let json = include_str!(
         "vectors/uc-consolidation/partition-view/v1/derived/weighted-4/trust-base.json"
     );
@@ -873,14 +843,23 @@ fn weighted_authority_is_unsupported_not_a_bad_signature() {
         .map(|(i, m)| json[i + m.len()..].trim_start_matches("0x")[..66].to_string())
         .collect();
     assert_eq!(keys.len(), 3);
-    let stakes = [2, 1, 1];
-    let nodes: Vec<_> = keys
-        .iter()
-        .zip(stakes)
-        .enumerate()
-        .map(|(i, (k, s))| node(&format!("n{i}"), k, s))
-        .collect();
-    let tb = RootTrustBase::try_new(1, NetworkId::MAINNET, 1, 0, nodes, 3).unwrap();
+    let weighted = |stakes: [u64; 3]| {
+        let members = keys
+            .iter()
+            .zip(stakes)
+            .enumerate()
+            .map(|(i, (k, s))| node(&format!("n{i}"), k, s))
+            .collect();
+        TrustBaseHistory::from_trusted_chain(vec![TrustBaseEntry::genesis(
+            NetworkId::MAINNET,
+            1,
+            0,
+            members,
+        )])
+        .unwrap()
+    };
+    let tb = weighted([2, 1, 1]);
+    assert_eq!(tb.latest().quorum_threshold, 3);
     let uc = UnicityCertificate::from_cbor(Decoder::new(vector!(
         "derived/weighted-4/enclosing-uc.cbor"
     )))
@@ -889,29 +868,13 @@ fn weighted_authority_is_unsupported_not_a_bad_signature() {
 
     let c = case(4);
     let mut s = SealSession::new(&tb);
-    assert_eq!(
-        s.authenticate_seal(&uc.unicity_seal),
-        Err(VerificationError::UnsupportedAuthority)
-    );
-    assert_eq!(
-        assemble(&c.view, &uc, Some(&c.topology), &mut s),
-        Err(PartitionViewError::Seal(
-            VerificationError::UnsupportedAuthority
-        ))
-    );
-    assert_eq!(
-        (s.stats().quorum_checks, s.stats().memo_hits),
-        (0, 0),
-        "no signature work, nothing cached"
-    );
+    assert_eq!(s.authenticate_seal(&uc.unicity_seal), Ok(()));
+    assert!(assemble(&c.view, &uc, Some(&c.topology), &mut s).is_ok());
 
-    // with unit stakes the same keys judge signatures: a bad witness is a quorum failure
-    let unit: Vec<_> = keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| node(&format!("n{i}"), k, 1))
-        .collect();
-    let tb = RootTrustBase::try_new(1, NetworkId::MAINNET, 1, 0, unit, 3).unwrap();
+    // with unit stakes the same two signatures are below the threshold of 3 signers... of
+    // total weight 3 the threshold is 3: a quorum failure, not a bad signature
+    let tb = weighted([1, 1, 1]);
+    assert_eq!(tb.latest().quorum_threshold, 3);
     let mut s = SealSession::new(&tb);
     assert_eq!(
         s.authenticate_seal(&uc.unicity_seal),
@@ -931,8 +894,8 @@ fn unpinned_authentication_needs_no_peer_configuration() {
             .authenticate(&c.uc, None, &mut session)
             .unwrap_or_else(|e| panic!("{n} shards: {e}"));
         assert_eq!(view.partition_id(), c.partition);
-        assert_eq!(view.network_id(), c.trust_base.network_id);
-        assert_eq!(view.epoch(), c.trust_base.epoch);
+        assert_eq!(view.network_id(), c.trust_base.network_id());
+        assert_eq!(view.epoch(), c.trust_base.latest().epoch);
         assert_eq!(view.leaves().len(), n);
         assert_eq!(view.seal(), &c.uc.unicity_seal);
         assert_eq!(view.shard_tree().root_hash(), c.tree_root.as_slice());
@@ -947,7 +910,7 @@ fn unpinned_authentication_needs_no_peer_configuration() {
 #[test]
 fn view_identity_binds_authority_partition_pins_and_seal() {
     let c = case(4);
-    let id = |tb: &RootTrustBase, uc: &UnicityCertificate, pins: Option<&PartitionTopology>| {
+    let id = |tb: &TrustBaseHistory, uc: &UnicityCertificate, pins: Option<&PartitionTopology>| {
         let mut s = SealSession::new(tb);
         *c.view.authenticate(uc, pins, &mut s).unwrap().identity()
     };
@@ -959,18 +922,8 @@ fn view_identity_binds_authority_partition_pins_and_seal() {
         "pins are part of the identity"
     );
 
-    // another admitted authority (same keys, different threshold/stake layout is
-    // rejected elsewhere; use an extra, unused validator)
-    let mut other = c.trust_base.clone();
-    other.root_nodes.push(RootTrustBaseNodeInfo {
-        node_id: "unused".into(),
-        signing_key: PublicKey::from_bytes(
-            &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-                .unwrap(),
-        )
-        .unwrap(),
-        stake: 1,
-    });
+    // another admitted authority: the same validators with a different entry (identity)
+    let other = tweak(&c.trust_base, |e| e.state_hash = Some(vec![7; 32]));
     assert_ne!(
         base,
         id(&other, &c.uc, None),
@@ -979,10 +932,7 @@ fn view_identity_binds_authority_partition_pins_and_seal() {
 
     // a different valid witness of the same unsigned seal is a different identity
     let mut witness = c.uc.clone();
-    witness
-        .unicity_seal
-        .signatures
-        .push(("extra".into(), vec![1; 65]));
+    witness.unicity_seal.signatures[0].1.truncate(64);
     assert_ne!(base, id(&c.trust_base, &witness, None));
 
     // pins on different shards differ
@@ -1037,7 +987,9 @@ fn candidate_data_is_never_authority() {
     let (r, checks) = go(&c.view, &bad);
     assert_eq!(
         r,
-        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
+        Err(PartitionViewError::Seal(
+            VerificationError::SealSignerInvalid
+        ))
     );
     assert_eq!(checks, 1);
 }
@@ -1095,7 +1047,9 @@ fn pinned_assembly_api_is_preserved() {
     let mut s = SealSession::new(&c.trust_base);
     assert_eq!(
         c.view.assemble_certificates(&bad, &c.topology, &mut s),
-        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
+        Err(PartitionViewError::Seal(
+            VerificationError::SealSignerInvalid
+        ))
     );
 }
 
@@ -1143,12 +1097,11 @@ fn signature_memo_is_shared_but_policy_rules_are_not() {
     }
     assert!(c.view.authenticate(&c.uc, Some(&wrong), &mut s).is_err());
     // and the strict authority is checked by every call, whatever was verified before
-    let mut tb = c.trust_base.clone();
-    tb.epoch += 1;
+    let tb = tweak(&c.trust_base, |e| e.epoch += 1);
     let mut other_epoch = SealSession::new(&tb);
     assert_eq!(
         other_epoch.authenticate_seal(&c.uc.unicity_seal),
-        Err(VerificationError::SealEpochMismatch)
+        Err(VerificationError::EpochBeforeGenesis)
     );
 }
 
@@ -1175,16 +1128,7 @@ fn custom_authenticators_cannot_mint_identified_views() {
         .unwrap();
     assert_eq!(ucs.len(), 4);
 
-    let mut other = c.trust_base.clone();
-    other.root_nodes.push(RootTrustBaseNodeInfo {
-        node_id: "unused".into(),
-        signing_key: PublicKey::from_bytes(
-            &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-                .unwrap(),
-        )
-        .unwrap(),
-        stake: 1,
-    });
+    let other = tweak(&c.trust_base, |e| e.state_hash = Some(vec![7; 32]));
     let (mut s1, mut s2) = (SealSession::new(&c.trust_base), SealSession::new(&other));
     let v1 = c.view.authenticate(&c.uc, None, &mut s1).unwrap();
     let v2 = c.view.authenticate(&c.uc, None, &mut s2).unwrap();

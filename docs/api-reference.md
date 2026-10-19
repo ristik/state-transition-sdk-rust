@@ -57,11 +57,11 @@ Every application verification path requires the authenticated unicity certifica
 1. validates its structure;
 2. rebuilds the shard tree;
 3. follows the enclosing certificate's partition path to the seal hash and matches the enclosing leaf exactly;
-4. authenticates the complete seal under the caller's `RootTrustBase` (network, exact epoch, round at or after the epoch start, quorum).
+4. authenticates the complete seal under the entry of the seal's epoch in the caller's `TrustBaseHistory` (network, the epoch's round interval, the strict weighted quorum).
 
 Only then does it return an immutable `AuthenticatedView`, the only input accepted by `certificates()`, which yields ordinary unicity certificates for every shard, all carrying the same seal. No peer configuration list is needed, because the seal commits to every leaf's configuration hash. Independently pinned shard configuration hashes (`Some(&PartitionTopology)`) are an optional stricter policy and are part of `AuthenticatedView::identity()`. The authority is never taken from a response.
 
-Token verification authenticates each distinct seal once per operation (`verify::SealSession`, a bounded memo of successful quorum checks bound to one trust base). Only the quorum signature check is reused; paths, reference times, predicates and application rules are checked for every proof. `verify::verify_token_with_seal_stats` reports the signature work performed. Seal reuse does not change token size or format, and nested proofs that carry other seals still need their own check.
+Token verification authenticates each distinct seal once per operation (`verify::SealSession`, a bounded memo of successful quorum checks bound to one trust base history entry per seal). Only the quorum signature check is reused; paths, reference times, predicates and application rules are checked for every proof. `verify::verify_token_with_seal_stats` reports the signature work performed. Seal reuse does not change token size or format, and nested proofs that carry other seals still need their own check.
 
 ## 4. Proof Consolidation
 
@@ -91,7 +91,7 @@ Examples: `examples/consolidate_for_bridge.rs` and `examples/consolidate_for_zkv
 
 `AggregatorClient::get_non_inclusion_proof(&state_id)` fetches a proof; it is unverified.
 
-`NonInclusionProof::verify_at_snapshot(&trust_base, &context)` (also `verify_for_at_snapshot` for a directly decoded proof, and `verify::verify_non_inclusion_at_snapshot` / `verify_non_inclusion_in` for explicit sessions) authenticates the unicity certificate before it returns anything: shape, trusted network, authority and epoch interval, quorum, the aggregation partition, the shard and partition commitments together with the optional pins of the `NonInclusionContext`, the query binding and the full state-tree relation. The result is:
+`NonInclusionProof::verify_at_snapshot(&trust_base, &context)` (also `verify_for_at_snapshot` for a directly decoded proof, and `verify::verify_non_inclusion_at_snapshot` / `verify_non_inclusion_in` for explicit sessions) authenticates the unicity certificate before it returns anything: shape, trusted network, the authority of the seal's epoch and its round interval, quorum, the aggregation partition, the shard and partition commitments together with the optional pins of the `NonInclusionContext`, the query binding and the full state-tree relation. The result is:
 
 - `Ok(NonInclusionOutcome::AbsentAtSnapshot { state_id, snapshot })`: the path proves the key absent.
 - `Ok(NonInclusionOutcome::IncludedAtSnapshot { state_id, snapshot })`: the path proves that exact key present.
@@ -132,4 +132,6 @@ if snapshot.network_id().id() != checkpoint.network_id
 - **Bundles.** A release ships the whole known history as one tag-39015 `GetTrustBase` response (`to_bundle`, `from_bundle`); `install_bundle` merges one into a history, all or nothing.
 - **Genesis.** Load it from CBOR, or from the V2 JSON form with `TrustBaseEntry::from_json` (host only; compare the identity with the deployment pin via `TrustBaseHistory::from_genesis(entry, Some(pin))`).
 
-The history does not yet drive token verification; that is the next change.
+- **Verification.** Every verification entry point (`Token::verify`, `verify::verify_token*`, `InclusionProof::verify*`, `NonInclusionProof::verify_at_snapshot`, `client::mint`/`transfer`) takes the history. A seal is judged by the entry of **its own epoch**; there is no age limit and no freshness rule. The newest epoch is open-ended until its successor is held; an older epoch ends at the successor's start round. Seal signatures follow the native rule: every signature is checked (no early exit), an unknown signer or a bad signature fails the seal, a signature is 64 bytes or 65 with recovery byte 0/1, and the signed weight has to reach the entry's threshold.
+- **Errors.** A seal of an epoch newer than the latest held entry is `VerificationError::UnknownTrustEpoch { epoch }` (`unknown_trust_epoch()` finds it inside nested errors): retryable, fetch the missing entries, `append` them and verify again. An epoch older than the first entry is `EpochBeforeGenesis`; `SealBeforeEpochStart`, `SealAfterAuthorityEnd`, `SealSignerInvalid` and `QuorumNotMet` complete the seal outcomes.
+- **Trusted chains.** `TrustBaseHistory::from_trusted_chain` builds a history from entries the caller already trusts (their signatures are not verified; epoch 0 is admitted for fixtures). Peer-supplied entries go through `append`/`install_bundle`.

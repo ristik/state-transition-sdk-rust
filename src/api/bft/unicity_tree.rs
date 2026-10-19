@@ -8,6 +8,8 @@ use crate::error::Error;
 
 /// CBOR tag for [`UnicityTreeCertificate`].
 pub const UNICITY_TREE_CERTIFICATE_TAG: u64 = 39004;
+/// The most steps a unicity tree path may have (the native bound).
+pub const MAX_UNICITY_TREE_STEPS: usize = 32;
 const VERSION: u64 = 1;
 
 /// A single step on the path from the partition leaf to the unicity-tree root.
@@ -58,9 +60,16 @@ impl UnicityTreeCertificate {
         }
         let partition_identifier = u32::try_from(items[1].uint()?)
             .map_err(|_| Error::OutOfRange("partition identifier exceeds 32 bits"))?;
+        // an empty path collection is `null` or an empty array on the native wire: zero steps
         let mut steps = Vec::new();
-        for s in items[2].array(None)? {
-            steps.push(HashStep::from_cbor(s)?);
+        if !items[2].is_null() {
+            let encoded = items[2].array(None)?;
+            if encoded.len() > MAX_UNICITY_TREE_STEPS {
+                return Err(Error::OutOfRange("too many unicity tree steps"));
+            }
+            for s in encoded {
+                steps.push(HashStep::from_cbor(s)?);
+            }
         }
         Ok(UnicityTreeCertificate {
             partition_identifier,

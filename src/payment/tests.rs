@@ -16,7 +16,7 @@ use super::{
     SplitTokenRequest, TokenSplit,
 };
 use crate::api::bft::{
-    InputRecord, RootTrustBase, RootTrustBaseNodeInfo, ShardId, ShardTreeCertificate,
+    InputRecord, ShardId, ShardTreeCertificate, TrustBaseEntry, TrustBaseHistory, TrustBaseMember,
     UnicityCertificate, UnicitySeal, UnicityTreeCertificate,
 };
 use crate::api::calculate_leaf_value;
@@ -53,16 +53,17 @@ fn sig_pred(s: &Secp256k1Signer) -> EncodedPredicate {
     SignaturePredicate::new(s.public_key()).to_encoded()
 }
 
-fn node_info(s: &Secp256k1Signer, id: &str) -> RootTrustBaseNodeInfo {
-    RootTrustBaseNodeInfo {
-        node_id: id.to_string(),
-        signing_key: s.public_key(),
-        stake: 1,
-    }
+fn node_info(s: &Secp256k1Signer, id: &str) -> TrustBaseMember {
+    TrustBaseMember::new(id.to_string(), s.public_key(), 1)
 }
 
-fn trust_base(node: &Secp256k1Signer) -> RootTrustBase {
-    RootTrustBase::new(0, NetworkId::LOCAL, 0, 0, vec![node_info(node, "NODE")], 1)
+/// One-entry history (epoch 1, from round 0) whose only validator is `node`.
+fn trust_base(node: &Secp256k1Signer) -> TrustBaseHistory {
+    TrustBaseHistory::from_genesis(
+        TrustBaseEntry::genesis(NetworkId::LOCAL, 1, 0, vec![node_info(node, "NODE")]),
+        None,
+    )
+    .unwrap()
 }
 
 fn empty_shard() -> ShardId {
@@ -73,7 +74,7 @@ fn mk_seal(hash: Vec<u8>, signatures: Vec<(String, Vec<u8>)>) -> UnicitySeal {
     UnicitySeal {
         network_id: NetworkId::LOCAL,
         root_chain_round_number: 1,
-        epoch: 0,
+        epoch: 1,
         timestamp: REFERENCE_TIME,
         previous_hash: None,
         hash,
@@ -246,7 +247,7 @@ fn authorize_test_payment(
 
 /// Build the full positive scenario, returning everything needed by the tests.
 struct Scenario {
-    tb: RootTrustBase,
+    tb: TrustBaseHistory,
     node: Secp256k1Signer,
     source: Token,
     alice: Secp256k1Signer,

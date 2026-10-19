@@ -14,7 +14,7 @@
 //! Decoding a structure proves *nothing* about its validity. Trust is
 //! established exclusively by [`Token::verify`], which walks an unbroken chain
 //! of cryptographic checks from a caller-supplied root of trust
-//! ([`RootTrustBase`]) down to every state in the token's history. See the
+//! ([`TrustBaseHistory`]) down to every state in the token's history. See the
 //! `verify` module for the enforced invariants.
 //!
 //! Application `data` and mint *justifications* are treated as opaque by
@@ -26,7 +26,7 @@
 //! sparse Merkle sum trees in [`rsmst`].
 //!
 //! [`Token::verify`]: crate::transaction::Token::verify
-//! [`RootTrustBase`]: crate::api::bft::RootTrustBase
+//! [`TrustBaseHistory`]: crate::api::bft::TrustBaseHistory
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]

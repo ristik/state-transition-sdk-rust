@@ -17,7 +17,7 @@ use std::io::Read;
 use std::time::Duration;
 use zeroize::Zeroize;
 
-use crate::api::bft::RootTrustBase;
+use crate::api::bft::TrustBaseHistory;
 use crate::api::certification_request::CertificationRequest;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::{
@@ -191,14 +191,14 @@ impl fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 /// The error for a proof that certifies other data than the submitted request: authenticated
-/// (`StateCertifiedWithOtherData`) only when the proof verifies under `trust_base` for
+/// (`StateCertifiedWithOtherData`) only when the proof verifies under `history` for
 /// `state_id`, at the reference time the proof itself commits to.
 pub(crate) fn conflict_error(
     proof: &InclusionProof,
     state_id: &StateId,
-    trust_base: &RootTrustBase,
+    history: &TrustBaseHistory,
 ) -> HttpError {
-    match proof.verify_for(state_id, proof.reference_time, trust_base) {
+    match proof.verify_for(state_id, proof.reference_time, history) {
         Ok(()) => HttpError::StateCertifiedWithOtherData,
         Err(_) => HttpError::ProofOfOtherData,
     }
@@ -426,7 +426,7 @@ impl HttpAggregatorClient {
     }
 
     /// Like [`submit_and_wait`](Self::submit_and_wait), but a proof for other data is
-    /// authenticated under `trust_base` before it is believed: only a proof that verifies
+    /// authenticated under `history` before it is believed: only a proof that verifies
     /// gives [`HttpError::StateCertifiedWithOtherData`] (the race is lost, not retryable);
     /// a proof that does not verify gives the unauthenticated
     /// [`HttpError::ProofOfOtherData`].
@@ -434,10 +434,10 @@ impl HttpAggregatorClient {
         &self,
         data: &CertificationData,
         max_resubmits: u32,
-        trust_base: &RootTrustBase,
+        history: &TrustBaseHistory,
     ) -> Result<InclusionProof, HttpError> {
         self.submit_and_wait_with(data, max_resubmits, |proof, state_id| {
-            conflict_error(proof, state_id, trust_base)
+            conflict_error(proof, state_id, history)
         })
     }
 

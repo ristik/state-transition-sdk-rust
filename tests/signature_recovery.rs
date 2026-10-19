@@ -1,15 +1,10 @@
 //! Strict recoverable-signature rule (arch-o3 §4) against the shared fixtures of
 //! bft-go-base (`tests/vectors/o3-signature-recovery/v1/vectors.json`, byte-identical):
 //! exactly 65 bytes `r||s||v`, low-S, `v` in 0..3, and the key recovered with `v` must
-//! equal the trusted key. A nonconforming signature contributes zero votes.
+//! equal the trusted key. Trust base entries use this rule; unicity seals use the native one.
 #![cfg(feature = "std")]
 
-use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
-use unicity_token::api::bft::{RootTrustBase, UnicitySeal};
-use unicity_token::api::NetworkId;
-use unicity_token::cbor::Decoder;
 use unicity_token::crypto::signature::{PublicKey, Signature};
-use unicity_token::verify::{SealSession, VerificationError};
 
 const VECTORS: &str = include_str!("vectors/o3-signature-recovery/v1/vectors.json");
 
@@ -85,213 +80,87 @@ fn recovery_vectors_agree_with_the_reference() {
     );
 }
 
-#[test]
-fn seal_quorum_vectors_count_only_conforming_signatures() {
-    let f = fixtures();
-    let s = &f["seal"];
-    let nodes = s["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|n| RootTrustBaseNodeInfo {
-            node_id: n["id"].as_str().unwrap().to_string(),
-            signing_key: key(n["publicKeyCompressed"].as_str().unwrap()),
-            stake: n["stake"].as_u64().unwrap(),
-        })
-        .collect();
-    assert_eq!(s["networkId"].as_u64(), Some(3));
-    let tb = RootTrustBase::new(
-        1,
-        NetworkId::LOCAL,
-        s["epoch"].as_u64().unwrap(),
-        0,
-        nodes,
-        s["quorumThreshold"].as_u64().unwrap(),
-    );
-    let cases = s["cases"].as_array().unwrap();
-    assert!(cases.len() >= 10);
-    for case in cases {
-        let name = case["name"].as_str().unwrap();
-        let bytes = hex::decode(case["sealCbor"].as_str().unwrap()).unwrap();
-        // every fixture seal decodes (signatures are raw byte strings in the codec): a
-        // nonconforming signature, a compact one included, is rejected by the quorum
-        // count (zero votes, as in Go), never by the decoder
-        let seal = UnicitySeal::from_cbor(Decoder::new(&bytes))
-            .unwrap_or_else(|e| panic!("{name}: fixture seal must decode: {e}"));
-        let verdict = SealSession::new(&tb).verify_quorum(&seal);
-        if case["accept"].as_bool().unwrap() {
-            assert_eq!(verdict, Ok(()), "{name}");
-        } else {
-            assert_eq!(verdict, Err(VerificationError::QuorumNotMet), "{name}");
-        }
-    }
-}
-
+/// The native seal-signature rule (bridge verifier, bft-core `b1ref`), as opposed to the strict
+/// recoverable rule above that trust base entries use: 64 bytes, or 65 with a recovery byte of
+/// 0/1 that is otherwise ignored; low-S; plain ECDSA against the listed key. The seal level
+/// is covered by the shared B1 vectors (`b1_seal_vectors.rs`).
 #[cfg(feature = "client")]
-mod generated {
-    use super::*;
+mod native_seal_rule {
+    use unicity_token::crypto::hash::sha256;
+    use unicity_token::crypto::signature::{verify_seal_signature, SealSignatureError};
     use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
 
-    fn signers() -> Vec<Secp256k1Signer> {
-        (1..=4u8)
-            .map(|i| Secp256k1Signer::from_bytes(&[i; 32]).unwrap())
-            .collect()
-    }
-
-    fn setup(signers: &[Secp256k1Signer]) -> (RootTrustBase, UnicitySeal) {
-        let tb = RootTrustBase::new(
-            1,
-            NetworkId::LOCAL,
-            1,
-            1,
-            signers
-                .iter()
-                .enumerate()
-                .map(|(i, s)| RootTrustBaseNodeInfo {
-                    node_id: format!("n{i}"),
-                    signing_key: s.public_key(),
-                    stake: 1,
-                })
-                .collect(),
-            3,
-        );
-        let mut seal = UnicitySeal {
-            network_id: NetworkId::LOCAL,
-            root_chain_round_number: 5,
-            epoch: 1,
-            timestamp: 1_731_504_000,
-            previous_hash: None,
-            hash: vec![7; 32],
-            signatures: Vec::new(),
-        };
-        let digest = seal.calculate_hash();
-        seal.signatures = signers
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (format!("n{i}"), s.sign(&digest).encode().to_vec()))
-            .collect();
-        (tb, seal)
-    }
-
-    fn with_v_xor(seal: &UnicitySeal, nodes: &[usize]) -> UnicitySeal {
-        let mut s = seal.clone();
-        for &i in nodes {
-            s.signatures[i].1[64] ^= 1;
-        }
-        s
-    }
-
-    /// A bad recovery id contributes zero votes; surplus invalid signatures are tolerated
-    /// while enough conforming ones remain; the changed witness never reuses a verdict.
     #[test]
-    fn a_mutated_recovery_id_contributes_no_vote_and_no_cached_verdict() {
-        let signers = signers();
-        let (tb, seal) = setup(&signers);
-        let mut session = SealSession::new(&tb);
-        assert_eq!(session.verify_quorum(&seal), Ok(()));
-        assert_eq!(session.stats().quorum_checks, 1);
+    fn forms_and_ranges() {
+        let signer = Secp256k1Signer::from_bytes(&[7; 32]).unwrap();
+        let other = Secp256k1Signer::from_bytes(&[8; 32]).unwrap();
+        let digest = sha256(b"a seal");
+        let d = digest.data();
+        let wire = signer.sign(&digest).encode().to_vec();
+        let key = signer.public_key();
 
-        // one flipped: three conforming votes remain (a different witness: re-verified)
-        let one = with_v_xor(&seal, &[0]);
-        assert_eq!(session.verify_quorum(&one), Ok(()));
-        assert_eq!(session.stats().quorum_checks, 2);
-        // two flipped: only two votes
-        let two = with_v_xor(&seal, &[0, 1]);
+        assert_eq!(verify_seal_signature(&wire, d, &key), Ok(()));
         assert_eq!(
-            session.verify_quorum(&two),
-            Err(VerificationError::QuorumNotMet)
+            verify_seal_signature(&wire[..64], d, &key),
+            Ok(()),
+            "compact form"
         );
-        // the original is still a hit, and the failed mutation was not remembered
-        assert_eq!(session.verify_quorum(&seal), Ok(()));
+        let mut flipped = wire.clone();
+        flipped[64] ^= 1;
         assert_eq!(
-            session.verify_quorum(&two),
-            Err(VerificationError::QuorumNotMet)
+            verify_seal_signature(&flipped, d, &key),
+            Ok(()),
+            "the recovery byte is ignored"
         );
-        assert_eq!(session.stats().quorum_checks, 4);
-
-        // exactly three signers, one with a flipped v: the quorum is lost
-        let mut three = seal.clone();
-        three.signatures.truncate(3);
-        let three_flipped = with_v_xor(&three, &[2]);
-        let mut fresh = SealSession::new(&tb);
-        assert_eq!(fresh.verify_quorum(&three), Ok(()));
+        let mut v2 = wire.clone();
+        v2[64] = 2;
         assert_eq!(
-            fresh.verify_quorum(&three_flipped),
-            Err(VerificationError::QuorumNotMet)
+            verify_seal_signature(&v2, d, &key),
+            Err(SealSignatureError::Format)
         );
-        // every in-range v other than the producing one fails for a single signer too
-        for v in 0..=3u8 {
-            let mut s = three.clone();
-            s.signatures[0].1[64] = v;
-            let ok = SealSession::new(&tb).verify_quorum(&s).is_ok();
-            assert_eq!(ok, v == three.signatures[0].1[64], "v={v}");
-        }
-    }
-}
-
-#[cfg(feature = "client")]
-mod surplus {
-    use super::*;
-    use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
-
-    /// Surplus entries that are not 65-byte signatures (compact, short, long, empty)
-    /// count as zero votes and do not hurt a met quorum (the shared fixtures have no
-    /// such accepting case yet).
-    #[test]
-    fn surplus_non_65_byte_signatures_are_zero_votes_next_to_a_met_quorum() {
-        let signers: Vec<_> = (1..=4u8)
-            .map(|i| Secp256k1Signer::from_bytes(&[i; 32]).unwrap())
-            .collect();
-        let tb = RootTrustBase::new(
-            1,
-            NetworkId::LOCAL,
-            1,
-            1,
-            signers
-                .iter()
-                .enumerate()
-                .map(|(i, s)| RootTrustBaseNodeInfo {
-                    node_id: format!("n{i}"),
-                    signing_key: s.public_key(),
-                    stake: 1,
-                })
-                .collect(),
-            3,
+        let mut v27 = wire.clone();
+        v27[64] = 27;
+        assert_eq!(
+            verify_seal_signature(&v27, d, &key),
+            Err(SealSignatureError::Format)
         );
-        let mut seal = UnicitySeal {
-            network_id: NetworkId::LOCAL,
-            root_chain_round_number: 5,
-            epoch: 1,
-            timestamp: 1_731_504_000,
-            previous_hash: None,
-            hash: vec![7; 32],
-            signatures: Vec::new(),
-        };
-        let digest = seal.calculate_hash();
-        let sigs: Vec<_> = signers
-            .iter()
-            .map(|s| s.sign(&digest).encode().to_vec())
-            .collect();
-        seal.signatures = (0..3).map(|i| (format!("n{i}"), sigs[i].clone())).collect();
-        for junk in [
-            sigs[3][..64].to_vec(),
-            sigs[3][..63].to_vec(),
-            {
-                let mut l = sigs[3].clone();
-                l.push(0);
-                l
-            },
-            Vec::new(),
-        ] {
-            let mut s = seal.clone();
-            s.signatures.push(("n3".to_string(), junk));
-            assert_eq!(SealSession::new(&tb).verify_quorum(&s), Ok(()));
-            // ... and in place of a needed signature the quorum is lost
-            s.signatures.remove(0);
-            assert_eq!(
-                SealSession::new(&tb).verify_quorum(&s),
-                Err(VerificationError::QuorumNotMet)
-            );
-        }
+        assert_eq!(
+            verify_seal_signature(&wire[..63], d, &key),
+            Err(SealSignatureError::Format)
+        );
+        let mut long = wire.clone();
+        long.push(0);
+        assert_eq!(
+            verify_seal_signature(&long, d, &key),
+            Err(SealSignatureError::Format)
+        );
+        assert_eq!(
+            verify_seal_signature(&[], d, &key),
+            Err(SealSignatureError::Format)
+        );
+
+        // r = 0 and s = 0 are out of range
+        let mut zero_r = wire.clone();
+        zero_r[..32].fill(0);
+        assert_eq!(
+            verify_seal_signature(&zero_r, d, &key),
+            Err(SealSignatureError::Range)
+        );
+        let mut zero_s = wire.clone();
+        zero_s[32..64].fill(0);
+        assert_eq!(
+            verify_seal_signature(&zero_s, d, &key),
+            Err(SealSignatureError::Range)
+        );
+
+        // valid and well-formed, but not this key's signature of this digest
+        assert_eq!(
+            verify_seal_signature(&wire, d, &other.public_key()),
+            Err(SealSignatureError::Invalid)
+        );
+        assert_eq!(
+            verify_seal_signature(&wire, sha256(b"another").data(), &key),
+            Err(SealSignatureError::Invalid)
+        );
     }
 }

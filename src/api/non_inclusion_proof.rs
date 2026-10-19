@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use super::bft::{RootTrustBase, UnicityCertificate};
+use super::bft::{TrustBaseHistory, UnicityCertificate};
 use super::{NonInclusionCertificate, StateId};
 use crate::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
 use crate::error::Error;
@@ -108,7 +108,7 @@ impl NonInclusionProof {
         self.requested_state_id.as_ref()
     }
 
-    /// Verify a client-bound proof against `trust_base` and report the authenticated snapshot.
+    /// Verify a client-bound proof against `history` and report the authenticated snapshot.
     ///
     /// The unicity certificate is authenticated strictly (network, exact epoch, root round
     /// not before the epoch start, quorum, the fixed aggregation partition and the
@@ -126,16 +126,16 @@ impl NonInclusionProof {
     /// metadata for this check.**
     ///
     /// ```no_run
-    /// # use unicity_token::api::{bft::RootTrustBase, NonInclusionProof};
+    /// # use unicity_token::api::{bft::TrustBaseHistory, NonInclusionProof};
     /// # use unicity_token::verify::{NonInclusionContext, NonInclusionOutcome};
     /// # struct Checkpoint { network_id: u16, required_root_round: u64 }
     /// # fn policy(
     /// #     proof: &NonInclusionProof,
-    /// #     trust_base: &RootTrustBase,
+    /// #     history: &TrustBaseHistory,
     /// #     checkpoint: &Checkpoint, // obtained independently of the proof and of the server response
     /// # ) -> Result<(), &'static str> {
     /// let outcome = proof
-    ///     .verify_at_snapshot(trust_base, &NonInclusionContext::new())
+    ///     .verify_at_snapshot(history, &NonInclusionContext::new())
     ///     .map_err(|_| "no verified absence")?;
     /// let NonInclusionOutcome::AbsentAtSnapshot { snapshot, .. } = outcome else {
     ///     return Err("no verified absence");
@@ -151,14 +151,14 @@ impl NonInclusionProof {
     /// ```
     pub fn verify_at_snapshot(
         &self,
-        trust_base: &RootTrustBase,
+        history: &TrustBaseHistory,
         context: &NonInclusionContext,
     ) -> Result<NonInclusionOutcome, VerificationError> {
         let target = self
             .requested_state_id
             .as_ref()
             .ok_or(VerificationError::NonInclusionTargetMissing)?;
-        verify::verify_non_inclusion_at_snapshot(trust_base, self, target, context)
+        verify::verify_non_inclusion_at_snapshot(history, self, target, context)
     }
 
     /// [`verify_at_snapshot`](Self::verify_at_snapshot) for a directly decoded proof and an
@@ -174,7 +174,7 @@ impl NonInclusionProof {
     pub fn verify_for_at_snapshot(
         &self,
         target: &StateId,
-        trust_base: &RootTrustBase,
+        history: &TrustBaseHistory,
         context: &NonInclusionContext,
     ) -> Result<NonInclusionOutcome, VerificationError> {
         if self
@@ -184,7 +184,7 @@ impl NonInclusionProof {
         {
             return Err(VerificationError::NonInclusionTargetMismatch);
         }
-        verify::verify_non_inclusion_at_snapshot(trust_base, self, target, context)
+        verify::verify_non_inclusion_at_snapshot(history, self, target, context)
     }
 }
 

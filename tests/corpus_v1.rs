@@ -7,17 +7,16 @@
 //! base, and must be byte-identical. The negative `view-*` and `trust-base-*`
 //! cases must be refused. RPC/evidence-stage cases await the batch client.
 
+mod trust_support;
+
 use std::fs;
 use std::path::PathBuf;
 
-use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
-use unicity_token::api::bft::{RootTrustBase, ShardId, UnicityCertificate};
-use unicity_token::api::NetworkId;
+use unicity_token::api::bft::{ShardId, TrustBaseHistory, UnicityCertificate};
 use unicity_token::cbor::Decoder;
 use unicity_token::consolidation::{
     PartitionTopology, PartitionView, PartitionViewError, ShardCertificate,
 };
-use unicity_token::crypto::signature::PublicKey;
 use unicity_token::verify::{SealSession, VerificationError};
 
 fn assemble(
@@ -80,35 +79,8 @@ fn file_name(bits: &str) -> String {
 
 /// `trust-base.cbor`: tag 39000 `[version, network, epoch, epochStart,
 /// [[nodeId, sigKey, stake]...], threshold, ...]`.
-fn trust_base(path: &str) -> RootTrustBase {
-    let bytes = read(path);
-    let items = Decoder::new(&bytes)
-        .expect_tag(39000)
-        .unwrap()
-        .array(Some(10))
-        .unwrap();
-    let nodes = items[4]
-        .array(None)
-        .unwrap()
-        .into_iter()
-        .map(|n| {
-            let f = n.array(Some(3)).unwrap();
-            RootTrustBaseNodeInfo {
-                node_id: f[0].text().unwrap().into(),
-                signing_key: PublicKey::from_bytes(f[1].bytes_value().unwrap()).unwrap(),
-                stake: f[2].uint().unwrap(),
-            }
-        })
-        .collect();
-    RootTrustBase::try_new(
-        items[0].uint().unwrap(),
-        NetworkId::new(items[1].uint().unwrap() as u16).unwrap(),
-        items[2].uint().unwrap(),
-        items[3].uint().unwrap(),
-        nodes,
-        items[5].uint().unwrap(),
-    )
-    .unwrap()
+fn trust_base(path: &str) -> TrustBaseHistory {
+    trust_support::history_from_corpus_trust_base(&read(path))
 }
 
 struct Case {
@@ -264,11 +236,12 @@ fn other_authorities_do_not_authenticate_the_master_seal() {
     for (name, want) in [
         (
             "trust-base-other-authority",
-            VerificationError::QuorumNotMet,
+            VerificationError::SealSignerInvalid,
         ),
         (
+            // the history holds an entry of another epoch only: older or newer than the seal's
             "trust-base-other-epoch",
-            VerificationError::SealEpochMismatch,
+            VerificationError::EpochBeforeGenesis,
         ),
         (
             "trust-base-other-network",

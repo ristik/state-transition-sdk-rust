@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use super::bft::{RootTrustBase, UnicityCertificate};
+use super::bft::{TrustBaseHistory, UnicityCertificate};
 use super::certification::CertificationData;
 use super::inclusion_certificate::InclusionCertificate;
 use super::StateId;
@@ -90,9 +90,9 @@ impl InclusionProof {
         &self,
         state_id: &StateId,
         reference_time: u64,
-        trust_base: &RootTrustBase,
+        history: &TrustBaseHistory,
     ) -> Result<(), VerificationError> {
-        verify::verify_inclusion_proof_for(trust_base, self, state_id, reference_time)
+        verify::verify_inclusion_proof_for(history, self, state_id, reference_time)
     }
 }
 

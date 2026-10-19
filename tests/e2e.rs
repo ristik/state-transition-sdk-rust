@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use unicity_token::api::bft::RootTrustBase;
+use unicity_token::api::bft::TrustBaseHistory;
 use unicity_token::client::{self, HttpAggregatorClient};
 use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
 use unicity_token::predicate::builtin::SignaturePredicate;
@@ -49,9 +49,9 @@ fn e2e_mint_transfer_verify() {
         .as_secs()
         + 3600;
     let (gateway, api_key, trustbase_path) = read_service();
-    let trust_json = std::fs::read_to_string(&trustbase_path)
+    let trust_file = std::fs::read(&trustbase_path)
         .unwrap_or_else(|e| panic!("read trust base {trustbase_path}: {e}"));
-    let trust_base = RootTrustBase::from_json(&trust_json).expect("parse trust base");
+    let trust_base = TrustBaseHistory::from_file(&trust_file, None).expect("parse trust base");
 
     let mut aggregator =
         HttpAggregatorClient::new(gateway).with_polling(Duration::from_secs(2), 90);
@@ -65,7 +65,7 @@ fn e2e_mint_transfer_verify() {
     let token = client::mint(
         &aggregator,
         &trust_base,
-        trust_base.network_id,
+        trust_base.network_id(),
         &SignaturePredicate::new(alice.public_key()),
         TokenType::random().unwrap(),
         TokenSalt::random().unwrap(),

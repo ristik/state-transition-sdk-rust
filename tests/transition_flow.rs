@@ -15,14 +15,15 @@
 //! wire version with the same element count, so one vector covers the encoding
 //! with and without a value in that slot.
 
-use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
-use unicity_token::api::bft::RootTrustBase;
+use unicity_token::api::bft::TrustBaseHistory;
 use unicity_token::api::{CertificationData, InclusionProofResponse, NetworkId};
 use unicity_token::cbor::Decoder;
 use unicity_token::crypto::hash::sha256;
 use unicity_token::crypto::signature::PublicKey;
 use unicity_token::transaction::{CertifiedTransferTransaction, Token, Transaction};
 use unicity_token::verify::VerificationError;
+
+mod trust_support;
 
 const FIXTURE: &str = include_str!("vectors/transition_flow.json");
 
@@ -40,21 +41,10 @@ fn alloc_format(key: &str) -> String {
     format!("\"{key}\"")
 }
 
-fn trust_base() -> RootTrustBase {
+fn trust_base() -> TrustBaseHistory {
     let pk = PublicKey::from_bytes(&hex::decode(field(FIXTURE, "aggregatorPublicKey")).unwrap())
         .unwrap();
-    RootTrustBase::new(
-        0,
-        NetworkId::LOCAL,
-        0,
-        0,
-        vec![RootTrustBaseNodeInfo {
-            node_id: "NODE".into(),
-            signing_key: pk,
-            stake: 1,
-        }],
-        1,
-    )
+    trust_support::single_node_history(pk)
 }
 
 fn token(name: &str) -> (Vec<u8>, Token) {
@@ -126,18 +116,7 @@ fn rejects_validly_signed_tokens_of_another_partition() {
     const OTHER: &str = include_str!("vectors/transition_flow_partition0.json");
     let pk =
         PublicKey::from_bytes(&hex::decode(field(OTHER, "aggregatorPublicKey")).unwrap()).unwrap();
-    let tb = RootTrustBase::new(
-        0,
-        NetworkId::LOCAL,
-        0,
-        0,
-        vec![RootTrustBaseNodeInfo {
-            node_id: "NODE".into(),
-            signing_key: pk,
-            stake: 1,
-        }],
-        1,
-    );
+    let tb = trust_support::single_node_history(pk);
     for name in [
         "aliceToken",
         "bobToken",
@@ -163,18 +142,7 @@ fn rejects_wrong_aggregator_key() {
         &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap(),
     )
     .unwrap();
-    let tb = RootTrustBase::new(
-        0,
-        NetworkId::LOCAL,
-        0,
-        0,
-        vec![RootTrustBaseNodeInfo {
-            node_id: "NODE".into(),
-            signing_key: other,
-            stake: 1,
-        }],
-        1,
-    );
+    let tb = trust_support::single_node_history(other);
     let (_, token) = token("carolToken");
     let err = token.verify(&tb).unwrap_err();
     assert!(
@@ -193,56 +161,9 @@ fn rejects_wrong_network() {
     // Genesis network is LOCAL; a MAINNET trust base must be rejected up front.
     let tb_pk = PublicKey::from_bytes(&hex::decode(field(FIXTURE, "aggregatorPublicKey")).unwrap())
         .unwrap();
-    let tb = RootTrustBase::new(
-        0,
-        NetworkId::MAINNET,
-        0,
-        0,
-        vec![RootTrustBaseNodeInfo {
-            node_id: "NODE".into(),
-            signing_key: tb_pk,
-            stake: 1,
-        }],
-        1,
-    );
+    let tb = trust_support::history(NetworkId::MAINNET, 0, 0, vec![("NODE", tb_pk, 1)]);
     let (_, token) = token("aliceToken");
     assert_eq!(token.verify(&tb), Err(VerificationError::NetworkMismatch));
-}
-
-#[test]
-fn rejects_structurally_unsafe_trust_bases() {
-    let (_, token) = token("aliceToken");
-    let empty = RootTrustBase::new(1, NetworkId::LOCAL, 1, 1, vec![], 0);
-    assert!(matches!(
-        token.verify(&empty),
-        Err(VerificationError::InvalidTrustBase(_))
-    ));
-
-    let key = PublicKey::from_bytes(&hex::decode(field(FIXTURE, "aggregatorPublicKey")).unwrap())
-        .unwrap();
-    let duplicate_key = RootTrustBase::new(
-        1,
-        NetworkId::LOCAL,
-        1,
-        1,
-        vec![
-            RootTrustBaseNodeInfo {
-                node_id: "A".into(),
-                signing_key: key.clone(),
-                stake: 1,
-            },
-            RootTrustBaseNodeInfo {
-                node_id: "B".into(),
-                signing_key: key,
-                stake: 1,
-            },
-        ],
-        2,
-    );
-    assert!(matches!(
-        token.verify(&duplicate_key),
-        Err(VerificationError::InvalidTrustBase(_))
-    ));
 }
 
 #[test]
