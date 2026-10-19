@@ -125,10 +125,11 @@ if snapshot.network_id().id() != checkpoint.network_id
 
 `api::bft::TrustBaseEntry` is one signed epoch record (record version 2, CBOR tag 39000, byte-compatible with bft-go-base `RootTrustBaseV2`). `api::bft::TrustBaseHistory` holds the chain of entries a verifier knows.
 
+- **Absent hashes.** `stateHash` and `changeRecordHash` are `null` when absent, otherwise exactly 32 bytes; the empty byte string is refused (one byte form, one identity).
 - **Identity.** `entry_id()` is the SHA-256 of the entry with its signature field encoded as `null` (`sig_bytes()`); valid signature sets of the same entry share it. A successor links to its predecessor's identity.
 - **Quorum.** Member weights are positive and bounded; the threshold is exactly `floor(2W/3)+1` of the total weight `W`. Signatures are the predecessor members' 65-byte recoverable signatures over `SHA-256(sig_bytes)`; the check is strict (an unknown member or any invalid signature fails the entry), the 64-byte compact form is not accepted.
 - **Append-only.** `append` verifies an entry from the latest held entry (epoch + 1, same network, later start, predecessor identity, quorum) and adds it. The same entry again (same identity) is a no-op only if its witness is valid, and the first witness stays; another entry of a held epoch is `HistoryError::Conflict`; an entry beyond the next epoch is a `Gap`. The latest held entry is effectively the pin.
 - **Bundles.** A release ships the whole known history as one tag-39015 `GetTrustBase` response (`to_bundle`, `from_bundle`); `install_bundle` merges one into a history, all or nothing.
-- **Genesis.** Load it from CBOR, or from the V2 JSON form with `TrustBaseEntry::from_json` (host only; JSON cannot tell `null` from an empty byte string, so compare the identity with the deployment pin via `TrustBaseHistory::from_genesis(entry, Some(pin))`).
+- **Genesis.** Load it from CBOR, or from the V2 JSON form with `TrustBaseEntry::from_json` (host only; compare the identity with the deployment pin via `TrustBaseHistory::from_genesis(entry, Some(pin))`).
 
 The history does not yet drive token verification; that is the next change.
