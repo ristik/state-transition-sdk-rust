@@ -97,10 +97,10 @@ fn long_poll_off_sends_no_wait_and_polls_by_interval() {
 }
 
 #[test]
-fn legacy_attempts_method_still_never_waits() {
+fn get_inclusion_proof_with_long_poll_off_is_the_attempts_loop_and_never_waits() {
     let e = empty();
     let server = Scripted::start(move |_, _| Reply::result(obj(&e, Some("pending"), None)));
-    let c = client(&server.url, 5);
+    let c = client(&server.url, 5).with_long_poll(false);
     assert!(matches!(
         c.get_inclusion_proof(&state_id(7)),
         Err(HttpError::Timeout)

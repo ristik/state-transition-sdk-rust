@@ -1,8 +1,9 @@
 //! Deadline-based inclusion-proof waiting with optional long-poll (`waitMs`).
 //!
-//! The legacy [`AggregatorClient::get_inclusion_proof`] keeps its attempts-based
-//! polling untouched. [`HttpAggregatorClient::wait_for_inclusion_proof`] is the
-//! separately selected policy: one total deadline, a per-call wait clamped to the
+//! [`AggregatorClient::get_inclusion_proof`] (and so `client::mint` / `client::transfer`)
+//! delegates here by default, with the total deadline `interval * attempts` of
+//! [`HttpAggregatorClient::with_polling`]; [`HttpAggregatorClient::with_long_poll`]`(false)`
+//! restores the attempts-based polling loop. The policy: one total deadline, a per-call wait clamped to the
 //! remaining time, a per-call transport timeout of `wait + margin` inside that
 //! deadline, and pacing that never turns a missing or zero echo into a tight loop.
 //!
@@ -175,8 +176,8 @@ enum Pace {
 impl HttpAggregatorClient {
     /// Wait for the certified proof of `state_id` until `options`' total deadline.
     ///
-    /// Unlike the legacy [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
-    /// (an attempts count) this is bounded by time alone, so a long server wait can
+    /// Unlike the attempts loop of [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
+    /// with long poll off, this is bounded by time alone, so a long server wait can
     /// never multiply into minutes. Each call asks for
     /// `floor(max(0, min(preferred, remaining - margin, max_request - margin)))`
     /// milliseconds of server-side waiting, with a call timeout of `wait + margin`

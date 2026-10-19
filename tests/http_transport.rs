@@ -261,7 +261,10 @@ fn ok_json(result: &str) -> Vec<u8> {
 }
 
 fn client(url: &str) -> HttpAggregatorClient {
-    HttpAggregatorClient::new_insecure_http(url).with_polling(Duration::from_millis(5), 3)
+    // these tests pin the classic attempts loop (counts of probes), so long poll is off
+    HttpAggregatorClient::new_insecure_http(url)
+        .with_polling(Duration::from_millis(5), 3)
+        .with_long_poll(false)
 }
 
 // --- tests -----------------------------------------------------------------
@@ -819,7 +822,8 @@ fn unknown_fails_after_the_grace_and_the_grace_is_configurable() {
     // default grace (2): the third consecutive unknown fails, without waiting for the timeout
     let server = MockServer::start(vec![unknown.clone()]);
     let c = HttpAggregatorClient::new_insecure_http(&server.url)
-        .with_polling(Duration::from_millis(1), 50);
+        .with_polling(Duration::from_millis(1), 50)
+        .with_long_poll(false);
     assert!(matches!(
         c.get_inclusion_proof(&fixture_state_id()),
         Err(HttpError::StateUnknown)
@@ -859,7 +863,8 @@ fn unknown_fails_after_the_grace_and_the_grace_is_configurable() {
         status_json(&full, "included"),
     ]);
     let c = HttpAggregatorClient::new_insecure_http(&server.url)
-        .with_polling(Duration::from_millis(1), 10);
+        .with_polling(Duration::from_millis(1), 10)
+        .with_long_poll(false);
     assert_eq!(c.get_inclusion_proof(&fixture_state_id()).unwrap(), proof);
     assert_eq!(server.request_count(), 6);
 }
