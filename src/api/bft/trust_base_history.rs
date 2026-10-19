@@ -132,14 +132,15 @@ impl TrustBaseHistory {
     /// is the deployment's genesis identity, when it has one. Host only.
     #[cfg(feature = "std")]
     pub fn from_file(contents: &[u8], pin: Option<[u8; ID_LEN]>) -> Result<Self, HistoryError> {
-        let first = contents.iter().find(|b| !b.is_ascii_whitespace());
-        match first {
+        let start = contents.iter().position(|b| !b.is_ascii_whitespace());
+        let rest = start.map_or(&contents[..0], |i| &contents[i..]);
+        match rest.first() {
             Some(b'{') => {
                 let text = core::str::from_utf8(contents)
                     .map_err(|_| HistoryError::Bundle("trust base JSON is not UTF-8"))?;
                 Self::from_genesis(TrustBaseEntry::from_json(text)?, pin)
             }
-            Some(0xd9) if contents.get(1..3) == Some(&[0x98, 0x58]) => {
+            Some(0xd9) if rest.get(1..3) == Some(&[0x98, 0x58]) => {
                 Self::from_genesis(TrustBaseEntry::from_cbor(contents)?, pin)
             }
             _ => Self::from_bundle(contents, pin),

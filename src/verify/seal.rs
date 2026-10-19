@@ -225,7 +225,9 @@ impl<'a> SealSession<'a> {
     /// reusing an earlier success of the identical complete seal under the same entry.
     ///
     /// This is only the signature part; callers check the unicity-tree root and everything
-    /// else themselves.
+    /// else themselves. It does not run the structural seal checks of `authenticate_seal`, so
+    /// the 16-signature cap applies on the authenticate path only (the seal's size bounds the
+    /// work here).
     pub fn verify_quorum(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
         self.verify_quorum_under(seal, &[0; 32])
     }
