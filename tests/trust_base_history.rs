@@ -82,11 +82,27 @@ fn go_encoding_of_a_genesis_decodes_and_reencodes_identically() {
     assert!(e.is_genesis());
     assert_eq!(e.state_hash, None);
     assert_eq!(e.to_cbor(), bytes);
-    // the empty byte string form is another valid byte form (another identity)
+    // the empty byte string is not a wire form: the canonical absent hash is null only
     let empty = hex.replace("0103f6f658", "0103404058");
-    let e2 = TrustBaseEntry::from_cbor(&hex::decode(empty).unwrap()).unwrap();
-    assert_eq!(e2.state_hash, Some(vec![]));
-    assert_ne!(e2.entry_id(), e.entry_id());
+    assert_ne!(empty, hex);
+    assert_eq!(
+        TrustBaseEntry::from_cbor(&hex::decode(empty).unwrap()),
+        Err(TrustBaseError::Encoding(
+            "an absent hash is null, not an empty byte string"
+        ))
+    );
+    // an in-memory empty value is the same entry as null: same bytes, same identity
+    let mut mem = e.clone();
+    mem.state_hash = Some(vec![]);
+    assert_eq!(mem.to_cbor(), bytes);
+    assert_eq!(mem.entry_id(), e.entry_id());
+    // a present hash is exactly 32 bytes
+    let mut short = e.clone();
+    short.state_hash = Some(vec![7; 31]);
+    assert!(short.validate().is_err());
+    let mut full = e.clone();
+    full.state_hash = Some(vec![7; 32]);
+    assert_eq!(TrustBaseEntry::from_cbor(&full.to_cbor()).unwrap(), full);
 }
 
 #[test]
