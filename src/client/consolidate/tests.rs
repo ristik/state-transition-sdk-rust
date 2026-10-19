@@ -175,6 +175,9 @@ struct Sim {
     /// The partition the simulated network certifies (the fixed one unless a test
     /// builds a foreign network).
     partition: u32,
+    /// The trust base epochs this simulated aggregator serves (`None`: all).
+    tb_serve_until: Option<u64>,
+    tb_requests: Vec<crate::api::bft::TrustBaseRequest>,
 }
 
 fn shard_of(key: &[u8; 32]) -> usize {
@@ -239,9 +242,31 @@ impl Sim {
             faults: Faults::default(),
             unsharded,
             partition,
+            tb_serve_until: None,
+            tb_requests: Vec::new(),
         };
         sim.advance();
         sim
+    }
+
+    /// A root epoch change: the same validators, a successor entry signed by three of them;
+    /// every later seal is of the new epoch.
+    fn upgrade_epoch(&mut self) {
+        let prev = self.trust_base.latest().clone();
+        let mut next = TrustBaseEntry::new(
+            prev.network_id,
+            prev.epoch + 1,
+            prev.epoch_start + 1000,
+            prev.members.clone(),
+            prev.quorum_threshold,
+            None,
+            None,
+            prev.entry_id(),
+        );
+        for (i, s) in self.signers.iter().take(3).enumerate() {
+            next.sign(&format!("root-{i}"), s);
+        }
+        self.trust_base.append(next).unwrap();
     }
 
     /// Finish a root round: roots, view, signed seal, local certificates.
@@ -2219,4 +2244,274 @@ fn a_wave_executor_returning_fewer_results_than_jobs_is_an_error() {
         c.consolidate(&token, &quick()),
         Err(ConsolidationError::Configuration(_))
     ));
+}
+
+// -------------------------------------------- trust base updates (UTB 3/3) ----
+
+impl crate::client::TrustBaseSource for Node {
+    type Error = &'static str;
+
+    fn get_trust_bases(
+        &self,
+        request: &crate::api::bft::TrustBaseRequest,
+    ) -> Result<crate::api::bft::TrustBasePage, &'static str> {
+        use crate::api::bft::{TrustBasePage, TrustBaseStatus};
+        let mut sim = self.sim.lock().unwrap();
+        sim.tb_requests.push(request.clone());
+        let held = sim.trust_base.clone();
+        let tip = sim
+            .tb_serve_until
+            .map_or(held.latest().epoch, |u| u.min(held.latest().epoch));
+        let page = |status, entries: Vec<TrustBaseEntry>, next| TrustBasePage {
+            network_id: held.network_id(),
+            status,
+            from_epoch: request.from,
+            effective_end: tip,
+            end_entry_id: held.get(tip).map(TrustBaseEntry::entry_id),
+            entries,
+            next_epoch: next,
+        };
+        if request.from > tip {
+            return Ok(page(TrustBaseStatus::NotYetAvailable, Vec::new(), None));
+        }
+        if let Some((end, id)) = request.snapshot {
+            if held.get(end).map(TrustBaseEntry::entry_id) != Some(id) {
+                return Ok(page(TrustBaseStatus::HistoryMismatch, Vec::new(), None));
+            }
+        }
+        let last = tip.min(request.from + u64::from(request.max_entries) - 1);
+        let entries: Vec<TrustBaseEntry> = (request.from..=last)
+            .map(|e| held.get(e).unwrap().clone())
+            .collect();
+        let next = (last < tip).then_some(last + 1);
+        Ok(page(TrustBaseStatus::Ok, entries, next))
+    }
+}
+
+fn old_history(sim: &Arc<Mutex<Sim>>) -> TrustBaseHistory {
+    TrustBaseHistory::from_genesis(sim.lock().unwrap().trust_base.genesis().clone(), None).unwrap()
+}
+
+fn fast_policy() -> crate::client::UpdatePolicy {
+    crate::client::UpdatePolicy {
+        interval: std::time::Duration::from_millis(1),
+        attempts: 3,
+        deadline: std::time::Duration::from_secs(5),
+        limits: crate::client::UpdateLimits::default(),
+    }
+}
+
+#[test]
+fn a_token_of_a_newer_epoch_updates_the_history_and_verifies() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    for _ in 0..3 {
+        sim.lock().unwrap().upgrade_epoch();
+    }
+    let token = make_token(&sim, 7, None, 1);
+    let mut history = old_history(&sim);
+    // the plain verification names the missing epoch
+    let err = token.verify(&history).unwrap_err();
+    assert_eq!(err.unknown_trust_epoch(), Some(4));
+
+    crate::client::verify_token_updating(&token, &mut history, &node(&sim), &fast_policy())
+        .unwrap();
+    assert_eq!(history.latest().epoch, 4);
+    // asked from held + 1, once, without a snapshot
+    let requests = sim.lock().unwrap().tb_requests.clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!((requests[0].from, requests[0].snapshot), (2, None));
+    // already current: verifying again asks nobody
+    crate::client::verify_token_updating(&token, &mut history, &node(&sim), &fast_policy())
+        .unwrap();
+    assert_eq!(sim.lock().unwrap().tb_requests.len(), 1);
+}
+
+#[test]
+fn pages_follow_the_snapshot_and_the_entry_cap_is_respected() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    for _ in 0..5 {
+        sim.lock().unwrap().upgrade_epoch();
+    }
+    let mut history = old_history(&sim);
+    let limits = crate::client::UpdateLimits {
+        page_entries: 2,
+        total_entries: 1024,
+    };
+    let out = crate::client::update_trust_base(&mut history, &node(&sim), 6, &limits).unwrap();
+    assert_eq!(out, crate::client::UpdateOutcome::Extended { added: 5 });
+    let requests = sim.lock().unwrap().tb_requests.clone();
+    assert_eq!(
+        requests.iter().map(|r| r.from).collect::<Vec<_>>(),
+        vec![2, 4, 6]
+    );
+    assert_eq!(requests[0].snapshot, None);
+    assert!(requests[1].snapshot.is_some() && requests[2].snapshot.is_some());
+    assert!(requests.iter().all(|r| r.max_entries == 2));
+
+    // the per-call cap stops early
+    let mut history = old_history(&sim);
+    let capped = crate::client::UpdateLimits {
+        page_entries: 2,
+        total_entries: 2,
+    };
+    let out = crate::client::update_trust_base(&mut history, &node(&sim), 6, &capped).unwrap();
+    assert_eq!(out, crate::client::UpdateOutcome::Extended { added: 2 });
+    assert_eq!(history.latest().epoch, 3);
+}
+
+#[test]
+fn an_epoch_the_source_does_not_have_is_unavailable_within_the_budget() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    sim.lock().unwrap().upgrade_epoch();
+    let token = make_token(&sim, 8, None, 0);
+    sim.lock().unwrap().tb_serve_until = Some(1);
+    let mut history = old_history(&sim);
+    let err =
+        crate::client::verify_token_updating(&token, &mut history, &node(&sim), &fast_policy())
+            .unwrap_err();
+    assert_eq!(
+        err,
+        crate::client::VerifyUpdateError::EpochUnavailable {
+            held: 1,
+            wanted: 2,
+            attempts: 3
+        }
+    );
+    assert_eq!(sim.lock().unwrap().tb_requests.len(), 3, "bounded attempts");
+    assert_eq!(history.latest().epoch, 1);
+}
+
+#[test]
+fn an_epoch_that_appears_later_is_picked_up() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    sim.lock().unwrap().upgrade_epoch();
+    let token = make_token(&sim, 9, None, 0);
+    sim.lock().unwrap().tb_serve_until = Some(1);
+    let mut history = old_history(&sim);
+    let sim2 = sim.clone();
+    let opener = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        sim2.lock().unwrap().tb_serve_until = None;
+    });
+    let policy = crate::client::UpdatePolicy {
+        interval: std::time::Duration::from_millis(20),
+        attempts: 20,
+        deadline: std::time::Duration::from_secs(5),
+        limits: crate::client::UpdateLimits::default(),
+    };
+    crate::client::verify_token_updating(&token, &mut history, &node(&sim), &policy).unwrap();
+    opener.join().unwrap();
+    assert_eq!(history.latest().epoch, 2);
+}
+
+#[test]
+fn other_failures_never_fetch_and_a_bad_entry_is_an_alarm() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    sim.lock().unwrap().upgrade_epoch();
+    let token = make_token(&sim, 10, None, 0);
+
+    // a history of other validators at the same epochs: a seal failure, not a missing epoch
+    let rogue = Secp256k1Signer::from_bytes(&[99; 32]).unwrap();
+    let make = |e: u64, start: u64| {
+        TrustBaseEntry::genesis(
+            NetworkId::LOCAL,
+            e,
+            start,
+            vec![TrustBaseMember::new("x", rogue.public_key(), 1)],
+        )
+    };
+    let mut other = TrustBaseHistory::from_trusted_chain(vec![make(1, 1), {
+        let mut n = make(2, 1001);
+        n.previous_entry_id = make(1, 1).entry_id();
+        n.add_signature("x", vec![0; 65]);
+        n
+    }])
+    .unwrap();
+    let err = crate::client::verify_token_updating(&token, &mut other, &node(&sim), &fast_policy())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::client::VerifyUpdateError::Verification(_)
+    ));
+    assert!(
+        sim.lock().unwrap().tb_requests.is_empty(),
+        "no fetch for another failure"
+    );
+
+    // an entry the source serves that does not extend the history is refused, loudly
+    {
+        let mut sim = sim.lock().unwrap();
+        let mut forged = sim.trust_base.get(2).unwrap().clone();
+        forged.signatures.as_mut().unwrap()[0].1[3] ^= 1;
+        sim.trust_base =
+            TrustBaseHistory::from_trusted_chain(vec![sim.trust_base.genesis().clone(), forged])
+                .unwrap();
+    }
+    let mut history = old_history(&sim);
+    let err = crate::client::update_trust_base(
+        &mut history,
+        &node(&sim),
+        2,
+        &crate::client::UpdateLimits::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::client::UpdateError::Entry(_)),
+        "{err:?}"
+    );
+    assert_eq!(history.latest().epoch, 1);
+}
+
+#[test]
+fn mint_and_transfer_update_the_history_for_a_fresh_proof() {
+    let sim = Arc::new(Mutex::new(Sim::new()));
+    sim.lock().unwrap().upgrade_epoch();
+    let mut history = old_history(&sim);
+    let agg = node(&sim);
+    let (owner, p) = recipient(50);
+    // the freshly certified proof is of epoch 2, newer than the history
+    let plain = mint(
+        &agg,
+        &history,
+        NetworkId::LOCAL,
+        &p,
+        TokenType::new([1; 32]),
+        TokenSalt::from_bytes([21; 32]),
+        None,
+        None,
+        None,
+    );
+    match plain {
+        Err(ClientError::Verification(e)) => assert_eq!(e.unknown_trust_epoch(), Some(2), "{e}"),
+        other => panic!("expected the missing epoch, got {:?}", other.map(|_| ())),
+    }
+    let token = crate::client::mint_updating(
+        &agg,
+        &mut history,
+        &fast_policy(),
+        NetworkId::LOCAL,
+        &p,
+        TokenType::new([1; 32]),
+        TokenSalt::from_bytes([22; 32]),
+        None,
+        None,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("mint_updating: {e}"));
+    assert_eq!(history.latest().epoch, 2);
+
+    let (_next, np) = recipient(51);
+    let moved = crate::client::transfer_updating(
+        &agg,
+        &mut history,
+        &fast_policy(),
+        &token,
+        &np,
+        &owner,
+        StateMask::from_bytes([1; 32]),
+        None,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("transfer_updating: {e}"));
+    assert_eq!(moved.transactions().len(), 1);
 }

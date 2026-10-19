@@ -331,10 +331,11 @@ func main() {
 	w := &world{genesis: g, pin: gid, chain: [][]byte{enc(g), enc(e2), enc(e3), enc(e4)}}
 	f := &file{
 		Format:    "utb-vectors/v1",
-		Generator: "briefs/tools/utb-vectors (ristik/bft-core a20708b64a1c, ristik/bft-go-base 6174434eeb99)",
+		Generator: "briefs/tools/utb-vectors (ristik/bft-core a20708b64a1c, ristik/bft-go-base f1fc4e5784b3 = bft-go-base#3 head)",
 		Notes: []string{
 			"Entries are RootTrustBaseV2 (tag 39000, version 2). EntryID = SHA-256(sigBytes), sigBytes = the entry with signatures encoded as CBOR null.",
 			"Witness signatures: exactly 65 bytes r||s||v, 1 <= r,s < n, low-S, v in 0..3, the recovered key must equal the member key (bft-go-base#2).",
+			"An absent state or change-record hash is CBOR null; a present one is exactly 32 bytes. An empty byte string is refused on decode (bft-go-base#3).",
 			"A successor needs a strict quorum of the PREDECESSOR's members: every supplied signature valid and from a member, weight >= threshold = floor(2W/3)+1.",
 			"Expected results come from bft-core utbstore.Append / Open and gettrustbase bundle functions. 'reason' is the Go error text, diagnostic only.",
 			"The bundle is the GetTrustBase response (tag 39015, provisional) with status OK, fromEpoch = genesis, every entry, nextEpoch null.",
@@ -366,6 +367,15 @@ func main() {
 	gs := clone(g)
 	must(gs.Sign(keys[0].id, keys[0].signer))
 	addGenesis("genesis.with-signatures", "a genesis carrying a signature map", enc(gs), gid)
+	// An absent state or change-record hash has one byte form: CBOR null. An empty byte string (0x40) is refused on decode (bft-go-base#3); in memory
+	// an empty value encodes as null, so the empty form names the same EntryID and cannot be a second entry. JSON genesis loaders use null.
+	ge := clone(g)
+	ge.StateHash, ge.ChangeRecordHash = []byte{}, []byte{}
+	addGenesis("genesis.empty-hash-form", "the pinned genesis with empty byte strings (0x40) instead of null state and change-record hashes", enc(ge), gid)
+	addGenesis("genesis.empty-hash-form-own-pin", "the 0x40 form under a pin computed over its own bytes: only the decode rule refuses it", enc(ge), sha256.Sum256(enc(ge)))
+	ges := clone(g)
+	ges.StateHash = []byte{}
+	addGenesis("genesis.empty-state-hash", "the pinned genesis with an empty byte string (0x40) state hash only", enc(ges), gid)
 	gnz := clone(g)
 	gnz.PreviousEntryID = label("not zero")
 	addGenesis("genesis.nonzero-predecessor", "an epoch-1 entry with a non-zero predecessor and no signatures", enc(gnz), gid)
@@ -420,6 +430,9 @@ func main() {
 	wz := clone(e2u)
 	wz.RootNodes[0].Stake = 0
 	add("refused.weight-zero", "a member of weight 0", 1, enc(signed(wz, keys[0], keys[1], keys[2])), false)
+	eh := signed(e2u, keys[0], keys[1], keys[2])
+	eh.ChangeRecordHash = []byte{} // the signatures cover the null form; the 0x40 form is refused before any signature check
+	add("decode.empty-hash-form", "a successor whose change-record hash is an empty byte string (0x40) instead of 32 bytes or null", 1, enc(eh), false)
 	add("sig.64-byte", "witnesses without the recovery byte", 1, enc(withSigs(e2, func(s []byte) []byte { return s[:64] })), false)
 	add("sig.wrong-recovery-id", "recovery byte flipped (0 <-> 1)", 1, enc(withSigs(e2, func(s []byte) []byte { s[64] ^= 1; return s })), false)
 	add("sig.recovery-id-27", "recovery byte 27 (Ethereum style)", 1, enc(withSigs(e2, func(s []byte) []byte { s[64] += 27; return s })), false)

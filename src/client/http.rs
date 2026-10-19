@@ -17,7 +17,7 @@ use std::io::Read;
 use std::time::Duration;
 use zeroize::Zeroize;
 
-use crate::api::bft::TrustBaseHistory;
+use crate::api::bft::{TrustBaseHistory, TrustBasePage, TrustBaseRequest};
 use crate::api::certification_request::CertificationRequest;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::{
@@ -28,8 +28,8 @@ use crate::cbor::Decoder;
 use super::{
     rpc_code, AggregatorClient, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
     InclusionProofBatch, MembershipStatus, NonInclusionAggregatorClient, RequestOptions, StateRoot,
-    WaitRequest, WaitedBatch, WaitedFailure, DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS,
-    MAX_WAIT_MS, UNCLASSIFIED,
+    TrustBaseSource, WaitRequest, WaitedBatch, WaitedFailure, DEFAULT_WAIT_MARGIN_MS,
+    MAX_BATCH_STATE_IDS, MAX_WAIT_MS, UNCLASSIFIED,
 };
 use crate::consolidation::PartitionView;
 
@@ -40,6 +40,7 @@ pub use wait::{
 
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_TRUST_BASE_PAGE_BYTES: usize = crate::api::bft::trust_base_fetch::MAX_PAGE_BYTES;
 const MAX_PROOF_HEX_CHARS: usize = MAX_RESPONSE_BODY_BYTES - 1024;
 // Shared proof-lookup states. JSON-RPC 2.0 reserves -32000..-32099 for
 // implementation-defined server errors; the Unicity aggregators keep
@@ -1017,6 +1018,72 @@ fn parse_waited_ms(value: &serde_json::Value) -> Result<u64, String> {
         .as_u64()
         .filter(|v| *v <= MAX_WAIT_MS)
         .ok_or_else(|| "malformed waitedMs".to_string())
+}
+
+/// `GET /api/v1/trustbases` on the aggregator's origin: plain HTTP, no JSON-RPC; the body is
+/// the raw `GetTrustBase` response (`application/cbor`, tag 39015). The status is inside the
+/// body. The server speaks for one network, so the request names none.
+impl TrustBaseSource for HttpAggregatorClient {
+    type Error = HttpError;
+
+    fn get_trust_bases(&self, request: &TrustBaseRequest) -> Result<TrustBasePage, HttpError> {
+        let mut url = self.validate_endpoint()?;
+        url.set_path("/api/v1/trustbases");
+        url.set_fragment(None);
+        {
+            let mut q = url.query_pairs_mut();
+            q.clear().append_pair("from", &request.from.to_string());
+            if let Some(to) = request.to {
+                q.append_pair("to", &to.to_string());
+            }
+            if let Some((end, id)) = &request.snapshot {
+                q.append_pair("snapshotEnd", &end.to_string());
+                q.append_pair("snapshotEntryId", &format!("0x{}", hex::encode(id)));
+            }
+            q.append_pair("maxEntries", &request.max_entries.to_string());
+        }
+        let mut call = self
+            .agent
+            .get(url.as_str())
+            .set("Accept", "application/cbor");
+        if let Some(key) = &self.api_key {
+            call = call.set("X-API-Key", key.expose());
+        }
+        let response = match call.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(status, r)) => {
+                let body = read_response_raw(r, MAX_ERROR_BODY_BYTES).map_err(raw_to_http)?;
+                return Err(HttpError::Http { status, body });
+            }
+            Err(e) => return Err(raw_to_http(transport_failure(&e))),
+        };
+        if response.status() != 200 {
+            let status = response.status();
+            let body = read_response_raw(response, MAX_ERROR_BODY_BYTES).map_err(raw_to_http)?;
+            return Err(HttpError::Http { status, body });
+        }
+        if !response.header("Content-Type").is_some_and(|c| {
+            c.trim()
+                .to_ascii_lowercase()
+                .starts_with("application/cbor")
+        }) {
+            return Err(HttpError::Decode(
+                "GetTrustBase response is not application/cbor".to_string(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(MAX_TRUST_BASE_PAGE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| raw_to_http(io_failure(&e)))?;
+        if bytes.len() > MAX_TRUST_BASE_PAGE_BYTES {
+            return Err(HttpError::ResponseTooLarge {
+                limit: MAX_TRUST_BASE_PAGE_BYTES,
+            });
+        }
+        TrustBasePage::from_cbor(&bytes).map_err(|e| HttpError::Decode(e.to_string()))
+    }
 }
 
 impl NonInclusionAggregatorClient for HttpAggregatorClient {
