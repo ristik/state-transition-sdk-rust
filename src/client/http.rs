@@ -212,6 +212,7 @@ pub struct HttpAggregatorClient {
     agent: ureq::Agent,
     poll_interval: Duration,
     poll_attempts: u32,
+    long_poll: bool,
     unknown_grace: u32,
     allow_insecure_http: bool,
 }
@@ -238,6 +239,7 @@ impl fmt::Debug for HttpAggregatorClient {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("poll_interval", &self.poll_interval)
             .field("poll_attempts", &self.poll_attempts)
+            .field("long_poll", &self.long_poll)
             .field("unknown_grace", &self.unknown_grace)
             .field("allow_insecure_http", &self.allow_insecure_http)
             .finish_non_exhaustive()
@@ -257,6 +259,7 @@ impl HttpAggregatorClient {
                 .build(),
             poll_interval: Duration::from_secs(1),
             poll_attempts: 60,
+            long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: false,
         }
@@ -281,6 +284,7 @@ impl HttpAggregatorClient {
                 .build(),
             poll_interval: Duration::from_secs(1),
             poll_attempts: 60,
+            long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: true,
         }
@@ -292,11 +296,28 @@ impl HttpAggregatorClient {
         self
     }
 
-    /// Configure inclusion-proof polling: wait `interval` between up to
-    /// `attempts` probes.
+    /// Configure inclusion-proof waiting: the pause `interval` between probes and an
+    /// overall budget of `interval * attempts` (defaults: 1 s, 60 attempts).
+    ///
+    /// With long poll on (the default, see [`with_long_poll`](Self::with_long_poll)) the
+    /// budget is a total deadline of [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
+    /// (`interval * attempts`), within which the aggregator may hold each request, so
+    /// far fewer than `attempts` requests are sent. With long poll off it is the
+    /// classic count: up to `attempts` probes, `interval` apart.
     pub fn with_polling(mut self, interval: Duration, attempts: u32) -> Self {
         self.poll_interval = interval;
         self.poll_attempts = attempts;
+        self
+    }
+
+    /// Whether [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof) (and so
+    /// `client::mint` / `client::transfer`) asks the aggregator to hold a request while
+    /// the proof is pending (`waitMs`; default `true`, as in the JS SDK). A server that
+    /// does not echo `waitedMs` is detected on the first answer and polled at the
+    /// configured interval for the rest of the wait, at no more requests than the
+    /// classic poller. `false` sends no `waitMs` and keeps the plain attempts loop.
+    pub fn with_long_poll(mut self, enabled: bool) -> Self {
+        self.long_poll = enabled;
         self
     }
 
@@ -858,6 +879,14 @@ impl AggregatorClient for HttpAggregatorClient {
 
     /// Wait for the certified proof of `state_id`.
     ///
+    /// By default (long poll on, [`with_long_poll`](HttpAggregatorClient::with_long_poll))
+    /// this is [`wait_for_inclusion_proof`](HttpAggregatorClient::wait_for_inclusion_proof)
+    /// with the total deadline `interval * attempts` of
+    /// [`with_polling`](HttpAggregatorClient::with_polling), the client's interval and
+    /// unknown grace: the aggregator holds each request while the proof is pending, and a
+    /// server that does not echo `waitedMs` is polled at the interval. With long poll off
+    /// it is the attempts loop described below, sending no `waitMs`.
+    ///
     /// Asks for the aggregator's status hint (`includeStatus`) and accepts both
     /// result shapes: a plain string (legacy server) behaves exactly as before.
     /// While the response is not a certified proof: `pending` (or no status)
@@ -869,6 +898,10 @@ impl AggregatorClient for HttpAggregatorClient {
     /// The status is an unauthenticated hint: a certified proof is returned
     /// whatever the status says, and the caller must still verify it.
     fn get_inclusion_proof(&self, state_id: &StateId) -> Result<InclusionProof, HttpError> {
+        if self.long_poll {
+            let total = self.poll_interval.saturating_mul(self.poll_attempts);
+            return self.wait_for_inclusion_proof(state_id, &WaitOptions::new(total));
+        }
         let params = serde_json::json!({
             "stateId": hex::encode(state_id.bytes()),
             "includeStatus": true,
