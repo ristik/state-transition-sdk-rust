@@ -20,10 +20,10 @@ With several aggregator instances behind a load balancer, an instance that did n
 
 ### Long polling
 
-`client::mint`, `client::transfer` and `AggregatorClient::get_inclusion_proof` use attempt-based polling (`with_polling(interval, attempts)`), which is unchanged. `HttpAggregatorClient::wait_for_inclusion_proof(&state_id, &WaitOptions::new(total))` is a separate, time-bounded wait that by default asks the aggregator to hold each request while the state is pending (`waitMs`). This reduces the number of requests and returns the proof soon after certification.
+`client::mint` and `client::transfer` wait for the proof through `HttpAggregatorClient::get_inclusion_proof`, which by default asks the aggregator to hold each request while the state is pending (`waitMs`). This reduces the number of requests and returns the proof soon after certification. With long polling on, `with_polling(interval, attempts)` sets the polling interval and a total time budget of `interval * attempts`. `HttpAggregatorClient::with_long_poll(false)` restores the attempt-based loop, which sends no `waitMs`. The same wait is available directly as `wait_for_inclusion_proof(&state_id, &WaitOptions::new(total))`, with these options:
 
 - The wait never exceeds `total`. Each request asks for at most the preferred wait (`with_preferred_wait`, default 20 s) and leaves a response margin (`with_margin`, default 2 s) within the remaining time and the per-call limit (`with_max_request_timeout`, default 30 s).
-- `with_long_poll(false)` sends no `waitMs` and polls at the interval (`with_poll_interval`, default the client's interval).
+- `WaitOptions::with_long_poll(false)` sends no `waitMs` and polls at the interval (`with_poll_interval`, default the client's interval).
 - An answer without the `waitedMs` echo to a request that asked for a wait means the server does not support long polling; the rest of that call polls at the interval. Nothing is remembered across calls.
 - The echo is unauthenticated and never extends the deadline. The returned proof is unverified, as with `get_inclusion_proof`.
 - `with_unknown_grace` overrides the client's `unknown` grace for this wait. `with_cancel` is checked before every call and during pauses; a call already in flight ends at its own timeout, because a blocking transport cannot be interrupted.
