@@ -1,6 +1,6 @@
 //! Shared state and cumulative limits for recursive token verification.
 
-use crate::api::bft::{RootTrustBase, UcInterner};
+use crate::api::bft::{TrustBaseHistory, UcInterner};
 use crate::cbor::DecodeLimits;
 use crate::transaction::Token;
 
@@ -46,7 +46,7 @@ pub struct VerificationPolicy {
 
 /// Mutable context shared by all recursively invoked verifiers.
 pub struct VerificationContext<'a> {
-    trust_base: &'a RootTrustBase,
+    history: &'a TrustBaseHistory,
     registry: &'a MintJustificationRegistry,
     policy: VerificationPolicy,
     seals: SealSession<'a>,
@@ -72,16 +72,16 @@ impl<'a> VerificationContext<'a> {
     /// A context whose seal/certificate memos hold at most `capacity` entries
     /// (`0` disables reuse: the slow reference behavior).
     pub(crate) fn with_memo_capacity(
-        trust_base: &'a RootTrustBase,
+        history: &'a TrustBaseHistory,
         registry: &'a MintJustificationRegistry,
         policy: VerificationPolicy,
         capacity: usize,
     ) -> Self {
         Self {
-            trust_base,
+            history,
             registry,
             policy,
-            seals: SealSession::with_capacity(trust_base, capacity),
+            seals: SealSession::with_capacity(history, capacity),
             interner: UcInterner::with_capacity(capacity),
             embedded_token_depth: 0,
             total_embedded_token_bytes: 0,
@@ -97,7 +97,7 @@ impl<'a> VerificationContext<'a> {
         policy: VerificationPolicy,
     ) -> Self {
         Self {
-            trust_base: seals.trust_base(),
+            history: seals.history(),
             registry,
             policy,
             seals,
@@ -113,9 +113,9 @@ impl<'a> VerificationContext<'a> {
         self.seals
     }
 
-    /// Root of trust used by the entire recursive verification chain.
-    pub fn trust_base(&self) -> &RootTrustBase {
-        self.trust_base
+    /// Trust base history used by the entire recursive verification chain.
+    pub fn history(&self) -> &'a TrustBaseHistory {
+        self.history
     }
 
     /// The seal authentication session shared by the whole recursive

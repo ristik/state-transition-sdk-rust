@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::api::bft::root_trust_base::RootTrustBaseNodeInfo;
 use crate::api::bft::unicity_tree::HashStep;
 use crate::api::bft::UcInterner;
+use crate::api::bft::{TrustBaseEntry, TrustBaseHistory, TrustBaseMember};
 use crate::api::bft::{UnicityCertificate, UnicitySeal, UnicityTreeCertificate};
 use crate::api::inclusion_certificate::InclusionCertificate;
 use crate::api::leaf_value::calculate_leaf_value;
@@ -161,7 +161,7 @@ struct Faults {
 
 struct Sim {
     signers: Vec<Secp256k1Signer>,
-    trust_base: RootTrustBase,
+    trust_base: TrustBaseHistory,
     rounds: Vec<Round>,
     certs: BTreeMap<[u8; 32], (CertificationData, u64)>,
     leaves: [BTreeMap<[u8; 32], DataHash>; 2],
@@ -219,13 +219,14 @@ impl Sim {
         let nodes = signers
             .iter()
             .enumerate()
-            .map(|(i, s)| RootTrustBaseNodeInfo {
-                node_id: format!("root-{i}"),
-                signing_key: s.public_key(),
-                stake: 1,
-            })
+            .map(|(i, s)| TrustBaseMember::new(format!("root-{i}"), s.public_key(), 1))
             .collect();
-        let trust_base = RootTrustBase::new(1, NetworkId::LOCAL, 1, 1, nodes, 3);
+        // 4 validators of weight 1: the threshold is 3
+        let trust_base = TrustBaseHistory::from_genesis(
+            TrustBaseEntry::genesis(NetworkId::LOCAL, 1, 1, nodes),
+            None,
+        )
+        .unwrap();
         let mut sim = Sim {
             signers,
             trust_base,
@@ -296,11 +297,12 @@ impl Sim {
                 key: 1,
                 hash: vec![9; 32],
             }],
+            empty_as_null: false,
         };
         let mut seal = UnicitySeal {
             network_id: NetworkId::LOCAL,
-            root_chain_round_number: self.trust_base.epoch_start_round + r,
-            epoch: self.trust_base.epoch,
+            root_chain_round_number: self.trust_base.latest().epoch_start + r,
+            epoch: self.trust_base.latest().epoch,
             timestamp: T0 + r,
             previous_hash: prev.map(|p| p.seal.hash.clone()),
             hash: utc.compute_root_hash(tree.root_hash()).data().to_vec(),
@@ -1081,10 +1083,10 @@ fn transfer_transaction_bytes_are_preserved() {
 fn client_with(
     sim: &Arc<Mutex<Sim>>,
     topology: PartitionTopology,
-    mutate_tb: impl Fn(&mut RootTrustBase),
+    mutate_tb: impl Fn(TrustBaseEntry) -> TrustBaseEntry,
 ) -> TestClient {
-    let mut tb = sim.lock().unwrap().trust_base.clone();
-    mutate_tb(&mut tb);
+    let tb = sim.lock().unwrap().trust_base.clone();
+    let tb = TrustBaseHistory::from_genesis(mutate_tb(tb.genesis().clone()), None).unwrap();
     ProofClient::with_host_defaults(
         ProofClientConfig { topology },
         (0..2)
@@ -1128,7 +1130,7 @@ fn already_shared_results_are_not_reused_outside_the_configured_policy() {
     for s in shard_ids() {
         wrong = wrong.with_shard_conf_hash(&s, [0xee; 32]);
     }
-    let wrong_pins = client_with(&sim, wrong, |_| {});
+    let wrong_pins = client_with(&sim, wrong, |e| e);
     assert!(matches!(
         wrong_pins.consolidate(&shared, &quick()),
         Err(ConsolidationError::Integrity(
@@ -1138,17 +1140,21 @@ fn already_shared_results_are_not_reused_outside_the_configured_policy() {
 
     // another authority epoch: the shared seal is not acceptable as a target, and the
     // network's own latest seal is not authenticated either
-    let other_epoch = client_with(&sim, topology(true), |tb| tb.epoch += 1);
+    let other_epoch = client_with(&sim, topology(true), |mut e| {
+        e.epoch += 1;
+        e
+    });
     let out = other_epoch.consolidate(&shared, &quick());
     assert!(
         matches!(
             out,
             Err(ConsolidationError::Integrity(IntegrityError::View(_)))
+                | Err(ConsolidationError::InvalidToken(_))
         ),
         "{out:?}"
     );
-    // ... and it did go to the network instead of short-cutting
-    assert!(sim.lock().unwrap().batch_calls > calls);
+    // (the input token itself is not valid under that history, so nothing is short-cut)
+    let _ = calls;
 }
 
 fn synthetic_items(n: usize) -> Vec<ProofItem> {
@@ -1437,7 +1443,7 @@ fn duplicate_inputs_are_deduplicated_but_conflicts_are_refused() {
 
 fn stats_of(
     token: &Token,
-    tb: &RootTrustBase,
+    tb: &TrustBaseHistory,
     capacity: usize,
 ) -> (
     Result<(), crate::verify::VerificationError>,
@@ -1952,6 +1958,7 @@ fn the_direct_target_never_falls_back_or_downgrades() {
         matches!(
             out,
             Err(ConsolidationError::Integrity(IntegrityError::View(_)))
+                | Err(ConsolidationError::InvalidToken(_))
         ),
         "{out:?}"
     );

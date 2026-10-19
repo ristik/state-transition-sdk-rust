@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use unicity_token::api::bft::RootTrustBase;
+use unicity_token::api::bft::TrustBaseHistory;
 use unicity_token::cbor::encode_text_string;
 use unicity_token::client::{self, HttpAggregatorClient};
 use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
@@ -22,7 +22,7 @@ const DEFAULT_GATEWAY: &str = "https://gateway.testnet2.unicity.network/";
 const DEFAULT_TRUSTBASE: &str = "bft-trustbase.testnet2.json";
 
 /// Build an aggregator client and its trust base from `e2e/.env`.
-fn load() -> (HttpAggregatorClient, RootTrustBase) {
+fn load() -> (HttpAggregatorClient, TrustBaseHistory) {
     // Load e2e/.env (values already in the process environment win).
     dotenvy::from_path("e2e/.env").ok();
 
@@ -35,9 +35,10 @@ fn load() -> (HttpAggregatorClient, RootTrustBase) {
         format!("e2e/{trustbase}")
     };
 
-    let trust_base = RootTrustBase::from_json(
-        &std::fs::read_to_string(&trustbase_path)
+    let trust_base = TrustBaseHistory::from_file(
+        &std::fs::read(&trustbase_path)
             .unwrap_or_else(|e| panic!("read trust base {trustbase_path}: {e}")),
+        None,
     )
     .expect("parse trust base");
 
@@ -62,7 +63,7 @@ fn main() {
     let token = client::mint(
         &aggregator,
         &trust_base,
-        trust_base.network_id,
+        trust_base.network_id(),
         &owner_predicate,
         TokenType::random().expect("token type"),
         TokenSalt::random().expect("salt"),

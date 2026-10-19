@@ -37,7 +37,7 @@ pub use consolidate::{SystemClock, ThreadedExecutor};
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::api::bft::RootTrustBase;
+use crate::api::bft::TrustBaseHistory;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::{CertificationData, NetworkId, NonInclusionProof, StateId};
 use crate::crypto::signer::Signer;
@@ -168,7 +168,7 @@ pub fn certification_data_for(
 #[allow(clippy::too_many_arguments)]
 pub fn mint<A: AggregatorClient>(
     aggregator: &A,
-    trust_base: &RootTrustBase,
+    history: &TrustBaseHistory,
     network: NetworkId,
     recipient: &impl Predicate,
     token_type: TokenType,
@@ -177,10 +177,7 @@ pub fn mint<A: AggregatorClient>(
     justification: Option<Vec<u8>>,
     expires_at: Option<u64>,
 ) -> Result<Token, ClientError<A::Error>> {
-    trust_base
-        .validate()
-        .map_err(VerificationError::InvalidTrustBase)?;
-    if network != trust_base.network_id {
+    if network != history.network_id() {
         return Err(VerificationError::NetworkMismatch.into());
     }
     let transaction = MintTransaction::create(
@@ -208,7 +205,7 @@ pub fn mint<A: AggregatorClient>(
         CertifiedMintTransaction::new(transaction, proof),
         Vec::new(),
     );
-    token.verify(trust_base)?;
+    token.verify(history)?;
     Ok(token)
 }
 
@@ -217,7 +214,7 @@ pub fn mint<A: AggregatorClient>(
 #[allow(clippy::too_many_arguments)]
 pub fn transfer<A: AggregatorClient>(
     aggregator: &A,
-    trust_base: &RootTrustBase,
+    history: &TrustBaseHistory,
     token: &Token,
     recipient: &impl Predicate,
     signer: &impl Signer,
@@ -227,7 +224,7 @@ pub fn transfer<A: AggregatorClient>(
 ) -> Result<Token, ClientError<A::Error>> {
     // Reject an untrusted or stale input before causing any aggregator side
     // effect. The successor is verified again below as defense in depth.
-    token.verify(trust_base)?;
+    token.verify(history)?;
     let (source_state_hash, lock_script) = token.latest_state();
     let transaction = TransferTransaction::new(
         source_state_hash,
@@ -250,7 +247,7 @@ pub fn transfer<A: AggregatorClient>(
     let mut transactions = token.transactions().to_vec();
     transactions.push(CertifiedTransferTransaction::new(transaction, proof));
     let next = Token::new(token.genesis().clone(), transactions);
-    next.verify(trust_base)?;
+    next.verify(history)?;
     Ok(next)
 }
 
@@ -301,23 +298,25 @@ mod tests {
             ))
             .unwrap(),
         );
-        let trust_base = RootTrustBase::new(
-            1,
-            NetworkId::MAINNET,
-            0,
-            0,
-            alloc::vec![crate::api::bft::root_trust_base::RootTrustBaseNodeInfo {
-                node_id: "NODE".into(),
-                signing_key: recipient.public_key().clone(),
-                stake: 1,
-            }],
-            1,
-        );
+        let history = TrustBaseHistory::from_genesis(
+            crate::api::bft::TrustBaseEntry::genesis(
+                NetworkId::MAINNET,
+                1,
+                0,
+                alloc::vec![crate::api::bft::TrustBaseMember::new(
+                    "NODE",
+                    recipient.public_key().clone(),
+                    1,
+                )],
+            ),
+            None,
+        )
+        .unwrap();
 
         // Fetching the proof fails in the mock, so the flow stops there.
         let err = mint(
             &agg,
-            &trust_base,
+            &history,
             NetworkId::MAINNET,
             &recipient,
             TokenType::new([0u8; 32]),

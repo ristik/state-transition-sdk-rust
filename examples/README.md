@@ -27,7 +27,7 @@ your key):
 ```
 UNICITY_GATEWAY=https://gateway.testnet2.unicity.network/
 UNICITY_API_KEY=sk_…
-UNICITY_TRUSTBASE=bft-trustbase.testnet2.json
+UNICITY_TRUSTBASE=bft-trustbase.testnet2.json  # a V2 genesis JSON, a genesis entry or a release bundle
 ```
 
 Values already present in the process environment take precedence. The examples

@@ -86,6 +86,7 @@ pub fn state_id(b: u8) -> StateId {
     StateId::from_cbor(Decoder::new(&cbor)).unwrap()
 }
 
+#[allow(unused_imports)]
 pub use self::mock::*;
 
 mod mock {

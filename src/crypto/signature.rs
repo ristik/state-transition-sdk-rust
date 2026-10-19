@@ -52,6 +52,43 @@ impl core::fmt::Debug for PublicKey {
     }
 }
 
+/// Why a native (B1) unicity-seal signature did not verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealSignatureError {
+    /// Not 64 bytes, or 65 bytes whose recovery byte is not 0 or 1.
+    Format,
+    /// `r` or `s` outside `1..n`, or `s` above `n/2`.
+    Range,
+    /// Well-formed, but not a valid ECDSA signature of the digest by the key.
+    Invalid,
+}
+
+/// Verify a unicity-seal signature by the native (B1) rule: 64 bytes `r||s`, or 65 bytes whose
+/// last byte is 0 or 1 and is otherwise ignored; `1 <= r < n`, `1 <= s <= n/2`; plain ECDSA of
+/// the 32-byte `digest` against the listed `key` (no key recovery, so the recovery byte is not
+/// a signature field). This is the rule of the bridge verifier and of bft-core's `b1ref`; the
+/// trust base entries themselves use [`Signature::verify`] (65 bytes, recovery-bound).
+pub fn verify_seal_signature(
+    wire: &[u8],
+    digest: &[u8],
+    key: &PublicKey,
+) -> Result<(), SealSignatureError> {
+    use k256::ecdsa::signature::hazmat::PrehashVerifier;
+    let compact = match wire.len() {
+        64 => wire,
+        65 if wire[64] <= 1 => &wire[..64],
+        _ => return Err(SealSignatureError::Format),
+    };
+    let sig = K256Signature::from_slice(compact).map_err(|_| SealSignatureError::Range)?;
+    if sig.normalize_s().is_some() {
+        return Err(SealSignatureError::Range);
+    }
+    let vk =
+        VerifyingKey::from_sec1_bytes(key.as_bytes()).map_err(|_| SealSignatureError::Invalid)?;
+    vk.verify_prehash(digest, &sig)
+        .map_err(|_| SealSignatureError::Invalid)
+}
+
 /// A recoverable secp256k1 signature.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Signature {

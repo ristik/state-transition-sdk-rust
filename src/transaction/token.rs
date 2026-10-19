@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use super::certified::{CertifiedMintTransaction, CertifiedTransferTransaction};
 use super::ids::{TokenId, TokenType};
-use crate::api::bft::{DecodeStats, RootTrustBase, UcInterner};
+use crate::api::bft::{DecodeStats, TrustBaseHistory, UcInterner};
 use crate::cbor::{encode_array, encode_uint, DecodeLimits, Decoder};
 use crate::error::Error;
 use crate::verify::VerificationError;
@@ -150,8 +150,8 @@ impl Token {
     /// trust. Application data remains opaque; payment consumers must use
     /// [`verify_payment_token`](crate::payment::verify_payment_token) or an
     /// explicit [`VerificationPolicy`](crate::verify::VerificationPolicy).
-    pub fn verify(&self, trust_base: &RootTrustBase) -> Result<(), VerificationError> {
-        crate::verify::verify_token(self, trust_base)
+    pub fn verify(&self, history: &TrustBaseHistory) -> Result<(), VerificationError> {
+        crate::verify::verify_token(self, history)
     }
 
     /// Like [`Token::verify`], but dispatches any mint justification through
@@ -159,9 +159,9 @@ impl Token {
     /// [`verify_token_with`](crate::verify::verify_token_with).
     pub fn verify_with(
         &self,
-        trust_base: &RootTrustBase,
+        history: &TrustBaseHistory,
         registry: &crate::verify::MintJustificationRegistry,
     ) -> Result<(), VerificationError> {
-        crate::verify::verify_token_with(self, trust_base, registry)
+        crate::verify::verify_token_with(self, history, registry)
     }
 }

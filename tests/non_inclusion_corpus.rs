@@ -9,11 +9,13 @@
 #![cfg(feature = "std")]
 
 use std::fs;
+mod trust_support;
+
 use std::path::PathBuf;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use unicity_token::api::bft::{RootTrustBase, ShardId};
+use unicity_token::api::bft::{ShardId, TrustBaseHistory};
 use unicity_token::api::{NonInclusionCertificate, NonInclusionProof, StateId};
 use unicity_token::cbor::{encode_array, encode_byte_string, encode_uint, Decoder};
 use unicity_token::verify::{
@@ -90,21 +92,19 @@ enum Verdict {
     Rejected(&'static str),
 }
 
-fn trust_base(ctx: &Value) -> RootTrustBase {
-    RootTrustBase::from_json(
+fn trust_base(ctx: &Value) -> TrustBaseHistory {
+    let end = num(&ctx["nextEpochStart"]);
+    trust_support::history_from_corpus_json(
         std::str::from_utf8(&read(ctx["trustBaseJson"].as_str().unwrap())).unwrap(),
+        (end > 0).then_some(end),
     )
-    .unwrap()
 }
 
 fn context_of(ctx: &Value) -> NonInclusionContext {
     // the corpus context always names the shard the verifier serves ("" = the unsharded partition)
     let mut context =
         NonInclusionContext::new().with_shard(shard_from_bits(ctx["shard"].as_str().unwrap()));
-    let end = num(&ctx["nextEpochStart"]);
-    if end > 0 {
-        context = context.with_authority_end_round(end);
-    }
+    // (the end of the authority is derived from the history, see `trust_base`)
     let pin = ctx["shardConfHash"].as_str().unwrap();
     if !pin.is_empty() {
         context = context.with_shard_conf_hash(hex::decode(pin).unwrap().try_into().unwrap());
@@ -117,10 +117,10 @@ fn class_of(error: &VerificationError, name: &str) -> &'static str {
         VerificationError::NonInclusionCertificateInvalid | VerificationError::ShardMismatch => {
             "certificate_invalid"
         }
-        VerificationError::InvalidTrustBase(_)
-        | VerificationError::UnsupportedAuthority
+        VerificationError::UnknownTrustEpoch { .. }
+        | VerificationError::EpochBeforeGenesis
+        | VerificationError::SealSignerInvalid
         | VerificationError::SealNetworkMismatch
-        | VerificationError::SealEpochMismatch
         | VerificationError::SealBeforeEpochStart
         | VerificationError::SealAfterAuthorityEnd
         | VerificationError::SealMalformed

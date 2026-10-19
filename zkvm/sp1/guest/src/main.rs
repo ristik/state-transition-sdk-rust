@@ -1,3 +1,6 @@
+//! **NOT PORTED to SDK 4.0.0** (see `zkvm/sp1/README.md`): this guest targets the removed
+//! `RootTrustBase` API and the old 65-byte recover-and-compare seal rule described below.
+//!
 //! SP1 guest: verifies, from scratch and with a local seal session, either
 //!
 //! * mode 0 - a complete token (UC quorum signatures, inclusion paths, unlock-script

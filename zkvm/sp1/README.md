@@ -1,5 +1,15 @@
 # SP1 zkVM: precompile-accelerated verification
 
+> **Not ported to 4.0.0.** The guests, the host and the `EVIDENCE-*` files here were written
+> and measured against SDK 3.x: they import the removed `RootTrustBase` /
+> `RootTrustBaseNodeInfo`, call `SealSession::authority_identity()` without a seal, and the text
+> below (and the instruction counts) describe the old 65-byte recover-and-compare seal rule.
+> Version 4 judges a seal by the `TrustBaseHistory` entry of its epoch with the native rule
+> (every signature checked, 64 or 65 bytes, plain ECDSA against the listed key, weighted
+> quorum). Porting means giving the guest a history (or the one entry that judges the seal,
+> committing its identity) and re-measuring. It is not built by CI and was not built or run
+> for 4.0.0. Use the pinned 3.x revision to reproduce the numbers.
+
 This directory is **outside the default build** (each crate carries its own empty
 `[workspace]`); nothing here is compiled by `cargo build` / `cargo test` of the SDK.
 

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use num_bigint::BigUint;
 
-use unicity_token::api::bft::RootTrustBase;
+use unicity_token::api::bft::TrustBaseHistory;
 use unicity_token::api::StateId;
 use unicity_token::client::{self, AggregatorClient, HttpAggregatorClient};
 use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
@@ -43,7 +43,7 @@ const DEFAULT_TRUSTBASE: &str = "bft-trustbase.testnet2.json";
 const BURN_STATE_MASK: [u8; 32] = [0x42; 32];
 
 /// Build an aggregator client and its trust base from `e2e/.env`.
-fn load() -> (HttpAggregatorClient, RootTrustBase) {
+fn load() -> (HttpAggregatorClient, TrustBaseHistory) {
     dotenvy::from_path("e2e/.env").ok();
 
     let gateway = std::env::var("UNICITY_GATEWAY").unwrap_or_else(|_| DEFAULT_GATEWAY.to_string());
@@ -55,9 +55,10 @@ fn load() -> (HttpAggregatorClient, RootTrustBase) {
         format!("e2e/{trustbase}")
     };
 
-    let trust_base = RootTrustBase::from_json(
-        &std::fs::read_to_string(&trustbase_path)
+    let trust_base = TrustBaseHistory::from_file(
+        &std::fs::read(&trustbase_path)
             .unwrap_or_else(|e| panic!("read trust base {trustbase_path}: {e}")),
+        None,
     )
     .expect("parse trust base");
 
@@ -87,7 +88,7 @@ fn authorize_issuance(
 /// mint justification.
 fn mint_split_output(
     aggregator: &HttpAggregatorClient,
-    trust_base: &RootTrustBase,
+    trust_base: &TrustBaseHistory,
     registry: &MintJustificationRegistry,
     burnt: &Token,
     out: &SplitToken,
@@ -171,7 +172,7 @@ fn main() {
     let source = client::mint(
         &aggregator,
         &trust_base,
-        trust_base.network_id,
+        trust_base.network_id(),
         &SignaturePredicate::new(alice.public_key()),
         coin_type.clone(),
         TokenSalt::random().expect("salt"),

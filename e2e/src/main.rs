@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use unicity_token::api::bft::RootTrustBase;
+use unicity_token::api::bft::TrustBaseHistory;
 use unicity_token::cbor::encode_text_string;
 use unicity_token::client::{self, HttpAggregatorClient};
 use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bob_lock = SignaturePredicate::new(bob.public_key());
 
     println!("Gateway: {}", config.gateway);
-    println!("Network ID: {}", trust_base.network_id.id());
+    println!("Network ID: {}", trust_base.network_id().id());
     println!(
         "Alice public key: {}",
         hex::encode(alice.public_key().as_bytes())
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let minted = client::mint(
         &gateway,
         &trust_base,
-        trust_base.network_id,
+        trust_base.network_id(),
         &alice_lock,
         TokenType::random()?,
         TokenSalt::random()?,
@@ -128,9 +128,9 @@ impl Config {
     }
 }
 
-fn load_trust_base(path: &Path) -> Result<RootTrustBase, Box<dyn Error>> {
-    let json = fs::read_to_string(path)?;
-    Ok(RootTrustBase::from_json(&json)?)
+fn load_trust_base(path: &Path) -> Result<TrustBaseHistory, Box<dyn Error>> {
+    let contents = fs::read(path)?;
+    Ok(TrustBaseHistory::from_file(&contents, None)?)
 }
 
 fn save_token(path: &Path, token: &Token) -> Result<(), Box<dyn Error>> {
@@ -138,7 +138,7 @@ fn save_token(path: &Path, token: &Token) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn load_and_verify(path: &Path, trust_base: &RootTrustBase) -> Result<Token, Box<dyn Error>> {
+fn load_and_verify(path: &Path, trust_base: &TrustBaseHistory) -> Result<Token, Box<dyn Error>> {
     let bytes = fs::read(path)?;
     let token = Token::from_cbor(&bytes)?;
     token.verify(trust_base)?;

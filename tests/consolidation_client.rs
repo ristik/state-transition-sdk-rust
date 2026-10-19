@@ -9,6 +9,8 @@
 #![cfg(feature = "http")]
 #![allow(clippy::result_large_err)]
 
+mod trust_support;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -17,9 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
-use unicity_token::api::bft::{RootTrustBase, ShardId};
-use unicity_token::api::{InclusionProofResponse, NetworkId, StateId};
+use unicity_token::api::bft::{ShardId, TrustBaseHistory};
+use unicity_token::api::{InclusionProofResponse, StateId};
 use unicity_token::cbor::Decoder;
 use unicity_token::client::{
     BundleOutcome, CancelToken, ConsolidateOptions, ConsolidationError, HttpAggregatorClient,
@@ -27,7 +28,6 @@ use unicity_token::client::{
     UnavailableReason,
 };
 use unicity_token::consolidation::{PartitionTopology, PartitionViewError};
-use unicity_token::crypto::signature::PublicKey;
 use unicity_token::verify::VerificationError;
 
 fn corpus(path: &str) -> String {
@@ -53,35 +53,8 @@ fn shard(bits: &str) -> ShardId {
     id
 }
 
-fn trust_base(path: &str) -> RootTrustBase {
-    let bytes = corpus_bytes(path);
-    let items = Decoder::new(&bytes)
-        .expect_tag(39000)
-        .unwrap()
-        .array(Some(10))
-        .unwrap();
-    let nodes = items[4]
-        .array(None)
-        .unwrap()
-        .into_iter()
-        .map(|n| {
-            let f = n.array(Some(3)).unwrap();
-            RootTrustBaseNodeInfo {
-                node_id: f[0].text().unwrap().into(),
-                signing_key: PublicKey::from_bytes(f[1].bytes_value().unwrap()).unwrap(),
-                stake: f[2].uint().unwrap(),
-            }
-        })
-        .collect();
-    RootTrustBase::try_new(
-        items[0].uint().unwrap(),
-        NetworkId::new(items[1].uint().unwrap() as u16).unwrap(),
-        items[2].uint().unwrap(),
-        items[3].uint().unwrap(),
-        nodes,
-        items[5].uint().unwrap(),
-    )
-    .unwrap()
+fn trust_base(path: &str) -> TrustBaseHistory {
+    trust_support::history_from_corpus_trust_base(&corpus_bytes(path))
 }
 
 // ---------------------------------------------------------------- mock shard
@@ -198,7 +171,7 @@ struct Case {
     topology: PartitionTopology,
     #[allow(dead_code)]
     partition: u32,
-    trust_base: RootTrustBase,
+    trust_base: TrustBaseHistory,
     items: Vec<ProofItem>,
     master_shard: String,
     master_reply: Value,
@@ -679,7 +652,7 @@ fn integrity_failures_are_never_unavailability() {
     assert!(matches!(
         consolidate_with(m, peer.clone()),
         Err(ConsolidationError::Integrity(IntegrityError::View(
-            PartitionViewError::Seal(VerificationError::QuorumNotMet)
+            PartitionViewError::Seal(VerificationError::SealSignerInvalid)
         )))
     ));
 

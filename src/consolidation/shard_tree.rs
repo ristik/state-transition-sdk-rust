@@ -165,6 +165,7 @@ impl ShardTree {
         Ok(ShardTreeCertificate {
             shard: shard.clone(),
             sibling_hash_list,
+            empty_as_null: false,
         })
     }
 }

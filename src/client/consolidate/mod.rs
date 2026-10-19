@@ -55,7 +55,7 @@ use super::batch::{
     BatchRequest, InclusionProofBatch, RequestOptions, StateRoot, WaitRequest,
     DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS,
 };
-use crate::api::bft::{RootTrustBase, ShardId};
+use crate::api::bft::{ShardId, TrustBaseHistory};
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::{StateId, AGGREGATION_PARTITION_ID};
 use crate::consolidation::{
@@ -233,7 +233,7 @@ struct Group {
 pub struct ProofClient<C, K, X> {
     config: ProofClientConfig,
     router: ShardRouter,
-    trust_base: RootTrustBase,
+    history: TrustBaseHistory,
     registry: MintJustificationRegistry,
     policy: VerificationPolicy,
     endpoints: Vec<(ShardId, C)>,
@@ -260,13 +260,13 @@ impl<C: BatchAggregatorClient + Sync> ProofClient<C, SystemClock, ThreadedExecut
     pub fn with_host_defaults(
         config: ProofClientConfig,
         endpoints: Vec<(ShardId, C)>,
-        trust_base: RootTrustBase,
+        history: TrustBaseHistory,
         max_parallel: usize,
     ) -> Result<Self, ConsolidationError> {
         Self::new(
             config,
             endpoints,
-            trust_base,
+            history,
             SystemClock::new(),
             ThreadedExecutor::new(max_parallel),
         )
@@ -280,14 +280,11 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
     pub fn new(
         config: ProofClientConfig,
         endpoints: Vec<(ShardId, C)>,
-        trust_base: RootTrustBase,
+        history: TrustBaseHistory,
         clock: K,
         executor: X,
     ) -> Result<Self, ConsolidationError> {
         let cfg = |m: &str| ConsolidationError::Configuration(m.to_string());
-        trust_base
-            .validate()
-            .map_err(|_| cfg("invalid trust base"))?;
         let router = ShardRouter::new(&config.topology)
             .map_err(|e| ConsolidationError::Configuration(e.to_string()))?;
         for (i, (shard, _)) in endpoints.iter().enumerate() {
@@ -306,7 +303,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         Ok(Self {
             config,
             router,
-            trust_base,
+            history,
             registry: MintJustificationRegistry::new(),
             policy: VerificationPolicy::default(),
             endpoints,
@@ -359,7 +356,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         // not authenticated again by the consolidation steps
         let (input_check, mut session) = verify_token_in_session(
             token,
-            SealSession::new(&self.trust_base),
+            SealSession::new(&self.history),
             &self.registry,
             self.policy,
         );
@@ -394,7 +391,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         let rebuilt = rebuild_token(token, bundle.proofs)
             .map_err(|m| ConsolidationError::Configuration(m.to_string()))?;
         let (check, stats) =
-            verify_token_with_seal_stats(&rebuilt, &self.trust_base, &self.registry, self.policy);
+            verify_token_with_seal_stats(&rebuilt, &self.history, &self.registry, self.policy);
         check.map_err(|e| ConsolidationError::Integrity(IntegrityError::Verification(e)))?;
         // never publish success for an attempt that is already over
         budget.check().map_err(stop_error)?;
@@ -419,7 +416,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             cancel: &options.cancel,
             abort: CancelToken::new(),
         };
-        let mut session = SealSession::new(&self.trust_base);
+        let mut session = SealSession::new(&self.history);
         match self.run(items, options.master.as_ref(), &budget, &mut session, false) {
             Ok(bundle) => Ok(BundleOutcome::Consolidated(bundle)),
             Err(Stop::Unavailable(reason, retryable)) => {
@@ -701,8 +698,8 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         };
         if before == 1 {
             // Already under one seal. Reuse is only sound when that shared seal is also
-            // acceptable *as a consolidation target*: the fixed authority's network, exact
-            // epoch and start, and the configured policy. Otherwise fall through to fetch
+            // acceptable *as a consolidation target*: judged by the entry of its own epoch
+            // (network, epoch window, quorum), and the configured policy. Otherwise fall through to fetch
             // a target that is.
             let policy = view_policy(Some(&self.config.topology));
             let seal = &items[0].proof.unicity_certificate.unicity_seal;

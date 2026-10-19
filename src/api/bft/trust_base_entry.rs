@@ -103,6 +103,17 @@ pub struct TrustBaseMember {
     pub weight: u64,
 }
 
+impl TrustBaseMember {
+    /// A member.
+    pub fn new(node_id: impl Into<String>, signing_key: PublicKey, weight: u64) -> Self {
+        TrustBaseMember {
+            node_id: node_id.into(),
+            signing_key,
+            weight,
+        }
+    }
+}
+
 /// An optional 32-byte hash in the entry. The canonical absent form is `None`, CBOR `null`;
 /// a present hash is exactly 32 bytes. The empty byte string is not a wire form: the decoder
 /// refuses it, and an in-memory `Some(empty)` is treated as `None` (it encodes as `null`),
@@ -160,6 +171,30 @@ impl TrustBaseEntry {
             previous_entry_id,
             signatures: None,
         }
+    }
+
+    /// An unsigned genesis entry (zero previous identity, absent hashes) whose threshold is
+    /// derived from the member weights. The members are sorted by node id. For tools, tests and
+    /// fixtures; a deployment's genesis comes from its pinned file.
+    pub fn genesis(
+        network_id: NetworkId,
+        epoch: u64,
+        epoch_start: u64,
+        mut members: Vec<TrustBaseMember>,
+    ) -> Self {
+        members.sort_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
+        let total = members.iter().fold(0u64, |a, m| a.saturating_add(m.weight));
+        let threshold = Self::threshold_for(total).unwrap_or(u64::MAX);
+        Self::new(
+            network_id,
+            epoch,
+            epoch_start,
+            members,
+            threshold,
+            None,
+            None,
+            [0; ID_LEN],
+        )
     }
 
     /// The threshold of a total weight: `floor(2W/3)+1`. `None` on overflow.
@@ -418,8 +453,15 @@ impl TrustBaseEntry {
     /// lengths, and genesis (zero predecessor, null signatures) versus non-genesis
     /// (non-empty signature map).
     pub fn validate(&self) -> Result<(), TrustBaseError> {
+        self.validate_inner(false)
+    }
+
+    /// [`validate`](Self::validate), optionally admitting epoch 0. A real network's epochs
+    /// start at 1; epoch 0 appears only in test environments and conformance fixtures, which
+    /// can only enter a history through [`TrustBaseHistory::from_trusted_chain`].
+    pub(crate) fn validate_inner(&self, allow_epoch_zero: bool) -> Result<(), TrustBaseError> {
         let bad = TrustBaseError::Invalid;
-        if self.epoch == 0 {
+        if self.epoch == 0 && !allow_epoch_zero {
             return Err(bad("epoch is zero"));
         }
         let n = self.members.len();

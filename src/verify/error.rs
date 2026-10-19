@@ -3,8 +3,6 @@
 use alloc::boxed::Box;
 use core::fmt;
 
-use crate::Error;
-
 /// Why a token (or one of its transactions) failed verification.
 ///
 /// Distinct variants make it possible to test that each rule rejects the
@@ -12,8 +10,6 @@ use crate::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VerificationError {
-    /// The supplied root trust base is structurally unsafe.
-    InvalidTrustBase(Error),
     /// The genesis network id does not match the trust base.
     NetworkMismatch,
     /// The genesis lock script is not the deterministic minter key for the token id.
@@ -80,12 +76,19 @@ pub enum VerificationError {
     ShardMismatch,
     /// The unicity seal's network id does not match the trust base.
     SealNetworkMismatch,
-    /// The authority uses a configuration this verifier can not judge (stake
-    /// weights other than one); not a statement about any signature.
-    UnsupportedAuthority,
-    /// The unicity seal's epoch is not the epoch of the authority's trust base.
-    SealEpochMismatch,
-    /// The unicity seal predates the start of the trust base's epoch.
+    /// The history holds no trust base entry for the seal's epoch because it is newer than
+    /// the latest held one. Retryable: fetch the missing entries, append them to the history
+    /// (`TrustBaseHistory::append`, verified from the latest held entry) and verify again.
+    UnknownTrustEpoch {
+        /// The epoch the seal names.
+        epoch: u64,
+    },
+    /// The seal's epoch is older than the first entry of the history.
+    EpochBeforeGenesis,
+    /// A signature on the seal is from an unknown signer, malformed or not valid. The native
+    /// rule is strict: one such signature fails the seal even when the others reach the quorum.
+    SealSignerInvalid,
+    /// The unicity seal predates the start of its epoch.
     SealBeforeEpochStart,
     /// The unicity seal is structurally unusable (no signatures, zero round, ...).
     SealMalformed,
@@ -105,7 +108,7 @@ pub enum VerificationError {
     SealAfterAuthorityEnd,
     /// The recomputed unicity-tree root does not match the signed seal hash.
     SealRootMismatch,
-    /// Fewer than `quorumThreshold` distinct root-node signatures were valid.
+    /// The signed weight did not reach the epoch's quorum threshold.
     QuorumNotMet,
     /// The unlock script does not satisfy the lock script.
     NotAuthenticated,
@@ -120,10 +123,26 @@ pub enum VerificationError {
     },
 }
 
+impl VerificationError {
+    /// The epoch of a seal the trust base history does not hold yet, if that is why
+    /// verification failed (also when nested in a genesis, transfer or burn failure). This
+    /// failure is retryable: fetch the missing entries, append them to the history and verify
+    /// again.
+    pub fn unknown_trust_epoch(&self) -> Option<u64> {
+        match self {
+            VerificationError::UnknownTrustEpoch { epoch } => Some(*epoch),
+            VerificationError::Genesis(e) | VerificationError::BurnTokenVerificationFailed(e) => {
+                e.unknown_trust_epoch()
+            }
+            VerificationError::Transfer { source, .. } => source.unknown_trust_epoch(),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for VerificationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VerificationError::InvalidTrustBase(e) => write!(f, "{e}"),
             VerificationError::NetworkMismatch => write!(f, "network id does not match trust base"),
             VerificationError::InvalidMintLockScript => {
                 write!(
@@ -231,14 +250,20 @@ impl fmt::Display for VerificationError {
             VerificationError::SealNetworkMismatch => {
                 write!(f, "unicity seal network does not match trust base")
             }
-            VerificationError::UnsupportedAuthority => {
-                write!(f, "unsupported authority configuration (non-unit stake)")
+            VerificationError::UnknownTrustEpoch { epoch } => {
+                write!(f, "no trust base entry for epoch {epoch}")
             }
-            VerificationError::SealEpochMismatch => {
-                write!(f, "unicity seal epoch does not match trust base")
+            VerificationError::EpochBeforeGenesis => {
+                write!(f, "unicity seal epoch is older than the trust base history")
+            }
+            VerificationError::SealSignerInvalid => {
+                write!(
+                    f,
+                    "a unicity seal signature is from an unknown signer or invalid"
+                )
             }
             VerificationError::SealBeforeEpochStart => {
-                write!(f, "unicity seal predates the trust base epoch")
+                write!(f, "unicity seal predates its epoch")
             }
             VerificationError::SealMalformed => write!(f, "malformed unicity seal"),
             VerificationError::PartitionMismatch => {
