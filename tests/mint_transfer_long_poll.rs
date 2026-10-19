@@ -222,3 +222,16 @@ fn a_small_budget_does_not_shrink_the_request_timeout() {
     assert!(c.get_inclusion_proof(&state_id(7)).is_ok());
     assert_eq!(server.count(), 1);
 }
+
+#[test]
+fn the_default_proof_wait_budget_is_fifteen_one_second_attempts() {
+    // 1 s x 15 = 15 s in total, for the long-poll and the attempts-loop path alike
+    for c in [
+        HttpAggregatorClient::new("https://aggregator.invalid"),
+        HttpAggregatorClient::new_insecure_http("http://127.0.0.1:1"),
+    ] {
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("poll_attempts: 15"), "{dbg}");
+        assert!(dbg.contains("poll_interval: 1s"), "{dbg}");
+    }
+}
