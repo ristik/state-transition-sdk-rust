@@ -3,7 +3,9 @@
 use alloc::vec::Vec;
 
 use super::shard_id::ShardId;
-use crate::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
+use crate::cbor::{
+    encode_array, encode_byte_string, encode_null, encode_tag, encode_uint, Decoder,
+};
 use crate::error::Error;
 
 /// CBOR tag for [`ShardTreeCertificate`].
@@ -17,6 +19,9 @@ pub struct ShardTreeCertificate {
     pub shard: ShardId,
     /// Sibling hashes from the shard leaf up to the root.
     pub sibling_hash_list: Vec<Vec<u8>>,
+    /// The list was `null` on the wire (an empty path collection written by a native encoder).
+    /// Kept so that re-encoding reproduces the exact bytes; it has no meaning for verification.
+    pub empty_as_null: bool,
 }
 
 impl ShardTreeCertificate {
@@ -33,7 +38,8 @@ impl ShardTreeCertificate {
         // the native encoders write an empty path collection as `null` or as an empty array:
         // both are zero siblings
         let mut sibling_hash_list = Vec::new();
-        if !items[2].is_null() {
+        let empty_as_null = items[2].is_null();
+        if !empty_as_null {
             for s in items[2].array(None)? {
                 sibling_hash_list.push(s.bytes_value()?.to_vec());
             }
@@ -41,6 +47,7 @@ impl ShardTreeCertificate {
         Ok(ShardTreeCertificate {
             shard,
             sibling_hash_list,
+            empty_as_null,
         })
     }
 
@@ -57,7 +64,11 @@ impl ShardTreeCertificate {
             &encode_array(&[
                 &encode_uint(VERSION),
                 &encode_byte_string(&self.shard.encode()),
-                &encode_array(&sibling_refs),
+                &if self.empty_as_null && sibling_refs.is_empty() {
+                    encode_null()
+                } else {
+                    encode_array(&sibling_refs)
+                },
             ]),
         )
     }

@@ -2,7 +2,9 @@
 
 use alloc::vec::Vec;
 
-use crate::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
+use crate::cbor::{
+    encode_array, encode_byte_string, encode_null, encode_tag, encode_uint, Decoder,
+};
 use crate::crypto::hash::{sha256, DataHash, DataHasher, HashAlgorithm};
 use crate::error::Error;
 
@@ -46,6 +48,9 @@ pub struct UnicityTreeCertificate {
     pub partition_identifier: u32,
     /// Steps up to the root.
     pub steps: Vec<HashStep>,
+    /// The list was `null` on the wire (an empty path collection written by a native encoder).
+    /// Kept so that re-encoding reproduces the exact bytes; it has no meaning for verification.
+    pub empty_as_null: bool,
 }
 
 impl UnicityTreeCertificate {
@@ -62,7 +67,8 @@ impl UnicityTreeCertificate {
             .map_err(|_| Error::OutOfRange("partition identifier exceeds 32 bits"))?;
         // an empty path collection is `null` or an empty array on the native wire: zero steps
         let mut steps = Vec::new();
-        if !items[2].is_null() {
+        let empty_as_null = items[2].is_null();
+        if !empty_as_null {
             let encoded = items[2].array(None)?;
             if encoded.len() > MAX_UNICITY_TREE_STEPS {
                 return Err(Error::OutOfRange("too many unicity tree steps"));
@@ -74,6 +80,7 @@ impl UnicityTreeCertificate {
         Ok(UnicityTreeCertificate {
             partition_identifier,
             steps,
+            empty_as_null,
         })
     }
 
@@ -118,7 +125,11 @@ impl UnicityTreeCertificate {
             &encode_array(&[
                 &encode_uint(VERSION),
                 &encode_uint(self.partition_identifier as u64),
-                &encode_array(&step_refs),
+                &if self.empty_as_null && step_refs.is_empty() {
+                    encode_null()
+                } else {
+                    encode_array(&step_refs)
+                },
             ]),
         )
     }

@@ -110,10 +110,12 @@ fn signed_uc(node: &Secp256k1Signer, root: [u8; 32]) -> UnicityCertificate {
         shard_tree_certificate: ShardTreeCertificate {
             shard: empty_shard(),
             sibling_hash_list: Vec::new(),
+            empty_as_null: false,
         },
         unicity_tree_certificate: UnicityTreeCertificate {
             partition_identifier: crate::api::AGGREGATION_PARTITION_ID,
             steps: Vec::new(),
+            empty_as_null: false,
         },
         unicity_seal: mk_seal(vec![0u8; 32], Vec::new()),
     };

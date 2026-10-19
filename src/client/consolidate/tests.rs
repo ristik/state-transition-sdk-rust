@@ -297,6 +297,7 @@ impl Sim {
                 key: 1,
                 hash: vec![9; 32],
             }],
+            empty_as_null: false,
         };
         let mut seal = UnicitySeal {
             network_id: NetworkId::LOCAL,
