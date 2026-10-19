@@ -103,9 +103,10 @@ pub struct TrustBaseMember {
     pub weight: u64,
 }
 
-/// An optional 32-byte hash in the entry. `None` is CBOR `null`; `Some(empty)` is the empty
-/// byte string. Both are valid on the wire and are different byte forms, hence different
-/// entry identities, so the form is preserved.
+/// An optional 32-byte hash in the entry. The canonical absent form is `None`, CBOR `null`;
+/// a present hash is exactly 32 bytes. The empty byte string is not a wire form: the decoder
+/// refuses it, and an in-memory `Some(empty)` is treated as `None` (it encodes as `null`),
+/// so an entry has one byte form and one identity.
 pub type OptionalHash = Option<Vec<u8>>;
 
 /// A signed trust base entry, record version 2.
@@ -147,14 +148,15 @@ impl TrustBaseEntry {
         change_record_hash: OptionalHash,
         previous_entry_id: [u8; ID_LEN],
     ) -> Self {
+        let norm = |h: OptionalHash| h.filter(|b| !b.is_empty());
         TrustBaseEntry {
             network_id,
             epoch,
             epoch_start,
             members,
             quorum_threshold,
-            state_hash,
-            change_record_hash,
+            state_hash: norm(state_hash),
+            change_record_hash: norm(change_record_hash),
             previous_entry_id,
             signatures: None,
         }
@@ -198,9 +200,10 @@ impl TrustBaseEntry {
             })
             .collect();
         let member_refs: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+        // the canonical absent hash is null, also for an in-memory empty value
         let hash = |h: &OptionalHash| match h {
-            None => encode_null(),
-            Some(b) => encode_byte_string(b),
+            Some(b) if !b.is_empty() => encode_byte_string(b),
+            _ => encode_null(),
         };
         let signatures = match (&self.signatures, with_signatures) {
             (Some(sigs), true) => {
@@ -285,6 +288,13 @@ impl TrustBaseEntry {
         };
         let state_hash = hash(&items[6])?;
         let change_record_hash = hash(&items[7])?;
+        for h in [&state_hash, &change_record_hash].into_iter().flatten() {
+            if h.is_empty() {
+                return Err(TrustBaseError::Encoding(
+                    "an absent hash is null, not an empty byte string",
+                ));
+            }
+        }
         let previous_entry_id: [u8; ID_LEN] = items[8]
             .bytes_value()?
             .try_into()
@@ -318,12 +328,10 @@ impl TrustBaseEntry {
     }
 
     /// Parse the JSON form of an entry (bft-go-base `RootTrustBaseV2` JSON tags), meant for an
-    /// on-disk genesis file. Host only. The JSON cannot tell a `null` hash from an empty byte
-    /// string (two different byte forms with different identities): an absent, `null` or
-    /// empty hash is read as `null`, so a genesis encoded with empty byte strings has to be
-    /// loaded from CBOR. Compare the result's identity with the deployment's pin
-    /// ([`TrustBaseHistory::from_genesis`](super::TrustBaseHistory::from_genesis)); a
-    /// mismatch means the file is not the pinned genesis.
+    /// on-disk genesis file. Host only. An absent, `null` or empty hash is read as absent
+    /// (`null`, the one canonical form). Compare the result's identity with the deployment's pin
+    /// ([`TrustBaseHistory::from_genesis`](super::TrustBaseHistory::from_genesis)); a mismatch
+    /// means the file is not the pinned genesis.
     #[cfg(feature = "std")]
     pub fn from_json(input: &str) -> Result<Self, TrustBaseError> {
         use serde_json::Value;
