@@ -272,3 +272,13 @@ pub fn http_response(status_line: &str, body: &str) -> Vec<u8> {
     )
     .into_bytes()
 }
+
+/// An HTTP response with extra header lines (each without the line break).
+pub fn http_response_with(status_line: &str, headers: &[&str], body: &str) -> Vec<u8> {
+    let extra: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
+    format!(
+        "HTTP/1.1 {status_line}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}

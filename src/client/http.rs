@@ -14,7 +14,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use crate::api::bft::RootTrustBase;
@@ -140,6 +140,17 @@ pub enum HttpError {
     /// The aggregator's proof admission limit is reached (`-32023`, normally with
     /// HTTP 429). Retry later; nothing is known about the state.
     ServerBusy,
+    /// The wait ended because the aggregator answered a proof read with an overload answer
+    /// (HTTP 503 or 429, `-32006`, or `data.retryable`) and the pause it asks for (the
+    /// larger of the polling interval and `Retry-After`) does not fit the time left of the
+    /// wait: the timeout form of such an answer, failing at once instead of sleeping
+    /// through the deadline. `cause` is the overload error; the request may be retried later.
+    OverloadTimeout {
+        /// The server's `Retry-After` (capped at 60 s), if it sent one.
+        retry_after: Option<Duration>,
+        /// The overload answer.
+        cause: Box<HttpError>,
+    },
 }
 
 impl fmt::Display for HttpError {
@@ -158,6 +169,12 @@ impl fmt::Display for HttpError {
             }
             HttpError::Rejected(s) => write!(f, "certification rejected: {s:?}"),
             HttpError::Timeout => write!(f, "timed out waiting for inclusion proof"),
+            HttpError::OverloadTimeout { retry_after, cause } => write!(
+                f,
+                "timed out waiting for inclusion proof: the aggregator is overloaded \
+                 (retry after {} ms) and the pause does not fit the time left: {cause}",
+                retry_after.map_or(0, |d| d.as_millis())
+            ),
             HttpError::Cancelled => write!(f, "wait cancelled"),
             HttpError::StateNotFound => write!(f, "state is not known to the aggregator"),
             HttpError::ProofOfOtherData => write!(
@@ -188,7 +205,14 @@ impl fmt::Display for HttpError {
     }
 }
 
-impl std::error::Error for HttpError {}
+impl std::error::Error for HttpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HttpError::OverloadTimeout { cause, .. } => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// The error for a proof that certifies other data than the submitted request: authenticated
 /// (`StateCertifiedWithOtherData`) only when the proof verifies under `trust_base` for
@@ -655,13 +679,19 @@ impl HttpAggregatorClient {
         let response = match request.send_string(&body) {
             Ok(r) => r,
             Err(ureq::Error::Status(status, r)) => {
+                let retry_after = parse_retry_after(r.header("Retry-After"));
                 let body = read_response_raw(r, MAX_ERROR_BODY_BYTES)?;
                 // a JSON-RPC error may ride on a non-2xx status: keep it typed
                 let rpc = match decode_rpc_envelope(&body, &id) {
                     Err(e @ EnvelopeError::Rpc { .. }) => Some(e),
                     _ => None,
                 };
-                return Err(RawFailure::Http { status, body, rpc });
+                return Err(RawFailure::Http {
+                    status,
+                    body,
+                    rpc,
+                    retry_after,
+                });
             }
             Err(e) => return Err(transport_failure(&e)),
         };
@@ -670,12 +700,71 @@ impl HttpAggregatorClient {
                 status: response.status(),
                 body: read_response_raw(response, MAX_ERROR_BODY_BYTES)?,
                 rpc: None,
+                retry_after: None,
             });
         }
 
         let text = read_response_raw(response, MAX_RESPONSE_BODY_BYTES)?;
         decode_rpc_envelope(&text, &id).map_err(RawFailure::Envelope)
     }
+}
+
+/// Greatest `Retry-After` the proof wait honors.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// `Retry-After` in delta-seconds form; anything else (a date, garbage, absent) is ignored.
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    let seconds: u64 = value?.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
+}
+
+/// An overload answer to a proof read: HTTP 503 or 429, JSON-RPC `-32006`, or any
+/// JSON-RPC error whose `data.retryable` is true. Inconclusive, not a failure of the
+/// wait. `Some(retry_after)` when it is one (the header, capped), `None` when not.
+fn overload_of(failure: &RawFailure) -> Option<Option<Duration>> {
+    let rpc_overload = |e: &EnvelopeError| match e {
+        EnvelopeError::Rpc { code, data, .. } => {
+            *code != RPC_INCLUSION_PENDING
+                && *code != RPC_STATE_NOT_FOUND
+                && (*code == rpc_code::CONCURRENCY_LIMIT
+                    || data
+                        .as_ref()
+                        .and_then(|d| d.get("retryable"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true))
+        }
+        EnvelopeError::Decode(_) => false,
+    };
+    match failure {
+        RawFailure::Http {
+            status,
+            rpc,
+            retry_after,
+            ..
+        } if matches!(status, 503 | 429) || rpc.as_ref().is_some_and(rpc_overload) => {
+            Some(*retry_after)
+        }
+        RawFailure::Envelope(e) if rpc_overload(e) => Some(None),
+        _ => None,
+    }
+}
+
+/// The pause after an overload answer, or the error that ends the wait now because the pause
+/// does not fit the `left` budget.
+fn overload_pause(
+    failure: RawFailure,
+    retry_after: Option<Duration>,
+    interval: Duration,
+    left: Duration,
+) -> Result<Duration, HttpError> {
+    let pause = interval.max(retry_after.unwrap_or_default());
+    if pause > left {
+        return Err(HttpError::OverloadTimeout {
+            retry_after,
+            cause: Box::new(raw_to_http(failure)),
+        });
+    }
+    Ok(pause)
 }
 
 fn raw_to_http(e: RawFailure) -> HttpError {
@@ -735,6 +824,8 @@ enum RawFailure {
         status: u16,
         body: String,
         rpc: Option<EnvelopeError>,
+        /// The `Retry-After` header in delta-seconds form, if present and parseable.
+        retry_after: Option<Duration>,
     },
     Transport(String),
     /// A transport failure caused by a timeout (an `io::ErrorKind::TimedOut` at the
@@ -915,8 +1006,20 @@ impl AggregatorClient for HttpAggregatorClient {
         });
         let mut unknown_seen = 0u32;
 
+        let started = Instant::now();
+        let budget = self.poll_interval.saturating_mul(self.poll_attempts);
         for attempt in 0..self.poll_attempts {
-            let result = match self.rpc("get_inclusion_proof.v2", params.clone(), &[]) {
+            let raw = self.rpc_raw("get_inclusion_proof.v2", params.clone(), &[], None);
+            // an overload answer is inconclusive: pause max(interval, Retry-After), or fail at once
+            if let Some(retry_after) = raw.as_ref().err().and_then(overload_of) {
+                let left = budget.saturating_sub(started.elapsed());
+                if let Err(failure) = raw {
+                    let pause = overload_pause(failure, retry_after, self.poll_interval, left)?;
+                    std::thread::sleep(pause);
+                }
+                continue;
+            }
+            let result = match raw.map_err(raw_to_http) {
                 Ok(result) => result,
                 Err(HttpError::Rpc { code, .. }) if code == RPC_INCLUSION_PENDING => {
                     if attempt + 1 < self.poll_attempts {
