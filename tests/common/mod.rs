@@ -113,6 +113,8 @@ mod mock {
         ErrorStatus(String, String),
         /// Bytes of a response (head and a part of the body), then silence: the rest never arrives.
         Partial(Vec<u8>),
+        /// Read the request and close the connection without answering (a reset / stale keep-alive socket).
+        Close,
         /// A full raw HTTP response.
         Raw(Vec<u8>),
         /// Accept the connection and never answer.
@@ -154,6 +156,13 @@ mod mock {
             Reply {
                 delay: Duration::ZERO,
                 body: Body::Partial(head_and_part),
+            }
+        }
+        /// Close the connection after reading the request, without any answer.
+        pub fn close() -> Self {
+            Reply {
+                delay: Duration::ZERO,
+                body: Body::Close,
             }
         }
         pub fn after(mut self, d: Duration) -> Self {
@@ -227,6 +236,7 @@ mod mock {
                                 std::thread::sleep(Duration::from_secs(30));
                                 return;
                             }
+                            Body::Close => return,
                             Body::Partial(b) => {
                                 let _ = stream.write_all(&b);
                                 let _ = stream.flush();

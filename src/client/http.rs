@@ -174,7 +174,7 @@ impl fmt::Display for HttpError {
             HttpError::Timeout => write!(f, "timed out waiting for inclusion proof"),
             HttpError::OverloadTimeout { retry_after, cause } => write!(
                 f,
-                "timed out waiting for inclusion proof: the aggregator is overloaded \
+                "timed out waiting for inclusion proof: the aggregator is overloaded or unavailable \
                  (retry after {} ms) and the pause does not fit the time left: {cause}",
                 retry_after.map_or(0, |d| d.as_millis())
             ),
@@ -686,7 +686,7 @@ impl HttpAggregatorClient {
                 let retry_after = parse_retry_after(r.header("Retry-After"));
                 // The status is classified even when the body is oversized or unreadable (an intermediary page):
                 // only a validated matching JSON-RPC envelope adds RPC semantics.
-                let (body, too_large) = read_error_body(r)?;
+                let (body, too_large, interrupted) = read_error_body(r);
                 // a JSON-RPC error may ride on a non-2xx status: keep it typed
                 let rpc = match decode_rpc_envelope(&body, &id) {
                     Err(e @ EnvelopeError::Rpc { .. }) => Some(e),
@@ -698,6 +698,7 @@ impl HttpAggregatorClient {
                     rpc,
                     retry_after,
                     too_large,
+                    interrupted,
                 });
             }
             Err(e) => return Err(transport_failure(&e)),
@@ -705,13 +706,14 @@ impl HttpAggregatorClient {
         if !(200..300).contains(&response.status()) {
             let status = response.status();
             let retry_after = parse_retry_after(response.header("Retry-After"));
-            let (body, too_large) = read_error_body(response)?;
+            let (body, too_large, interrupted) = read_error_body(response);
             return Err(RawFailure::Http {
                 status,
                 retry_after,
                 body,
                 rpc: None,
                 too_large,
+                interrupted,
             });
         }
 
@@ -782,52 +784,63 @@ fn parse_http_date(text: &str) -> Option<u64> {
         .position(|x| x.eq_ignore_ascii_case(m))
         .map(|i| i as i64 + 1)
     };
+    // exactly `digits` ASCII digits
+    let num = |t: &str, digits: usize| -> Option<i64> {
+        (t.len() == digits && t.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| t.parse().ok())
+            .flatten()
+    };
     let (day, mon, year, clock): (i64, i64, i64, &str) = match tokens.as_slice() {
         // Sun, 06 Nov 1994 08:49:37 GMT
-        [_, d, m, y, t, "GMT"] if y.len() == 4 => (d.parse().ok()?, month(m)?, y.parse().ok()?, t),
+        [_, d, m, y, t, "GMT"] => (num(d, 2)?, month(m)?, num(y, 4)?, t),
         // Sunday, 06-Nov-94 08:49:37 GMT
         [_, dmy, t, "GMT"] => {
             let mut p = dmy.split('-');
             let (d, m, y) = (p.next()?, p.next()?, p.next()?);
-            let y: i64 = y.parse().ok()?;
-            let year = if y < 100 {
-                if y < 70 {
-                    2000 + y
-                } else {
-                    1900 + y
-                }
-            } else {
-                y
-            };
-            (d.parse().ok()?, month(m)?, year, t)
+            if p.next().is_some() {
+                return None;
+            }
+            let y = num(y, 2)?;
+            (
+                num(d, 2)?,
+                month(m)?,
+                if y < 70 { 2000 + y } else { 1900 + y },
+                t,
+            )
         }
         // Sun Nov  6 08:49:37 1994
-        [_, m, d, t, y] => (d.parse().ok()?, month(m)?, y.parse().ok()?, t),
+        [_, m, d, t, y] => (num(d, d.len().min(2))?, month(m)?, num(y, 4)?, t),
         _ => return None,
     };
     let mut c = clock.split(':');
-    let (h, mi, sec): (i64, i64, i64) = (
-        c.next()?.parse().ok()?,
-        c.next()?.parse().ok()?,
-        c.next()?.parse().ok()?,
-    );
-    if c.next().is_some()
-        || !(1..=31).contains(&day)
-        || h > 23
-        || mi > 59
-        || sec > 60
-        || year < 1970
-    {
+    let (h, mi, sec) = (num(c.next()?, 2)?, num(c.next()?, 2)?, num(c.next()?, 2)?);
+    if c.next().is_some() || h > 23 || mi > 59 || sec > 60 || !(1970..=9999).contains(&year) {
         return None;
     }
-    // days from civil (Howard Hinnant)
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match mon {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    // days from civil (Howard Hinnant), checked
     let y = if mon <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let doy = (153 * (mon + if mon > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + sec).ok()
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(h * 3600 + mi * 60 + sec)?;
+    u64::try_from(seconds).ok()
 }
 
 /// An overload answer to a proof read, or an intermediary timeout/gateway error inside a wait (HTTP 502 or 504): HTTP 503 or 429, JSON-RPC `-32006`, or any
@@ -896,8 +909,14 @@ fn raw_to_http(e: RawFailure) -> HttpError {
             too_large: Some(limit),
             ..
         } => HttpError::ResponseTooLarge { limit },
+        RawFailure::Http {
+            interrupted: Some(cut),
+            ..
+        } if matches!(*cut, RawFailure::TimedOut(_)) => raw_to_http(*cut),
         RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
-        RawFailure::Transport(m) | RawFailure::TimedOut(m) => HttpError::Transport(m),
+        RawFailure::Transport(m) | RawFailure::TimedOut(m) | RawFailure::Fatal(m) => {
+            HttpError::Transport(m)
+        }
         RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
         // unchanged for everything but the overload decision: an answer to no request of ours
         RawFailure::Envelope(EnvelopeError::NullIdRpc { .. }) => {
@@ -960,8 +979,13 @@ enum RawFailure {
         /// The limit when the error body exceeded the bounded error-body reader (the body is then empty): the status
         /// still classifies the answer, one-shot calls report [`HttpError::ResponseTooLarge`] as before.
         too_large: Option<usize>,
+        /// The failure that cut the body short (a timeout, reset or early EOF while it was read). The status still
+        /// classifies the answer; one-shot calls report a timeout as the timeout it was.
+        interrupted: Option<Box<RawFailure>>,
     },
     Transport(String),
+    /// A transport failure no retry can fix: TLS certificate or hostname validation, an invalid URL, scheme or proxy.
+    Fatal(String),
     /// A transport failure caused by a timeout (an `io::ErrorKind::TimedOut` at the
     /// root of the error chain).
     TimedOut(String),
@@ -980,8 +1004,23 @@ fn is_timeout_kind(kind: std::io::ErrorKind) -> bool {
 /// Classify a ureq transport error by walking its source chain to an
 /// `io::Error`, not by its text.
 fn transport_failure(error: &ureq::Error) -> RawFailure {
+    if let ureq::Error::Transport(t) = error {
+        use ureq::ErrorKind::{
+            InvalidProxyUrl, InvalidUrl, ProxyUnauthorized, TooManyRedirects, UnknownScheme,
+        };
+        if matches!(
+            t.kind(),
+            InvalidUrl | UnknownScheme | InvalidProxyUrl | ProxyUnauthorized | TooManyRedirects
+        ) {
+            return RawFailure::Fatal(error.to_string());
+        }
+    }
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(e) = source {
+        // TLS certificate / hostname validation: no retry can fix it
+        if format!("{e:?}").contains("InvalidCertificate") {
+            return RawFailure::Fatal(error.to_string());
+        }
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
             if is_timeout_kind(io.kind()) {
                 return RawFailure::TimedOut(error.to_string());
@@ -1000,14 +1039,17 @@ fn io_failure(error: &std::io::Error) -> RawFailure {
     }
 }
 
-/// The bounded body of a non-2xx answer. A body that is too large or not valid text does not hide the status; a timeout
-/// or transport failure while it is read stays what it is (a timeout is not a status).
-fn read_error_body(response: ureq::Response) -> Result<(String, Option<usize>), RawFailure> {
+/// The bounded body of a non-2xx answer, with how it ended. A body that is too large, not valid text, or cut short
+/// (timeout, reset, early EOF) never hides the status: the interruption is recorded and each caller decides by its own
+/// terminal state (a wait: cancellation and a spent deadline win, otherwise the status stands).
+fn read_error_body(response: ureq::Response) -> (String, Option<usize>, Option<Box<RawFailure>>) {
     match read_response_raw(response, MAX_ERROR_BODY_BYTES) {
-        Ok(body) => Ok((body, None)),
-        Err(RawFailure::TooLarge(limit)) => Ok((String::new(), Some(limit))),
-        Err(e @ (RawFailure::TimedOut(_) | RawFailure::Transport(_))) => Err(e),
-        Err(_) => Ok((String::new(), None)),
+        Ok(body) => (body, None, None),
+        Err(RawFailure::TooLarge(limit)) => (String::new(), Some(limit), None),
+        Err(e @ (RawFailure::TimedOut(_) | RawFailure::Transport(_))) => {
+            (String::new(), None, Some(Box::new(e)))
+        }
+        Err(_) => (String::new(), None, None),
     }
 }
 
@@ -1188,6 +1230,16 @@ impl AggregatorClient for HttpAggregatorClient {
                 let left = budget.saturating_sub(started.elapsed());
                 if let Err(failure) = raw {
                     let pause = overload_pause(failure, retry_after, self.poll_interval, left)?;
+                    std::thread::sleep(pause);
+                }
+                continue;
+            }
+            // a transport-level failure of a proof read inside the wait is inconclusive too (TLS validation, invalid
+            // URLs and configuration errors are other variants and stay terminal)
+            if matches!(raw, Err(RawFailure::Transport(_) | RawFailure::TimedOut(_))) {
+                if let Err(failure) = raw {
+                    let left = budget.saturating_sub(started.elapsed());
+                    let pause = overload_pause(failure, None, self.poll_interval, left)?;
                     std::thread::sleep(pause);
                 }
                 continue;
@@ -1426,12 +1478,16 @@ fn batch_failure(failure: RawFailure) -> BatchFailure {
     match failure {
         RawFailure::Http { rpc: Some(e), .. } => batch_failure(RawFailure::Envelope(e)),
         RawFailure::Http {
+            interrupted: Some(cut),
+            ..
+        } if matches!(*cut, RawFailure::TimedOut(_)) => BatchFailure::Timeout,
+        RawFailure::Http {
             too_large: Some(limit),
             ..
         } => BatchFailure::TooLarge { limit },
         RawFailure::Http { status, .. } => BatchFailure::Http { status },
         RawFailure::TimedOut(_) => BatchFailure::Timeout,
-        RawFailure::Transport(m) => BatchFailure::Transport(m),
+        RawFailure::Transport(m) | RawFailure::Fatal(m) => BatchFailure::Transport(m),
         RawFailure::TooLarge(limit) => BatchFailure::TooLarge { limit },
         RawFailure::Config(e) => BatchFailure::Transport(e.to_string()),
         RawFailure::Envelope(EnvelopeError::Decode(m)) => BatchFailure::Decode(m),
@@ -1705,7 +1761,21 @@ mod tests {
         assert_eq!(secs("Sun, 06 Nov 1994 08:49:37 GMT"), Some(Duration::ZERO));
         assert_eq!(secs("Sun, 06 Nov 1994 08:00:00 GMT"), Some(Duration::ZERO));
         assert_eq!(secs("Mon, 07 Nov 1994 08:49:37 GMT"), Some(MAX_RETRY_AFTER));
+        // far future (year 9999) is capped, never overflows
+        assert_eq!(secs("Fri, 31 Dec 9999 23:59:59 GMT"), Some(MAX_RETRY_AFTER));
+        assert_eq!(
+            secs("Sun, 29 Feb 1996 08:50:00 GMT"),
+            Some(Duration::from_secs(60))
+        );
         for ignored in [
+            "Sunday, 06-Nov-9223372036854775807 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 99999999999999",
+            "Sun, 06 Nov 10000 08:49:37 GMT",
+            "Sun, 06 Nov 1969 08:49:37 GMT",
+            "Sun, 31 Feb 1994 08:49:37 GMT",
+            "Sun, 29 Feb 1995 08:49:37 GMT",
+            "Sun, 31 Apr 1994 08:49:37 GMT",
+            "Sun, 00 Nov 1994 08:49:37 GMT",
             "",
             " ",
             "+5",
@@ -1733,6 +1803,7 @@ mod tests {
                 rpc: None,
                 retry_after: None,
                 too_large: None,
+                interrupted: None,
             };
             assert_eq!(overload_of(&http), Some(None), "{status}");
         }
@@ -1742,6 +1813,7 @@ mod tests {
             rpc: None,
             retry_after: None,
             too_large: None,
+            interrupted: None,
         };
         assert_eq!(overload_of(&http), None);
     }
@@ -1784,6 +1856,7 @@ mod tests {
                 rpc: None,
                 retry_after: Some(Duration::from_secs(1)),
                 too_large: None,
+                interrupted: None,
             };
             assert_eq!(overload_of(&http), Some(Some(Duration::from_secs(1))));
         }
@@ -1794,6 +1867,7 @@ mod tests {
                 rpc: None,
                 retry_after: None,
                 too_large: None,
+                interrupted: None,
             };
             assert_eq!(overload_of(&http), None);
         }
