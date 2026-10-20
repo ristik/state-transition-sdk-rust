@@ -328,24 +328,39 @@ fn a_hung_server_ends_at_the_deadline_not_at_the_transport_default() {
 }
 
 #[test]
-fn a_hung_server_beyond_wait_plus_margin_is_cut_by_the_call_timeout() {
-    // 3 s total, 1 s margin: the call timeout is wait + margin = 3 s... use a
-    // short max so the call timeout is below the deadline.
+fn a_hung_server_beyond_wait_plus_margin_is_cut_by_the_call_timeout_and_retried_plainly() {
+    // the call timeout (wait 300 ms + margin 100 ms) is far below the 2 s deadline: a single call timing out inside
+    // the budget is inconclusive (spec "Transport failures"); the rest of the wait sends plain reads, and the wait ends
+    // with the original budget
     let server = Scripted::start(|_, _| Reply::silent());
     let c = client(&server.url, 50);
     let started = Instant::now();
-    let r = c.wait_for_inclusion_proof(
+    let out = c.wait_for_inclusion_proof_with_stats(
         &state_id(7),
-        &WaitOptions::new(secs(30))
+        &WaitOptions::new(secs(2))
             .with_margin(Duration::from_millis(100))
             .with_max_request_timeout(Duration::from_millis(500))
             .with_preferred_wait(Duration::from_millis(300)),
     );
-    let took = started.elapsed();
-    // wait 300 ms + margin 100 ms = 400 ms call timeout, far below the 30 s deadline
-    assert!(matches!(r, Err(HttpError::Transport(_))), "{r:?}");
-    assert!(took < Duration::from_millis(1_500), "{took:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_500),
+        "the budget is not cut short"
+    );
+    assert!(
+        matches!(
+            out.result,
+            Err(HttpError::Timeout) | Err(HttpError::OverloadTimeout { .. })
+        ),
+        "{:?}",
+        out.result
+    );
+    assert!(out.stats.transport_failures >= 2, "{:?}", out.stats);
     assert_eq!(wait_param(&server, 0), Some(300));
+    assert_eq!(
+        wait_param(&server, 1),
+        None,
+        "plain reads after the first timeout"
+    );
 }
 
 #[test]
@@ -377,20 +392,32 @@ fn cancellation_is_observed_between_calls_and_during_sleeps() {
 }
 
 #[test]
-fn a_refused_connection_is_a_transport_error_not_a_timeout() {
+fn a_refused_connection_is_inconclusive_in_a_wait_and_ends_with_the_budget() {
     // grab a free port, then close it so connecting is refused
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
     let url = format!("http://127.0.0.1:{port}/");
-    for total in [Duration::from_millis(500), secs(5), secs(60)] {
-        let r = client(&url, 5).wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(total));
+    for total in [Duration::from_millis(300), Duration::from_millis(900)] {
+        let out = client(&url, 20)
+            .wait_for_inclusion_proof_with_stats(&state_id(7), &WaitOptions::new(total));
+        // retried within the original budget; the end is the SDK timeout
         assert!(
-            matches!(r, Err(HttpError::Transport(_))),
-            "{total:?}: {r:?}"
+            matches!(
+                out.result,
+                Err(HttpError::Timeout) | Err(HttpError::OverloadTimeout { .. })
+            ),
+            "{total:?}: {:?}",
+            out.result
         );
+        assert!(out.stats.transport_failures >= 2, "{:?}", out.stats);
     }
+    // a one-shot call still surfaces the transport error
+    let err = client(&url, 20)
+        .lookup_inclusion_proof(&state_id(7))
+        .unwrap_err();
+    assert!(matches!(err, HttpError::Transport(_)), "{err:?}");
 }
 
 #[test]

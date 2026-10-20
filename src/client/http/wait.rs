@@ -176,6 +176,9 @@ pub struct WaitStats {
     /// Overload answers (503, 429, `-32006`, `data.retryable`), each paused out; after the first the
     /// rest of the wait sends no `waitMs`.
     pub overloaded: u32,
+    /// Transport-level failures of a proof read (refused or reset connection, stale pooled connection, a single call
+    /// timing out inside the budget, a truncated response), each paused out as inconclusive.
+    pub transport_failures: u32,
     /// Pending answers followed by an immediate re-call (a positive echo after a
     /// call that already took the polling interval).
     pub immediate_rechecks: u32,
@@ -296,6 +299,25 @@ impl HttpAggregatorClient {
             );
             let call_took = call_started.elapsed();
             let timed_out = matches!(raw, Err(RawFailure::TimedOut(_)));
+            // A transport-level failure of a proof read inside a wait (refused or reset, stale pooled connection,
+            // timeout of one call within the budget, truncated response) is inconclusive: plain reads at the interval
+            // within the original budget. Cancellation and a spent deadline win; TLS validation, invalid URLs and
+            // configuration errors are another variant and stay terminal. Submissions are not part of this loop.
+            if matches!(raw, Err(RawFailure::Transport(_) | RawFailure::TimedOut(_))) {
+                let Err(failure) = raw else { unreachable!() };
+                if cancelled() {
+                    return Err(HttpError::Cancelled);
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() || (timed_out && plan.timeout_ms >= left_ms) {
+                    return Err(HttpError::Timeout);
+                }
+                stats.transport_failures += 1;
+                send_wait = false;
+                let pause = overload_pause(failure, None, interval.max(MIN_PAUSE), left)?;
+                self.pause(Pace::Sleep(pause), deadline, options)?;
+                continue;
+            }
             // `error.data.waitedMs` of a handled error: a server that echoes understood `waitMs`.
             let error_echo = match &raw {
                 Err(RawFailure::Envelope(EnvelopeError::Rpc { data, .. }))
@@ -310,16 +332,24 @@ impl HttpAggregatorClient {
             // with the overload as cause; the rest of this wait sends plain reads (no `waitMs`).
             if let Some(retry_after) = raw.as_ref().err().and_then(overload_of) {
                 let Err(failure) = raw else { unreachable!() };
+                // cancellation and the spent deadline come before the overload verdict
+                if cancelled() {
+                    return Err(HttpError::Cancelled);
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                // a body that timed out under a call timeout capped by the deadline is the deadline
+                let body_timed_out = matches!(
+                    &failure,
+                    RawFailure::Http { interrupted: Some(cut), .. } if matches!(**cut, RawFailure::TimedOut(_))
+                );
+                if left.is_zero() || (body_timed_out && plan.timeout_ms >= left_ms) {
+                    return Err(HttpError::Timeout);
+                }
                 stats.overloaded += 1;
                 if plan.wait_ms.is_some() {
                     send_wait = false;
                 }
-                let pause = overload_pause(
-                    failure,
-                    retry_after,
-                    interval.max(MIN_PAUSE),
-                    deadline.saturating_duration_since(Instant::now()),
-                )?;
+                let pause = overload_pause(failure, retry_after, interval.max(MIN_PAUSE), left)?;
                 self.pause(Pace::Sleep(pause), deadline, options)?;
                 continue;
             }
