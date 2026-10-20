@@ -111,6 +111,8 @@ mod mock {
         ErrorWithHeaders(String, Vec<String>),
         /// JSON-RPC `error` object JSON (id echoed) on the given HTTP status line.
         ErrorStatus(String, String),
+        /// Bytes of a response (head and a part of the body), then silence: the rest never arrives.
+        Partial(Vec<u8>),
         /// A full raw HTTP response.
         Raw(Vec<u8>),
         /// Accept the connection and never answer.
@@ -145,6 +147,13 @@ mod mock {
             Reply {
                 delay: Duration::ZERO,
                 body: Body::ErrorStatus(status_line.to_string(), json.into()),
+            }
+        }
+        /// Send `head_and_part` and then stall (the declared body never completes).
+        pub fn partial(head_and_part: Vec<u8>) -> Self {
+            Reply {
+                delay: Duration::ZERO,
+                body: Body::Partial(head_and_part),
             }
         }
         pub fn after(mut self, d: Duration) -> Self {
@@ -215,6 +224,12 @@ mod mock {
                         std::thread::sleep(reply.delay);
                         let bytes = match reply.body {
                             Body::Silent => {
+                                std::thread::sleep(Duration::from_secs(30));
+                                return;
+                            }
+                            Body::Partial(b) => {
+                                let _ = stream.write_all(&b);
+                                let _ = stream.flush();
                                 std::thread::sleep(Duration::from_secs(30));
                                 return;
                             }

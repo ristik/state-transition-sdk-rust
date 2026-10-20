@@ -686,7 +686,7 @@ impl HttpAggregatorClient {
                 let retry_after = parse_retry_after(r.header("Retry-After"));
                 // The status is classified even when the body is oversized or unreadable (an intermediary page):
                 // only a validated matching JSON-RPC envelope adds RPC semantics.
-                let (body, too_large) = read_error_body(r);
+                let (body, too_large) = read_error_body(r)?;
                 // a JSON-RPC error may ride on a non-2xx status: keep it typed
                 let rpc = match decode_rpc_envelope(&body, &id) {
                     Err(e @ EnvelopeError::Rpc { .. }) => Some(e),
@@ -705,7 +705,7 @@ impl HttpAggregatorClient {
         if !(200..300).contains(&response.status()) {
             let status = response.status();
             let retry_after = parse_retry_after(response.header("Retry-After"));
-            let (body, too_large) = read_error_body(response);
+            let (body, too_large) = read_error_body(response)?;
             return Err(RawFailure::Http {
                 status,
                 retry_after,
@@ -1000,12 +1000,14 @@ fn io_failure(error: &std::io::Error) -> RawFailure {
     }
 }
 
-/// The bounded body of a non-2xx answer; a body that is too large or unreadable does not hide the status.
-fn read_error_body(response: ureq::Response) -> (String, Option<usize>) {
+/// The bounded body of a non-2xx answer. A body that is too large or not valid text does not hide the status; a timeout
+/// or transport failure while it is read stays what it is (a timeout is not a status).
+fn read_error_body(response: ureq::Response) -> Result<(String, Option<usize>), RawFailure> {
     match read_response_raw(response, MAX_ERROR_BODY_BYTES) {
-        Ok(body) => (body, None),
-        Err(RawFailure::TooLarge(limit)) => (String::new(), Some(limit)),
-        Err(_) => (String::new(), None),
+        Ok(body) => Ok((body, None)),
+        Err(RawFailure::TooLarge(limit)) => Ok((String::new(), Some(limit))),
+        Err(e @ (RawFailure::TimedOut(_) | RawFailure::Transport(_))) => Err(e),
+        Err(_) => Ok((String::new(), None)),
     }
 }
 
