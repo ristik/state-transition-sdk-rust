@@ -18,6 +18,11 @@ fn client(url: &str, interval_ms: u64) -> HttpAggregatorClient {
         .with_unknown_grace(2)
 }
 
+/// A client whose submit_and_wait budget (interval x attempts = 10 s) does not depend on machine speed.
+fn patient(url: &str) -> HttpAggregatorClient {
+    client(url, 20).with_polling(Duration::from_millis(20), 500)
+}
+
 fn pending() -> String {
     format!(
         r#"{{"proof":"{}","status":"pending","waitedMs":0}}"#,
@@ -288,7 +293,7 @@ fn a_retryable_unknown_or_pending_is_an_overload_never_a_failure_or_a_resubmit()
             }
         });
         let (_, data) = fixture_proof_and_data();
-        let c = client(&server.url, 20).with_unknown_grace(0);
+        let c = patient(&server.url).with_unknown_grace(0);
         let got = c.submit_and_wait(&data, 3).expect("the wait goes on");
         assert_eq!(got.certification_data, data);
         let methods: Vec<String> = (0..server.count())
@@ -380,7 +385,7 @@ fn a_null_id_busy_answer_never_resubmits_through_submit_and_wait() {
         }
     });
     let (_, data) = fixture_proof_and_data();
-    let got = client(&server.url, 20)
+    let got = patient(&server.url)
         .with_unknown_grace(0)
         .submit_and_wait(&data, 3)
         .expect("the wait goes on");
@@ -518,7 +523,7 @@ fn a_502_during_submit_and_wait_never_resubmits() {
         }
     });
     let (_, data) = fixture_proof_and_data();
-    assert!(client(&server.url, 20).submit_and_wait(&data, 3).is_ok());
+    assert!(patient(&server.url).submit_and_wait(&data, 3).is_ok());
     let methods: Vec<String> = (0..server.count())
         .map(|i| server.request(i).method)
         .collect();
@@ -686,4 +691,178 @@ fn an_answer_without_an_id_is_a_protocol_error_even_for_a_retryable_busy() {
     );
     assert_eq!(server.count(), 1);
     assert_eq!(out.stats.overloaded, 0);
+}
+
+// --- interrupted gateway bodies and transport failures (rev-agg re-check; spec "Transport failures") ----------
+
+fn truncated(status: &str) -> Reply {
+    Reply::raw(
+        format!("HTTP/1.1 {status}\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n<html>cut")
+            .into_bytes(),
+    )
+}
+
+#[test]
+fn a_truncated_502_body_keeps_its_status_in_a_wait() {
+    for status in [
+        "502 Bad Gateway",
+        "504 Gateway Timeout",
+        "503 Service Unavailable",
+    ] {
+        let server = after_overload(truncated(status));
+        let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+            &state_id(7),
+            &WaitOptions::new(Duration::from_secs(10)),
+        );
+        assert!(out.result.is_ok(), "{status}: {:?}", out.result);
+        assert_eq!(out.stats.requests, 4, "{status}");
+        assert_eq!(out.stats.overloaded, 1, "{status}");
+        assert_eq!(wait_param(&server, 1), None);
+    }
+    // 502 then the proof: two requests
+    let f = proof();
+    let server = Scripted::start(move |i, _| {
+        if i == 0 {
+            truncated("502 Bad Gateway")
+        } else {
+            Reply::result(f.clone())
+        }
+    });
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)),
+    );
+    assert!(out.result.is_ok());
+    assert_eq!(out.stats.requests, 2);
+}
+
+#[test]
+fn one_shot_calls_keep_the_status_of_a_truncated_error_body() {
+    let server = Scripted::start(|_, _| truncated("502 Bad Gateway"));
+    let err = client(&server.url, 20)
+        .lookup_inclusion_proof(&state_id(7))
+        .unwrap_err();
+    assert!(
+        matches!(err, HttpError::Http { status: 502, .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_transport_failure_of_a_proof_read_is_inconclusive_in_a_wait() {
+    // a reset / stale connection, a truncated successful body, then the proof
+    for first in [Reply::close(), truncated("200 OK")] {
+        let first = std::sync::Mutex::new(Some(first));
+        let (f, p) = (proof(), pending());
+        let server = Scripted::start(move |i, _| match i {
+            0 => first.lock().unwrap().take().unwrap(),
+            1 => Reply::result(p.clone()),
+            _ => Reply::result(f.clone()),
+        });
+        let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+            &state_id(7),
+            &WaitOptions::new(Duration::from_secs(10)),
+        );
+        assert!(out.result.is_ok(), "{:?}", out.result);
+        assert_eq!(out.stats.requests, 3);
+        assert_eq!(out.stats.transport_failures, 1);
+        assert!(wait_param(&server, 0).is_some());
+        assert_eq!(wait_param(&server, 1), None, "plain reads afterwards");
+        assert_eq!(wait_param(&server, 2), None);
+    }
+}
+
+#[test]
+fn the_attempts_loop_retries_a_transport_failure_too() {
+    let (f, p) = (proof(), pending());
+    let server = Scripted::start(move |i, _| match i {
+        0 => Reply::close(),
+        1 => Reply::result(p.clone()),
+        _ => Reply::result(f.clone()),
+    });
+    let c = client(&server.url, 20)
+        .with_polling(Duration::from_millis(20), 6)
+        .with_long_poll(false);
+    assert!(c.get_inclusion_proof(&state_id(7)).is_ok());
+    assert_eq!(server.count(), 3);
+}
+
+#[test]
+fn a_cancel_during_a_transport_failure_is_cancelled() {
+    let server = Scripted::start(|_, _| Reply::close().after(Duration::from_millis(300)));
+    let cancel = unicity_token::client::CancelToken::new();
+    let remote = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        remote.cancel();
+    });
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)).with_cancel(cancel),
+    );
+    assert!(
+        matches!(out.result, Err(HttpError::Cancelled)),
+        "{:?}",
+        out.result
+    );
+    assert_eq!(server.count(), 1);
+}
+
+#[test]
+fn an_invalid_endpoint_is_terminal_with_no_request() {
+    for url in [
+        "ftp://127.0.0.1:9/",
+        "http://user:pw@127.0.0.1:9/",
+        "not a url",
+    ] {
+        let out = HttpAggregatorClient::new_insecure_http(url)
+            .with_polling(Duration::from_millis(20), 3)
+            .wait_for_inclusion_proof_with_stats(
+                &state_id(7),
+                &WaitOptions::new(Duration::from_secs(5)),
+            );
+        assert!(
+            matches!(out.result, Err(HttpError::Configuration(_))),
+            "{url}: {:?}",
+            out.result
+        );
+        assert_eq!(out.stats.transport_failures, 0);
+    }
+}
+
+#[test]
+fn submit_and_wait_never_resubmits_on_a_transport_error() {
+    // the proof read is reset once; the submission was sent exactly once
+    let (f, p) = (proof(), pending());
+    let server = Scripted::start(move |i, seen| {
+        if seen.method == "certification_request" {
+            return Reply::result(r#"{"status":"SUCCESS"}"#);
+        }
+        match i {
+            1 => Reply::close(),
+            2 => Reply::result(p.clone()),
+            _ => Reply::result(f.clone()),
+        }
+    });
+    let (_, data) = fixture_proof_and_data();
+    assert!(patient(&server.url).submit_and_wait(&data, 3).is_ok());
+    let methods: Vec<String> = (0..server.count())
+        .map(|i| server.request(i).method)
+        .collect();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|m| *m == "certification_request")
+            .count(),
+        1,
+        "{methods:?}"
+    );
+
+    // a transport error on the submission itself is surfaced, not replayed
+    let server = Scripted::start(|_, _| Reply::close());
+    let err = client(&server.url, 20)
+        .submit_and_wait(&data, 3)
+        .unwrap_err();
+    assert!(matches!(err, HttpError::Transport(_)), "{err:?}");
+    assert_eq!(server.count(), 1);
 }
