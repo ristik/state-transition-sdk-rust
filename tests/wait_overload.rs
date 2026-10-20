@@ -7,10 +7,10 @@
 mod common;
 
 use std::error::Error;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::*;
-use unicity_token::client::{HttpAggregatorClient, HttpError, WaitOptions};
+use unicity_token::client::{AggregatorClient, HttpAggregatorClient, HttpError, WaitOptions};
 
 fn client(url: &str, interval_ms: u64) -> HttpAggregatorClient {
     HttpAggregatorClient::new_insecure_http(url)
@@ -71,9 +71,7 @@ fn assert_overload_then_plain_reads(
         assert_eq!(wait_param(server, i), None, "read {i} is plain");
     }
     assert!(gap(server, 0) >= pause_at_least, "{:?}", gap(server, 0));
-    assert!(gap(server, 0) < pause_at_least + Duration::from_millis(600));
-    // at the configured interval from then on (20 ms), not at the Retry-After
-    assert!(gap(server, 1) < Duration::from_millis(500));
+    // (the pause plan itself is unit tested in `client::http`; no wall-clock upper bounds here)
 }
 
 #[test]
@@ -146,12 +144,10 @@ fn an_unparseable_retry_after_is_ignored() {
 fn a_retry_after_beyond_the_remaining_budget_fails_at_once_with_the_overload_as_cause() {
     let server =
         Scripted::start(|_, _| http_status("503 Service Unavailable", &["Retry-After: 30"]));
-    let started = Instant::now();
     let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
         &state_id(7),
         &WaitOptions::new(Duration::from_secs(10)),
     );
-    assert!(started.elapsed() < Duration::from_secs(2), "fails fast");
     assert_eq!(server.count(), 1);
     let Err(error) = out.result else {
         panic!("expected an error")
@@ -214,7 +210,6 @@ fn a_non_retryable_error_still_ends_the_wait_at_once() {
 
 #[test]
 fn the_attempts_loop_follows_the_same_rule() {
-    use unicity_token::client::AggregatorClient;
     let server = after_overload(http_status("503 Service Unavailable", &[]));
     let c = client(&server.url, 100)
         .with_polling(Duration::from_millis(100), 6)
@@ -227,11 +222,122 @@ fn the_attempts_loop_follows_the_same_rule() {
     let server =
         Scripted::start(|_, _| http_status("503 Service Unavailable", &["Retry-After: 30"]));
     let c = client(&server.url, 100).with_long_poll(false);
-    let started = Instant::now();
     assert!(matches!(
         c.get_inclusion_proof(&state_id(7)),
         Err(HttpError::OverloadTimeout { .. })
     ));
-    assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(server.count(), 1);
+}
+
+#[test]
+fn a_retry_after_on_an_http_200_rpc_error_is_honored() {
+    let (f, p) = (proof(), pending());
+    let server = Scripted::start(move |i, _| match i {
+        0 => Reply::error_with_headers(r#"{"code":-32006,"message":"busy"}"#, &["Retry-After: 1"]),
+        1 => Reply::result(p.clone()),
+        _ => Reply::result(f.clone()),
+    });
+    let c = client(&server.url, 20);
+    let out = c.wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)),
+    );
+    assert!(out.result.is_ok(), "{:?}", out.result);
+    assert_eq!(out.stats.requests, 3);
+    assert_eq!(out.stats.overloaded, 1);
+    assert!(
+        gap(&server, 0) >= Duration::from_millis(950),
+        "{:?}",
+        gap(&server, 0)
+    );
+    assert_eq!(wait_param(&server, 1), None);
+}
+
+#[test]
+fn a_huge_all_digit_retry_after_saturates_and_fails_at_once() {
+    let server = Scripted::start(|_, _| {
+        http_status(
+            "503 Service Unavailable",
+            &["Retry-After: 99999999999999999999999999"],
+        )
+    });
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)),
+    );
+    let Err(HttpError::OverloadTimeout { retry_after, .. }) = out.result else {
+        panic!("{:?}", out.result)
+    };
+    assert_eq!(retry_after, Some(Duration::from_secs(60)));
+    assert_eq!(server.count(), 1, "one request, no tight loop");
+}
+
+#[test]
+fn a_retryable_unknown_or_pending_is_an_overload_never_a_failure_or_a_resubmit() {
+    for code in [-32020, -32021] {
+        let (f, p) = (proof(), pending());
+        let body = format!(r#"{{"code":{code},"message":"later","data":{{"retryable":true}}}}"#);
+        let server = Scripted::start(move |i, seen| {
+            if seen.method == "certification_request" {
+                return Reply::result(r#"{"status":"SUCCESS"}"#);
+            }
+            match i {
+                1 => Reply::error(body.clone()),
+                2 => Reply::result(p.clone()),
+                _ => Reply::result(f.clone()),
+            }
+        });
+        let (_, data) = fixture_proof_and_data();
+        let c = client(&server.url, 20).with_unknown_grace(0);
+        let got = c.submit_and_wait(&data, 3).expect("the wait goes on");
+        assert_eq!(got.certification_data, data);
+        let methods: Vec<String> = (0..server.count())
+            .map(|i| server.request(i).method)
+            .collect();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| *m == "certification_request")
+                .count(),
+            1,
+            "{code}: never resubmitted, {methods:?}"
+        );
+        // and directly: the wait counts it as an overload and then reads plainly
+        let (f, body) = (
+            proof(),
+            format!(r#"{{"code":{code},"message":"x","data":{{"retryable":true}}}}"#),
+        );
+        let server = Scripted::start(move |i, _| {
+            if i == 0 {
+                Reply::error(body.clone())
+            } else {
+                Reply::result(f.clone())
+            }
+        });
+        let out = client(&server.url, 20)
+            .with_unknown_grace(0)
+            .wait_for_inclusion_proof_with_stats(
+                &state_id(7),
+                &WaitOptions::new(Duration::from_secs(10)),
+            );
+        assert!(out.result.is_ok(), "{code}: {:?}", out.result);
+        assert_eq!((out.stats.overloaded, out.stats.requests), (1, 2));
+        assert_eq!(wait_param(&server, 1), None);
+    }
+}
+
+#[test]
+fn a_plain_unknown_or_pending_error_keeps_its_meaning() {
+    let server =
+        Scripted::start(|_, _| Reply::error(r#"{"code":-32020,"message":"no such state"}"#));
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)),
+    );
+    assert!(
+        matches!(out.result, Err(HttpError::StateNotFound)),
+        "{:?}",
+        out.result
+    );
+    assert_eq!(out.stats.overloaded, 0);
 }
