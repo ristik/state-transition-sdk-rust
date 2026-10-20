@@ -341,3 +341,94 @@ fn a_plain_unknown_or_pending_error_keeps_its_meaning() {
     );
     assert_eq!(out.stats.overloaded, 0);
 }
+
+// aggregator-go answers its server-wide concurrency limit before parsing the request: the id can not be echoed
+// (rust#64). Rules (b) and (c) of the spec: a null-id -32006 / data.retryable is an overload, any other unmatched
+// answer stays terminal.
+const NULL_ID_BUSY: &str =
+    r#"{"jsonrpc":"2.0","error":{"code":-32006,"message":"Concurrency limit exceeded"},"id":null}"#;
+
+fn exact(body: &'static str) -> Reply {
+    Reply::raw(http_response_with("200 OK", &[], body))
+}
+
+#[test]
+fn a_null_id_busy_answer_is_an_overload_through_the_wait() {
+    let server = after_overload(exact(NULL_ID_BUSY));
+    assert_overload_then_plain_reads(&server, &client(&server.url, 50), Duration::from_millis(45));
+}
+
+#[test]
+fn a_null_id_retryable_error_is_an_overload() {
+    let server = after_overload(exact(
+        r#"{"jsonrpc":"2.0","error":{"code":-32099,"message":"later","data":{"retryable":true}},"id":null}"#,
+    ));
+    assert_overload_then_plain_reads(&server, &client(&server.url, 50), Duration::from_millis(45));
+}
+
+#[test]
+fn a_null_id_busy_answer_never_resubmits_through_submit_and_wait() {
+    let (f, p) = (proof(), pending());
+    let server = Scripted::start(move |i, seen| {
+        if seen.method == "certification_request" {
+            return Reply::result(r#"{"status":"SUCCESS"}"#);
+        }
+        match i {
+            1 => exact(NULL_ID_BUSY),
+            2 => Reply::result(p.clone()),
+            _ => Reply::result(f.clone()),
+        }
+    });
+    let (_, data) = fixture_proof_and_data();
+    let got = client(&server.url, 20)
+        .with_unknown_grace(0)
+        .submit_and_wait(&data, 3)
+        .expect("the wait goes on");
+    assert_eq!(got.certification_data, data);
+    let methods: Vec<String> = (0..server.count())
+        .map(|i| server.request(i).method)
+        .collect();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|m| *m == "certification_request")
+            .count(),
+        1,
+        "{methods:?}"
+    );
+    assert_eq!(
+        methods.len(),
+        4,
+        "submit, busy, pending, proof: {methods:?}"
+    );
+}
+
+#[test]
+fn other_unmatched_answers_stay_terminal() {
+    for body in [
+        // null id, not an overload
+        r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad"},"id":null}"#,
+        r#"{"jsonrpc":"2.0","error":{"code":-32099,"message":"no","data":{"retryable":false}},"id":null}"#,
+        // unmatched pending / not found / unknown
+        r#"{"jsonrpc":"2.0","error":{"code":-32021,"message":"pending"},"id":null}"#,
+        r#"{"jsonrpc":"2.0","error":{"code":-32020,"message":"none"},"id":null}"#,
+        // a different non-null id, even for a busy answer
+        r#"{"jsonrpc":"2.0","error":{"code":-32006,"message":"busy"},"id":"someone-else"}"#,
+        r#"{"jsonrpc":"2.0","error":{"code":-32006,"message":"busy"},"id":7}"#,
+        // a null id with a result
+        r#"{"jsonrpc":"2.0","result":{},"id":null}"#,
+    ] {
+        let server = Scripted::start(move |_, _| exact(body));
+        let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+            &state_id(7),
+            &WaitOptions::new(Duration::from_secs(10)),
+        );
+        assert!(
+            matches!(out.result, Err(HttpError::Decode(_))),
+            "{body}: {:?}",
+            out.result
+        );
+        assert_eq!(server.count(), 1, "{body}");
+        assert_eq!(out.stats.overloaded, 0, "{body}");
+    }
+}
