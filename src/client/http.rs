@@ -720,6 +720,11 @@ impl HttpAggregatorClient {
                     data,
                     retry_after,
                 },
+                EnvelopeError::NullIdRpc { code, data, .. } => EnvelopeError::NullIdRpc {
+                    code,
+                    data,
+                    retry_after,
+                },
                 other => other,
             })
         })
@@ -743,22 +748,29 @@ fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
 /// An overload answer to a proof read: HTTP 503 or 429, JSON-RPC `-32006`, or any
 /// JSON-RPC error whose `data.retryable` is true. Inconclusive, not a failure of the
 /// wait. `Some(retry_after)` when it is one (the header, capped), `None` when not.
+fn retryable_flag(data: &Option<serde_json::Value>) -> bool {
+    data.as_ref()
+        .and_then(|d| d.get("retryable"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
 fn overload_of(failure: &RawFailure) -> Option<Option<Duration>> {
     // classified before pending / not-found / unknown: any code with `data.retryable: true` is an overload
     let rpc_overload = |e: &EnvelopeError| match e {
         EnvelopeError::Rpc { code, data, .. } => {
-            *code == rpc_code::CONCURRENCY_LIMIT
-                || data
-                    .as_ref()
-                    .and_then(|d| d.get("retryable"))
-                    .and_then(|v| v.as_bool())
-                    == Some(true)
+            *code == rpc_code::CONCURRENCY_LIMIT || retryable_flag(data)
+        }
+        EnvelopeError::NullIdRpc { code, data, .. } => {
+            *code == rpc_code::CONCURRENCY_LIMIT || retryable_flag(data)
         }
         EnvelopeError::Decode(_) => false,
     };
     // Retry-After of the HTTP response, whatever its status (on a non-2xx it rides on the failure itself)
     let rpc_retry_after = |e: &EnvelopeError| match e {
-        EnvelopeError::Rpc { retry_after, .. } => *retry_after,
+        EnvelopeError::Rpc { retry_after, .. } | EnvelopeError::NullIdRpc { retry_after, .. } => {
+            *retry_after
+        }
         EnvelopeError::Decode(_) => None,
     };
     match failure {
@@ -798,6 +810,10 @@ fn raw_to_http(e: RawFailure) -> HttpError {
         RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
         RawFailure::Transport(m) | RawFailure::TimedOut(m) => HttpError::Transport(m),
         RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
+        // unchanged for everything but the overload decision: an answer to no request of ours
+        RawFailure::Envelope(EnvelopeError::NullIdRpc { .. }) => {
+            HttpError::Decode(NULL_ID_MESSAGE.to_string())
+        }
         RawFailure::Envelope(EnvelopeError::Rpc { code, message, .. }) => {
             HttpError::Rpc { code, message }
         }
@@ -915,7 +931,17 @@ enum EnvelopeError {
         /// `Retry-After` of the HTTP response that carried the error (set on a 2xx response).
         retry_after: Option<Duration>,
     },
+    /// An error answer whose id is `null`: a server that rejects a request before parsing it (aggregator-go's
+    /// server-wide concurrency limit) cannot echo the id. It answers no request of ours, so it is a protocol error
+    /// (`Decode`) for everything except an overload, which [`overload_of`] recognizes.
+    NullIdRpc {
+        code: i64,
+        data: Option<serde_json::Value>,
+        retry_after: Option<Duration>,
+    },
 }
+
+const NULL_ID_MESSAGE: &str = "invalid or missing JSON-RPC id";
 
 fn decode_rpc_envelope(text: &str, expected_id: &str) -> Result<serde_json::Value, EnvelopeError> {
     let decode = |m: &str| EnvelopeError::Decode(m.to_string());
@@ -926,6 +952,20 @@ fn decode_rpc_envelope(text: &str, expected_id: &str) -> Result<serde_json::Valu
         .ok_or_else(|| decode("JSON-RPC response must be an object"))?;
     if object.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
         return Err(decode("invalid or missing JSON-RPC version"));
+    }
+    if object.get("id").is_some_and(serde_json::Value::is_null) && object.get("result").is_none() {
+        if let Some(error) = object.get("error") {
+            if let (Some(code), Some(_)) = (
+                error.get("code").and_then(|v| v.as_i64()),
+                error.get("message").and_then(|v| v.as_str()),
+            ) {
+                return Err(EnvelopeError::NullIdRpc {
+                    code,
+                    data: error.get("data").cloned(),
+                    retry_after: None,
+                });
+            }
+        }
     }
     let response_id = object
         .get("id")
@@ -965,6 +1005,7 @@ fn decode_rpc_response(text: &str, expected_id: &str) -> Result<serde_json::Valu
     decode_rpc_envelope(text, expected_id).map_err(|e| match e {
         EnvelopeError::Decode(m) => HttpError::Decode(m),
         EnvelopeError::Rpc { code, message, .. } => HttpError::Rpc { code, message },
+        EnvelopeError::NullIdRpc { .. } => HttpError::Decode(NULL_ID_MESSAGE.to_string()),
     })
 }
 
@@ -1287,6 +1328,9 @@ fn batch_failure(failure: RawFailure) -> BatchFailure {
         RawFailure::TooLarge(limit) => BatchFailure::TooLarge { limit },
         RawFailure::Config(e) => BatchFailure::Transport(e.to_string()),
         RawFailure::Envelope(EnvelopeError::Decode(m)) => BatchFailure::Decode(m),
+        RawFailure::Envelope(EnvelopeError::NullIdRpc { .. }) => {
+            BatchFailure::Decode(NULL_ID_MESSAGE.to_string())
+        }
         RawFailure::Envelope(EnvelopeError::Rpc {
             code,
             message,
