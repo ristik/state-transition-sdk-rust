@@ -310,16 +310,19 @@ impl HttpAggregatorClient {
             // with the overload as cause; the rest of this wait sends plain reads (no `waitMs`).
             if let Some(retry_after) = raw.as_ref().err().and_then(overload_of) {
                 let Err(failure) = raw else { unreachable!() };
+                // cancellation and the spent deadline come before the overload verdict
+                if cancelled() {
+                    return Err(HttpError::Cancelled);
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(HttpError::Timeout);
+                }
                 stats.overloaded += 1;
                 if plan.wait_ms.is_some() {
                     send_wait = false;
                 }
-                let pause = overload_pause(
-                    failure,
-                    retry_after,
-                    interval.max(MIN_PAUSE),
-                    deadline.saturating_duration_since(Instant::now()),
-                )?;
+                let pause = overload_pause(failure, retry_after, interval.max(MIN_PAUSE), left)?;
                 self.pause(Pace::Sleep(pause), deadline, options)?;
                 continue;
             }

@@ -607,3 +607,83 @@ fn http_date(secs: u64) -> String {
         rem % 60
     )
 }
+
+// --- error-body read failures and cancellation (rev-agg) ------------------------------------------------
+
+#[test]
+fn a_timeout_while_the_error_body_is_read_is_a_timeout_not_a_status() {
+    // 504 head with a declared 100-byte body of which 4 arrive, then silence
+    let server = Scripted::start(|_, _| {
+        Reply::partial(
+            b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 100\r\nConnection: close\r\n\r\nslow"
+                .to_vec(),
+        )
+    });
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_millis(1_500)),
+    );
+    assert!(
+        matches!(out.result, Err(HttpError::Timeout)),
+        "{:?}",
+        out.result
+    );
+    assert_eq!(server.count(), 1, "not an overload pause and retry");
+    assert_eq!(out.stats.overloaded, 0);
+    // a one-shot call reports the transport timeout, not an HTTP status
+    let err = client(&server.url, 20)
+        .lookup_inclusion_proof_with_wait(
+            &state_id(7),
+            &unicity_token::client::WaitRequest::new(0),
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HttpError::Transport(_)), "{err:?}");
+}
+
+#[test]
+fn a_cancel_landing_during_a_gateway_error_is_cancelled_not_an_overload_timeout() {
+    let server = Scripted::start(|_, _| {
+        Reply::raw(http_response_with(
+            "504 Gateway Timeout",
+            &["Retry-After: 30"],
+            "slow",
+        ))
+        .after(Duration::from_millis(400))
+    });
+    let cancel = unicity_token::client::CancelToken::new();
+    let remote = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        remote.cancel();
+    });
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)).with_cancel(cancel),
+    );
+    assert!(
+        matches!(out.result, Err(HttpError::Cancelled)),
+        "{:?}",
+        out.result
+    );
+    assert_eq!(server.count(), 1);
+}
+
+#[test]
+fn an_answer_without_an_id_is_a_protocol_error_even_for_a_retryable_busy() {
+    // a *missing* id is not the null id of the pre-parse limit
+    let body =
+        r#"{"jsonrpc":"2.0","error":{"code":-32006,"message":"busy","data":{"retryable":true}}}"#;
+    let server = Scripted::start(move |_, _| exact(body));
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)),
+    );
+    assert!(
+        matches!(out.result, Err(HttpError::Decode(_))),
+        "{:?}",
+        out.result
+    );
+    assert_eq!(server.count(), 1);
+    assert_eq!(out.stats.overloaded, 0);
+}

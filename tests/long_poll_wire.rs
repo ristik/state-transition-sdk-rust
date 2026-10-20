@@ -802,7 +802,8 @@ fn a_gateway_http_400_mixed_shard_answer_keeps_its_rpc_classification() {
     let server = Scripted::start(|_, _| {
         Reply::error_status(
             "400 Bad Request",
-            r#"{"code":-32602,"message":"Invalid params","data":{"reason":"invalid_request","detail":"wrong_shard","retryable":false}}"#,
+            // the gateway's exact body (aggregator-subscription batchShardErrorBody): code, message, id; no data
+            r#"{"code":-32602,"message":"stateIds belong to more than one shard; send one request per shard"}"#,
         )
     });
     let ids = batch_ids();
