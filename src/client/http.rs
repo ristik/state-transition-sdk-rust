@@ -377,6 +377,7 @@ impl HttpAggregatorClient {
                 code,
                 message,
                 data,
+                ..
             })) if is_queue_duplicate(code, &data) => {
                 return Ok(SubmitReply::QueueDuplicate(HttpError::Rpc {
                     code,
@@ -704,8 +705,24 @@ impl HttpAggregatorClient {
             });
         }
 
+        let retry_after = parse_retry_after(response.header("Retry-After"));
         let text = read_response_raw(response, MAX_RESPONSE_BODY_BYTES)?;
-        decode_rpc_envelope(&text, &id).map_err(RawFailure::Envelope)
+        decode_rpc_envelope(&text, &id).map_err(|e| {
+            RawFailure::Envelope(match e {
+                EnvelopeError::Rpc {
+                    code,
+                    message,
+                    data,
+                    ..
+                } => EnvelopeError::Rpc {
+                    code,
+                    message,
+                    data,
+                    retry_after,
+                },
+                other => other,
+            })
+        })
     }
 }
 
@@ -714,7 +731,12 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// `Retry-After` in delta-seconds form; anything else (a date, garbage, absent) is ignored.
 fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
-    let seconds: u64 = value?.trim().parse().ok()?;
+    let digits = value?.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // decimal seconds of any length saturate at the cap
+    let seconds: u64 = digits.parse().unwrap_or(u64::MAX);
     Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
 }
 
@@ -722,18 +744,22 @@ fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
 /// JSON-RPC error whose `data.retryable` is true. Inconclusive, not a failure of the
 /// wait. `Some(retry_after)` when it is one (the header, capped), `None` when not.
 fn overload_of(failure: &RawFailure) -> Option<Option<Duration>> {
+    // classified before pending / not-found / unknown: any code with `data.retryable: true` is an overload
     let rpc_overload = |e: &EnvelopeError| match e {
         EnvelopeError::Rpc { code, data, .. } => {
-            *code != RPC_INCLUSION_PENDING
-                && *code != RPC_STATE_NOT_FOUND
-                && (*code == rpc_code::CONCURRENCY_LIMIT
-                    || data
-                        .as_ref()
-                        .and_then(|d| d.get("retryable"))
-                        .and_then(|v| v.as_bool())
-                        == Some(true))
+            *code == rpc_code::CONCURRENCY_LIMIT
+                || data
+                    .as_ref()
+                    .and_then(|d| d.get("retryable"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
         }
         EnvelopeError::Decode(_) => false,
+    };
+    // Retry-After of the HTTP response, whatever its status (on a non-2xx it rides on the failure itself)
+    let rpc_retry_after = |e: &EnvelopeError| match e {
+        EnvelopeError::Rpc { retry_after, .. } => *retry_after,
+        EnvelopeError::Decode(_) => None,
     };
     match failure {
         RawFailure::Http {
@@ -744,7 +770,7 @@ fn overload_of(failure: &RawFailure) -> Option<Option<Duration>> {
         } if matches!(status, 503 | 429) || rpc.as_ref().is_some_and(rpc_overload) => {
             Some(*retry_after)
         }
-        RawFailure::Envelope(e) if rpc_overload(e) => Some(None),
+        RawFailure::Envelope(e) if rpc_overload(e) => Some(rpc_retry_after(e)),
         _ => None,
     }
 }
@@ -886,6 +912,8 @@ enum EnvelopeError {
         code: i64,
         message: String,
         data: Option<serde_json::Value>,
+        /// `Retry-After` of the HTTP response that carried the error (set on a 2xx response).
+        retry_after: Option<Duration>,
     },
 }
 
@@ -923,6 +951,7 @@ fn decode_rpc_envelope(text: &str, expected_id: &str) -> Result<serde_json::Valu
                 code,
                 message: message.to_string(),
                 data: error.get("data").cloned(),
+                retry_after: None,
             })
         }
         (None, None) => Err(decode(
@@ -1262,6 +1291,7 @@ fn batch_failure(failure: RawFailure) -> BatchFailure {
             code,
             message,
             data,
+            ..
         }) => {
             let text = |k: &str| {
                 data.as_ref()
@@ -1494,5 +1524,114 @@ mod tests {
         assert!(decode_non_inclusion_proof_response(&one).is_err());
         let two = encode_array(&[encode_uint(1).as_slice(), encode_uint(2).as_slice()]);
         assert!(decode_non_inclusion_proof_response(&two).is_err());
+    }
+
+    #[test]
+    fn retry_after_is_delta_seconds_saturating_at_the_cap() {
+        let secs = |v: &str| parse_retry_after(Some(v));
+        assert_eq!(secs("3"), Some(Duration::from_secs(3)));
+        assert_eq!(secs(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(secs("0"), Some(Duration::ZERO));
+        assert_eq!(secs("60"), Some(Duration::from_secs(60)));
+        assert_eq!(secs("61"), Some(MAX_RETRY_AFTER));
+        assert_eq!(secs("99999999999999999999999999"), Some(MAX_RETRY_AFTER));
+        assert_eq!(secs(&"9".repeat(400)), Some(MAX_RETRY_AFTER));
+        for ignored in [
+            "",
+            " ",
+            "+5",
+            "-1",
+            "1.5",
+            "1e3",
+            "3 s",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+        ] {
+            assert_eq!(secs(ignored), None, "{ignored:?}");
+        }
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    fn rpc_failure(
+        code: i64,
+        data: Option<serde_json::Value>,
+        retry_after: Option<u64>,
+    ) -> RawFailure {
+        RawFailure::Envelope(EnvelopeError::Rpc {
+            code,
+            message: String::new(),
+            data,
+            retry_after: retry_after.map(Duration::from_secs),
+        })
+    }
+
+    #[test]
+    fn overload_is_classified_before_pending_and_unknown() {
+        let retryable = Some(serde_json::json!({"retryable": true}));
+        for code in [RPC_INCLUSION_PENDING, RPC_STATE_NOT_FOUND, -32099, -1] {
+            assert_eq!(
+                overload_of(&rpc_failure(code, retryable.clone(), Some(2))),
+                Some(Some(Duration::from_secs(2))),
+                "{code}"
+            );
+            let not_retryable = Some(serde_json::json!({"retryable": false}));
+            assert_eq!(
+                overload_of(&rpc_failure(code, not_retryable, None)),
+                None,
+                "{code}"
+            );
+            assert_eq!(overload_of(&rpc_failure(code, None, None)), None, "{code}");
+        }
+        assert_eq!(overload_of(&rpc_failure(-32006, None, None)), Some(None));
+        for status in [503u16, 429] {
+            let http = RawFailure::Http {
+                status,
+                body: String::new(),
+                rpc: None,
+                retry_after: Some(Duration::from_secs(1)),
+            };
+            assert_eq!(overload_of(&http), Some(Some(Duration::from_secs(1))));
+        }
+        for status in [500u16, 404, 400] {
+            let http = RawFailure::Http {
+                status,
+                body: String::new(),
+                rpc: None,
+                retry_after: None,
+            };
+            assert_eq!(overload_of(&http), None);
+        }
+    }
+
+    #[test]
+    fn the_overload_pause_is_the_larger_of_interval_and_retry_after_and_must_fit() {
+        let ms = Duration::from_millis;
+        let failure = || rpc_failure(-32006, None, None);
+        // the interval when there is no Retry-After or a smaller one
+        assert_eq!(
+            overload_pause(failure(), None, ms(100), ms(1000)).unwrap(),
+            ms(100)
+        );
+        assert_eq!(
+            overload_pause(failure(), Some(ms(50)), ms(100), ms(1000)).unwrap(),
+            ms(100)
+        );
+        // Retry-After when larger, up to exactly what is left
+        assert_eq!(
+            overload_pause(failure(), Some(ms(700)), ms(100), ms(1000)).unwrap(),
+            ms(700)
+        );
+        assert_eq!(
+            overload_pause(failure(), Some(ms(1000)), ms(100), ms(1000)).unwrap(),
+            ms(1000)
+        );
+        // beyond what is left: the timeout form, the overload as cause
+        match overload_pause(failure(), Some(ms(1001)), ms(100), ms(1000)) {
+            Err(HttpError::OverloadTimeout { retry_after, cause }) => {
+                assert_eq!(retry_after, Some(ms(1001)));
+                assert!(matches!(*cause, HttpError::Rpc { code: -32006, .. }));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(overload_pause(failure(), None, ms(100), ms(99)).is_err());
     }
 }
