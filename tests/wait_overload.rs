@@ -131,7 +131,7 @@ fn a_retry_after_below_the_interval_does_not_shorten_the_pause() {
 fn an_unparseable_retry_after_is_ignored() {
     let server = after_overload(http_status(
         "503 Service Unavailable",
-        &["Retry-After: Wed, 21 Oct 2026 07:28:00 GMT"],
+        &["Retry-After: soon"],
     ));
     assert_overload_then_plain_reads(
         &server,
@@ -431,4 +431,179 @@ fn other_unmatched_answers_stay_terminal() {
         assert_eq!(server.count(), 1, "{body}");
         assert_eq!(out.stats.overloaded, 0, "{body}");
     }
+}
+
+// --- intermediary errors (502/504), spec "Intermediary errors" -----------------------------------------------
+
+fn gateway_error(status: &str) -> Reply {
+    Reply::raw(http_response_with(
+        status,
+        &[],
+        "<html>upstream timed out</html>",
+    ))
+}
+
+#[test]
+fn http_502_and_504_are_inconclusive_in_a_wait_then_plain_reads() {
+    for status in ["502 Bad Gateway", "504 Gateway Timeout"] {
+        let server = after_overload(gateway_error(status));
+        let c = client(&server.url, 50);
+        let out = c.wait_for_inclusion_proof_with_stats(
+            &state_id(7),
+            &WaitOptions::new(Duration::from_secs(10)),
+        );
+        assert!(out.result.is_ok(), "{status}: {:?}", out.result);
+        assert_eq!(out.stats.requests, 4, "{status}");
+        assert!(wait_param(&server, 0).is_some());
+        for i in 1..4 {
+            assert_eq!(wait_param(&server, i), None, "{status}: read {i} is plain");
+        }
+        assert!(gap(&server, 0) >= Duration::from_millis(45));
+    }
+}
+
+#[test]
+fn a_502_with_an_oversized_or_non_json_body_is_still_classified_by_its_status() {
+    for body in ["x".repeat(200_000), String::new(), "{not json".to_string()] {
+        let server = Scripted::start({
+            let body = body.clone();
+            move |i, _| {
+                if i == 0 {
+                    Reply::raw(http_response_with("502 Bad Gateway", &[], &body))
+                } else {
+                    Reply::result(proof())
+                }
+            }
+        });
+        let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+            &state_id(7),
+            &WaitOptions::new(Duration::from_secs(10)),
+        );
+        assert!(out.result.is_ok(), "{} bytes: {:?}", body.len(), out.result);
+        assert_eq!(server.count(), 2);
+    }
+}
+
+#[test]
+fn a_504_pause_beyond_the_budget_fails_within_it_with_the_gateway_error_as_cause() {
+    let server = Scripted::start(|_, _| {
+        Reply::raw(http_response_with(
+            "504 Gateway Timeout",
+            &["Retry-After: 30"],
+            "slow",
+        ))
+    });
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)),
+    );
+    let Err(HttpError::OverloadTimeout { cause, .. }) = out.result else {
+        panic!("{:?}", out.result)
+    };
+    assert!(matches!(*cause, HttpError::Http { status: 504, .. }));
+    assert_eq!(server.count(), 1);
+}
+
+#[test]
+fn a_502_during_submit_and_wait_never_resubmits() {
+    let (f, p) = (proof(), pending());
+    let server = Scripted::start(move |i, seen| {
+        if seen.method == "certification_request" {
+            return Reply::result(r#"{"status":"SUCCESS"}"#);
+        }
+        match i {
+            1 => gateway_error("502 Bad Gateway"),
+            2 => Reply::result(p.clone()),
+            _ => Reply::result(f.clone()),
+        }
+    });
+    let (_, data) = fixture_proof_and_data();
+    assert!(client(&server.url, 20).submit_and_wait(&data, 3).is_ok());
+    let methods: Vec<String> = (0..server.count())
+        .map(|i| server.request(i).method)
+        .collect();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|m| *m == "certification_request")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn one_shot_apis_still_surface_502_503_504_429() {
+    for (status, code) in [
+        ("502 Bad Gateway", 502),
+        ("503 Service Unavailable", 503),
+        ("504 Gateway Timeout", 504),
+        ("429 Too Many Requests", 429),
+    ] {
+        let server = Scripted::start(move |_, _| gateway_error(status));
+        let err = client(&server.url, 20)
+            .lookup_inclusion_proof(&state_id(7))
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::Http { status: s, .. } if s == code),
+            "{status}: {err:?}"
+        );
+        assert_eq!(server.count(), 1);
+    }
+}
+
+#[test]
+fn a_retry_after_http_date_is_honored_in_the_wait() {
+    // a date two seconds ahead; whole seconds, so the pause is at least ~1 s
+    let when = std::time::SystemTime::now() + Duration::from_secs(2);
+    let secs = when
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (f, p) = (proof(), pending());
+    let header = format!("Retry-After: {}", http_date(secs));
+    let server = Scripted::start(move |i, _| match i {
+        0 => Reply::raw(http_response_with(
+            "503 Service Unavailable",
+            &[&header],
+            "busy",
+        )),
+        1 => Reply::result(p.clone()),
+        _ => Reply::result(f.clone()),
+    });
+    let out = client(&server.url, 20).wait_for_inclusion_proof_with_stats(
+        &state_id(7),
+        &WaitOptions::new(Duration::from_secs(10)),
+    );
+    assert!(out.result.is_ok());
+    assert!(
+        gap(&server, 0) >= Duration::from_millis(900),
+        "{:?}",
+        gap(&server, 0)
+    );
+}
+
+/// IMF-fixdate of a Unix time (test helper).
+fn http_date(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (z, era);
+    z = days + 719_468;
+    era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let wd = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][(days.rem_euclid(7)) as usize];
+    let mon = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(m - 1) as usize];
+    format!(
+        "{wd}, {d:02} {mon} {y} {:02}:{:02}:{:02} GMT",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }

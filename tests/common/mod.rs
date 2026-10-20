@@ -109,6 +109,8 @@ mod mock {
         Error(String),
         /// JSON-RPC `error` object JSON with extra header lines, on HTTP 200.
         ErrorWithHeaders(String, Vec<String>),
+        /// JSON-RPC `error` object JSON (id echoed) on the given HTTP status line.
+        ErrorStatus(String, String),
         /// A full raw HTTP response.
         Raw(Vec<u8>),
         /// Accept the connection and never answer.
@@ -136,6 +138,13 @@ mod mock {
                     json.into(),
                     headers.iter().map(|h| h.to_string()).collect(),
                 ),
+            }
+        }
+        /// A JSON-RPC `error` answer on another HTTP status, e.g. "400 Bad Request", the id echoed.
+        pub fn error_status(status_line: &str, json: impl Into<String>) -> Self {
+            Reply {
+                delay: Duration::ZERO,
+                body: Body::ErrorStatus(status_line.to_string(), json.into()),
             }
         }
         pub fn after(mut self, d: Duration) -> Self {
@@ -213,6 +222,10 @@ mod mock {
                             Body::Result(r) => http_response(
                                 "200 OK",
                                 &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{r}}}"#),
+                            ),
+                            Body::ErrorStatus(status, e) => http_response(
+                                &status,
+                                &format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{e}}}"#),
                             ),
                             Body::ErrorWithHeaders(e, headers) => {
                                 let headers: Vec<&str> =
