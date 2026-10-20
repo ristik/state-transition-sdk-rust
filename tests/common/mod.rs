@@ -108,6 +108,14 @@ mod mock {
         Result(String),
         /// JSON-RPC `error` object JSON.
         Error(String),
+        /// JSON-RPC `error` object JSON with extra header lines, on HTTP 200.
+        ErrorWithHeaders(String, Vec<String>),
+        /// JSON-RPC `error` object JSON (id echoed) on the given HTTP status line.
+        ErrorStatus(String, String),
+        /// Bytes of a response (head and a part of the body), then silence: the rest never arrives.
+        Partial(Vec<u8>),
+        /// Read the request and close the connection without answering (a reset / stale keep-alive socket).
+        Close,
         /// A full raw HTTP response.
         Raw(Vec<u8>),
         /// Accept the connection and never answer.
@@ -125,6 +133,37 @@ mod mock {
             Reply {
                 delay: Duration::ZERO,
                 body: Body::Error(json.into()),
+            }
+        }
+        /// A JSON-RPC `error` answer on HTTP 200 with extra response header lines.
+        pub fn error_with_headers(json: impl Into<String>, headers: &[&str]) -> Self {
+            Reply {
+                delay: Duration::ZERO,
+                body: Body::ErrorWithHeaders(
+                    json.into(),
+                    headers.iter().map(|h| h.to_string()).collect(),
+                ),
+            }
+        }
+        /// A JSON-RPC `error` answer on another HTTP status, e.g. "400 Bad Request", the id echoed.
+        pub fn error_status(status_line: &str, json: impl Into<String>) -> Self {
+            Reply {
+                delay: Duration::ZERO,
+                body: Body::ErrorStatus(status_line.to_string(), json.into()),
+            }
+        }
+        /// Send `head_and_part` and then stall (the declared body never completes).
+        pub fn partial(head_and_part: Vec<u8>) -> Self {
+            Reply {
+                delay: Duration::ZERO,
+                body: Body::Partial(head_and_part),
+            }
+        }
+        /// Close the connection after reading the request, without any answer.
+        pub fn close() -> Self {
+            Reply {
+                delay: Duration::ZERO,
+                body: Body::Close,
             }
         }
         pub fn after(mut self, d: Duration) -> Self {
@@ -198,11 +237,31 @@ mod mock {
                                 std::thread::sleep(Duration::from_secs(30));
                                 return;
                             }
+                            Body::Close => return,
+                            Body::Partial(b) => {
+                                let _ = stream.write_all(&b);
+                                let _ = stream.flush();
+                                std::thread::sleep(Duration::from_secs(30));
+                                return;
+                            }
                             Body::Raw(b) => b,
                             Body::Result(r) => http_response(
                                 "200 OK",
                                 &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{r}}}"#),
                             ),
+                            Body::ErrorStatus(status, e) => http_response(
+                                &status,
+                                &format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{e}}}"#),
+                            ),
+                            Body::ErrorWithHeaders(e, headers) => {
+                                let headers: Vec<&str> =
+                                    headers.iter().map(String::as_str).collect();
+                                http_response_with(
+                                    "200 OK",
+                                    &headers,
+                                    &format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{e}}}"#),
+                                )
+                            }
                             Body::Error(e) => http_response(
                                 "200 OK",
                                 &format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{e}}}"#),
@@ -269,6 +328,16 @@ pub fn content_length(headers: &[u8]) -> usize {
 pub fn http_response(status_line: &str, body: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// An HTTP response with extra header lines (each without the line break).
+pub fn http_response_with(status_line: &str, headers: &[&str], body: &str) -> Vec<u8> {
+    let extra: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
+    format!(
+        "HTTP/1.1 {status_line}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .into_bytes()
