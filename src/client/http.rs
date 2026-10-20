@@ -9,6 +9,9 @@
 //! (so the [`mint`](super::mint)/[`transfer`](super::transfer) helpers work
 //! unchanged against live infrastructure).
 
+// the raw failure of one exchange carries the decoded envelope and the status details; it is not a hot path
+#![allow(clippy::result_large_err)]
+
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -681,7 +684,9 @@ impl HttpAggregatorClient {
             Ok(r) => r,
             Err(ureq::Error::Status(status, r)) => {
                 let retry_after = parse_retry_after(r.header("Retry-After"));
-                let body = read_response_raw(r, MAX_ERROR_BODY_BYTES)?;
+                // The status is classified even when the body is oversized or unreadable (an intermediary page):
+                // only a validated matching JSON-RPC envelope adds RPC semantics.
+                let (body, too_large) = read_error_body(r);
                 // a JSON-RPC error may ride on a non-2xx status: keep it typed
                 let rpc = match decode_rpc_envelope(&body, &id) {
                     Err(e @ EnvelopeError::Rpc { .. }) => Some(e),
@@ -692,16 +697,21 @@ impl HttpAggregatorClient {
                     body,
                     rpc,
                     retry_after,
+                    too_large,
                 });
             }
             Err(e) => return Err(transport_failure(&e)),
         };
         if !(200..300).contains(&response.status()) {
+            let status = response.status();
+            let retry_after = parse_retry_after(response.header("Retry-After"));
+            let (body, too_large) = read_error_body(response);
             return Err(RawFailure::Http {
-                status: response.status(),
-                body: read_response_raw(response, MAX_ERROR_BODY_BYTES)?,
+                status,
+                retry_after,
+                body,
                 rpc: None,
-                retry_after: None,
+                too_large,
             });
         }
 
@@ -734,18 +744,93 @@ impl HttpAggregatorClient {
 /// Greatest `Retry-After` the proof wait honors.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
-/// `Retry-After` in delta-seconds form; anything else (a date, garbage, absent) is ignored.
+/// `Retry-After` (RFC 9110 §10.2.3): delay-seconds (all digits, saturating at the cap) or an HTTP-date (the delay is
+/// the date minus the local clock, floored at zero); anything else is ignored. Capped at 60 s.
 fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
-    let digits = value?.trim();
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    // decimal seconds of any length saturate at the cap
-    let seconds: u64 = digits.parse().unwrap_or(u64::MAX);
-    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
+    parse_retry_after_at(value, std::time::SystemTime::now())
 }
 
-/// An overload answer to a proof read: HTTP 503 or 429, JSON-RPC `-32006`, or any
+fn parse_retry_after_at(value: Option<&str>, now: std::time::SystemTime) -> Option<Duration> {
+    let text = value?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.bytes().all(|b| b.is_ascii_digit()) {
+        // decimal seconds of any length saturate at the cap
+        let seconds: u64 = text.parse().unwrap_or(u64::MAX);
+        return Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
+    }
+    let date = std::time::UNIX_EPOCH + Duration::from_secs(parse_http_date(text)?);
+    Some(
+        date.duration_since(now)
+            .unwrap_or_default()
+            .min(MAX_RETRY_AFTER),
+    )
+}
+
+/// The three HTTP-date forms (IMF-fixdate, obsolete RFC 850 and asctime) as seconds since the Unix epoch.
+fn parse_http_date(text: &str) -> Option<u64> {
+    let tokens: Vec<&str> = text
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let month = |m: &str| {
+        [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ]
+        .iter()
+        .position(|x| x.eq_ignore_ascii_case(m))
+        .map(|i| i as i64 + 1)
+    };
+    let (day, mon, year, clock): (i64, i64, i64, &str) = match tokens.as_slice() {
+        // Sun, 06 Nov 1994 08:49:37 GMT
+        [_, d, m, y, t, "GMT"] if y.len() == 4 => (d.parse().ok()?, month(m)?, y.parse().ok()?, t),
+        // Sunday, 06-Nov-94 08:49:37 GMT
+        [_, dmy, t, "GMT"] => {
+            let mut p = dmy.split('-');
+            let (d, m, y) = (p.next()?, p.next()?, p.next()?);
+            let y: i64 = y.parse().ok()?;
+            let year = if y < 100 {
+                if y < 70 {
+                    2000 + y
+                } else {
+                    1900 + y
+                }
+            } else {
+                y
+            };
+            (d.parse().ok()?, month(m)?, year, t)
+        }
+        // Sun Nov  6 08:49:37 1994
+        [_, m, d, t, y] => (d.parse().ok()?, month(m)?, y.parse().ok()?, t),
+        _ => return None,
+    };
+    let mut c = clock.split(':');
+    let (h, mi, sec): (i64, i64, i64) = (
+        c.next()?.parse().ok()?,
+        c.next()?.parse().ok()?,
+        c.next()?.parse().ok()?,
+    );
+    if c.next().is_some()
+        || !(1..=31).contains(&day)
+        || h > 23
+        || mi > 59
+        || sec > 60
+        || year < 1970
+    {
+        return None;
+    }
+    // days from civil (Howard Hinnant)
+    let y = if mon <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (mon + if mon > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + sec).ok()
+}
+
+/// An overload answer to a proof read, or an intermediary timeout/gateway error inside a wait (HTTP 502 or 504): HTTP 503 or 429, JSON-RPC `-32006`, or any
 /// JSON-RPC error whose `data.retryable` is true. Inconclusive, not a failure of the
 /// wait. `Some(retry_after)` when it is one (the header, capped), `None` when not.
 fn retryable_flag(data: &Option<serde_json::Value>) -> bool {
@@ -779,7 +864,7 @@ fn overload_of(failure: &RawFailure) -> Option<Option<Duration>> {
             rpc,
             retry_after,
             ..
-        } if matches!(status, 503 | 429) || rpc.as_ref().is_some_and(rpc_overload) => {
+        } if matches!(status, 502 | 503 | 504 | 429) || rpc.as_ref().is_some_and(rpc_overload) => {
             Some(*retry_after)
         }
         RawFailure::Envelope(e) if rpc_overload(e) => Some(rpc_retry_after(e)),
@@ -807,6 +892,10 @@ fn overload_pause(
 
 fn raw_to_http(e: RawFailure) -> HttpError {
     match e {
+        RawFailure::Http {
+            too_large: Some(limit),
+            ..
+        } => HttpError::ResponseTooLarge { limit },
         RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
         RawFailure::Transport(m) | RawFailure::TimedOut(m) => HttpError::Transport(m),
         RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
@@ -866,8 +955,11 @@ enum RawFailure {
         status: u16,
         body: String,
         rpc: Option<EnvelopeError>,
-        /// The `Retry-After` header in delta-seconds form, if present and parseable.
+        /// The `Retry-After` header (delay-seconds or HTTP-date), if present and parseable.
         retry_after: Option<Duration>,
+        /// The limit when the error body exceeded the bounded error-body reader (the body is then empty): the status
+        /// still classifies the answer, one-shot calls report [`HttpError::ResponseTooLarge`] as before.
+        too_large: Option<usize>,
     },
     Transport(String),
     /// A transport failure caused by a timeout (an `io::ErrorKind::TimedOut` at the
@@ -905,6 +997,15 @@ fn io_failure(error: &std::io::Error) -> RawFailure {
         RawFailure::TimedOut(error.to_string())
     } else {
         RawFailure::Transport(error.to_string())
+    }
+}
+
+/// The bounded body of a non-2xx answer; a body that is too large or unreadable does not hide the status.
+fn read_error_body(response: ureq::Response) -> (String, Option<usize>) {
+    match read_response_raw(response, MAX_ERROR_BODY_BYTES) {
+        Ok(body) => (body, None),
+        Err(RawFailure::TooLarge(limit)) => (String::new(), Some(limit)),
+        Err(_) => (String::new(), None),
     }
 }
 
@@ -1322,6 +1423,10 @@ fn batch_failure_waited(failure: RawFailure, sent_wait_ms: Option<u64>) -> Waite
 fn batch_failure(failure: RawFailure) -> BatchFailure {
     match failure {
         RawFailure::Http { rpc: Some(e), .. } => batch_failure(RawFailure::Envelope(e)),
+        RawFailure::Http {
+            too_large: Some(limit),
+            ..
+        } => BatchFailure::TooLarge { limit },
         RawFailure::Http { status, .. } => BatchFailure::Http { status },
         RawFailure::TimedOut(_) => BatchFailure::Timeout,
         RawFailure::Transport(m) => BatchFailure::Transport(m),
@@ -1571,15 +1676,33 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_is_delta_seconds_saturating_at_the_cap() {
-        let secs = |v: &str| parse_retry_after(Some(v));
+    fn retry_after_is_delta_seconds_or_http_date_capped() {
+        use std::time::UNIX_EPOCH;
+        // 1994-11-06 08:49:37 GMT = 784111777
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let secs = |v: &str| parse_retry_after_at(Some(v), at(784_111_777));
         assert_eq!(secs("3"), Some(Duration::from_secs(3)));
         assert_eq!(secs(" 7 "), Some(Duration::from_secs(7)));
         assert_eq!(secs("0"), Some(Duration::ZERO));
-        assert_eq!(secs("60"), Some(Duration::from_secs(60)));
         assert_eq!(secs("61"), Some(MAX_RETRY_AFTER));
         assert_eq!(secs("99999999999999999999999999"), Some(MAX_RETRY_AFTER));
         assert_eq!(secs(&"9".repeat(400)), Some(MAX_RETRY_AFTER));
+        // the three HTTP-date forms: 10 s ahead, now, in the past, far ahead
+        assert_eq!(
+            secs("Sun, 06 Nov 1994 08:49:47 GMT"),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            secs("Sunday, 06-Nov-94 08:49:47 GMT"),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            secs("Sun Nov  6 08:49:47 1994"),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(secs("Sun, 06 Nov 1994 08:49:37 GMT"), Some(Duration::ZERO));
+        assert_eq!(secs("Sun, 06 Nov 1994 08:00:00 GMT"), Some(Duration::ZERO));
+        assert_eq!(secs("Mon, 07 Nov 1994 08:49:37 GMT"), Some(MAX_RETRY_AFTER));
         for ignored in [
             "",
             " ",
@@ -1588,11 +1711,37 @@ mod tests {
             "1.5",
             "1e3",
             "3 s",
-            "Wed, 21 Oct 2026 07:28:00 GMT",
+            "soon",
+            "Sun, 32 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Foo 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 25:49:37 GMT",
+            "Sun, 06 Nov 1994 08:49:37 PST",
         ] {
             assert_eq!(secs(ignored), None, "{ignored:?}");
         }
         assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn a_gateway_error_status_is_an_intermediary_timeout_not_a_failure() {
+        for status in [502u16, 504] {
+            let http = RawFailure::Http {
+                status,
+                body: String::new(),
+                rpc: None,
+                retry_after: None,
+                too_large: None,
+            };
+            assert_eq!(overload_of(&http), Some(None), "{status}");
+        }
+        let http = RawFailure::Http {
+            status: 501,
+            body: String::new(),
+            rpc: None,
+            retry_after: None,
+            too_large: None,
+        };
+        assert_eq!(overload_of(&http), None);
     }
 
     fn rpc_failure(
@@ -1632,6 +1781,7 @@ mod tests {
                 body: String::new(),
                 rpc: None,
                 retry_after: Some(Duration::from_secs(1)),
+                too_large: None,
             };
             assert_eq!(overload_of(&http), Some(Some(Duration::from_secs(1))));
         }
@@ -1641,6 +1791,7 @@ mod tests {
                 body: String::new(),
                 rpc: None,
                 retry_after: None,
+                too_large: None,
             };
             assert_eq!(overload_of(&http), None);
         }

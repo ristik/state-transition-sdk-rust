@@ -793,3 +793,45 @@ fn the_http_transport_reports_the_wait_it_sent() {
         .unwrap_err();
     assert_eq!(e.sent_wait_ms, None);
 }
+
+// Gateway answer for a batch spanning several shards: HTTP 400 with the unchanged JSON-RPC -32602 body and id
+// (arch-lb-compat §D). The classifier reads the RPC error behind the 400; it is not the "retry without waitMs"
+// malformed_params case, so no second request is made.
+#[test]
+fn a_gateway_http_400_mixed_shard_answer_keeps_its_rpc_classification() {
+    let server = Scripted::start(|_, _| {
+        Reply::error_status(
+            "400 Bad Request",
+            r#"{"code":-32602,"message":"Invalid params","data":{"reason":"invalid_request","detail":"wrong_shard","retryable":false}}"#,
+        )
+    });
+    let ids = batch_ids();
+    let now = clock();
+    let out = get_latest_negotiating_wait(
+        &client(&server.url),
+        &ids,
+        &opts(20_000),
+        &WaitRequest::new(8_000),
+        &now,
+    );
+    assert_eq!((out.requests, out.retried_without_wait), (1, false));
+    assert_eq!(server.count(), 1, "not retried without waitMs");
+    let failure = out.result.unwrap_err().failure;
+    assert!(!is_malformed_params(&failure), "{failure:?}");
+    assert!(
+        matches!(failure, BatchFailure::Rpc { code: -32602, .. }),
+        "{failure:?}"
+    );
+    // and the same through the plain batch call
+    let latest = BatchRequest {
+        state_ids: &ids,
+        state_root: StateRoot::Latest,
+    };
+    let err = client(&server.url)
+        .get_inclusion_proofs(&latest, &opts(20_000))
+        .unwrap_err();
+    assert!(
+        matches!(err, BatchFailure::Rpc { code: -32602, .. }),
+        "{err:?}"
+    );
+}
