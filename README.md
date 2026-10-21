@@ -71,7 +71,7 @@ The SDK handles cryptography and token encoding. Your application manages keys, 
 
 `client::mint` and `client::transfer` submit the transaction, wait for its unicity proof (`InclusionProof` in the API), and return the verified token. The [split example](./examples/split.rs) includes payment verifier setup.
 
-While waiting, the client stops early with `HttpError::StateExpired` or `HttpError::StateUnknown` when the aggregator reports that it dropped the request or does not know it. The same signed request can then be submitted again. See the [API reference](./docs/api-reference.md#1-waiting-for-inclusion-proofs).
+While waiting, the client stops early with `HttpError::StateExpired` or `HttpError::StateUnknown` when the aggregator reports that it dropped the request or does not know it. The same signed request can then be submitted again. The wait uses long polling by default: the aggregator holds each request open while the state is pending, so the proof arrives soon after certification. Servers without long polling are polled at the configured interval. See the [API reference](./docs/api-reference.md#1-waiting-for-inclusion-proofs).
 
 ### Store, send, and receive
 

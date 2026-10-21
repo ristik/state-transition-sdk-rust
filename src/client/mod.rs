@@ -14,16 +14,21 @@ mod http;
 #[cfg(all(test, feature = "http"))]
 pub(crate) use http::conflict_error;
 #[cfg(feature = "http")]
-pub use http::{HttpAggregatorClient, HttpError, SubmitOutcome, DEFAULT_UNKNOWN_GRACE};
+pub use http::{
+    HttpAggregatorClient, HttpError, SubmitOutcome, WaitOptions, WaitOutcome, WaitStats,
+    WaitedLookup, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT, DEFAULT_UNKNOWN_GRACE,
+};
 
 pub use batch::{
-    detail, rpc_code, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
-    InclusionProofBatch, RequestOptions, StateRoot, MAX_BATCH_STATE_IDS, UNCLASSIFIED,
+    detail, get_latest_negotiating_wait, is_malformed_params, rpc_code, wait_on_wire,
+    BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest, InclusionProofBatch,
+    NegotiatedBatch, RequestOptions, StateRoot, WaitRequest, WaitedBatch, WaitedFailure,
+    DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS, MAX_WAIT_MS, UNCLASSIFIED,
 };
 pub use consolidate::{
     AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,
-    ConsolidationOutcome, ConsolidationSummary, IntegrityError, ProofBundle, ProofClient,
-    ProofClientConfig, ProofItem, SequentialExecutor, UnavailableReason, WaveExecutor,
+    ConsolidationOutcome, ConsolidationSummary, IntegrityError, MasterLongPoll, ProofBundle,
+    ProofClient, ProofClientConfig, ProofItem, SequentialExecutor, UnavailableReason, WaveExecutor,
     DEFAULT_TIMEOUT_MS,
 };
 #[cfg(feature = "std")]

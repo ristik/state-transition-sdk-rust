@@ -51,8 +51,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::batch::{
-    detail, rpc_code, BatchAggregatorClient, BatchFailure, BatchRequest, InclusionProofBatch,
-    RequestOptions, StateRoot, MAX_BATCH_STATE_IDS,
+    detail, get_latest_negotiating_wait, rpc_code, BatchAggregatorClient, BatchFailure,
+    BatchRequest, InclusionProofBatch, RequestOptions, StateRoot, WaitRequest,
+    DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS,
 };
 use crate::api::bft::{RootTrustBase, ShardId};
 use crate::api::inclusion_proof::InclusionProof;
@@ -100,6 +101,50 @@ impl Default for ConsolidateOptions {
             cancel: CancelToken::new(),
             master: None,
         }
+    }
+}
+
+/// Opt-in long-poll of the **one master latest request** of an attempt.
+///
+/// Off by default: an attempt is a single fetch with no waiting. Enabled with
+/// [`ProofClient::with_master_long_poll`], the master's latest request asks the
+/// aggregator to hold it (`waitMs`) while the target is pending, bounded by the
+/// attempt's deadline: `wait = floor(max(0, min(preferred, remaining - margin,
+/// max_request - margin)))`. Exact-root peer requests never carry a wait, the
+/// attempt never re-asks, and the single exception is the parser-negotiation
+/// retry (one repeat without the wait on a generic `malformed_params`
+/// rejection), which is counted in [`ConsolidationSummary::requests`]. Repeated
+/// waiting belongs to a caller-side wrapper around the attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasterLongPoll {
+    /// Preferred server-side wait in milliseconds (default 20 000).
+    pub preferred_ms: u64,
+    /// Response margin kept below the call timeout (default 2 000).
+    pub margin_ms: u64,
+    /// Longest a single transport call may last (default 30 000).
+    pub max_request_ms: u64,
+}
+
+impl Default for MasterLongPoll {
+    fn default() -> Self {
+        Self {
+            preferred_ms: 20_000,
+            margin_ms: 2_000,
+            max_request_ms: 30_000,
+        }
+    }
+}
+
+impl MasterLongPoll {
+    /// The `waitMs` for a request with `remaining_ms` left of the attempt, if
+    /// any positive wait fits.
+    pub fn wait_for(&self, remaining_ms: u64) -> Option<u64> {
+        let wait = self
+            .preferred_ms
+            .min(remaining_ms.saturating_sub(self.margin_ms))
+            .min(self.max_request_ms.saturating_sub(self.margin_ms))
+            .min(super::batch::MAX_WAIT_MS);
+        (wait > 0).then_some(wait)
     }
 }
 
@@ -196,6 +241,7 @@ pub struct ProofClient<C, K, X> {
     endpoint_by_shard: Vec<Option<usize>>,
     clock: K,
     executor: X,
+    master_long_poll: Option<MasterLongPoll>,
 }
 
 impl<C, K, X> core::fmt::Debug for ProofClient<C, K, X> {
@@ -267,7 +313,15 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
             endpoint_by_shard,
             clock,
             executor,
+            master_long_poll: None,
         })
+    }
+
+    /// Let the single master latest request of each attempt long-poll (see
+    /// [`MasterLongPoll`]). Without this call an attempt never waits.
+    pub fn with_master_long_poll(mut self, long_poll: MasterLongPoll) -> Self {
+        self.master_long_poll = Some(long_poll);
+        self
     }
 
     /// Use `registry` and `policy` for the complete verification of the input
@@ -459,19 +513,43 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
         root: StateRoot,
         budget: &Budget<'_, K>,
         requests: &AtomicUsize,
+        long_poll: Option<&MasterLongPoll>,
     ) -> Res<InclusionProofBatch> {
         let remaining = budget.check()?;
         let (shard, client) = &endpoints[group.endpoint];
-        requests.fetch_add(1, Ordering::SeqCst);
-        let result = client.get_inclusion_proofs(
-            &BatchRequest {
-                state_ids: &group.ids,
-                state_root: root,
-            },
-            &RequestOptions {
-                timeout_ms: remaining,
-            },
-        );
+        let options = RequestOptions {
+            timeout_ms: remaining,
+        };
+        // Only the master's latest fetch may wait; an exact root never does.
+        let wait = match root {
+            StateRoot::Latest => long_poll.and_then(|lp| lp.wait_for(remaining)),
+            StateRoot::Exact(_) => None,
+        };
+        let result = match wait {
+            Some(wait_ms) => {
+                let wait = WaitRequest::new(wait_ms)
+                    .with_margin_ms(long_poll.map_or(DEFAULT_WAIT_MARGIN_MS, |lp| lp.margin_ms));
+                let negotiated =
+                    get_latest_negotiating_wait(client, &group.ids, &options, &wait, &|| {
+                        budget.clock.now_ms()
+                    });
+                requests.fetch_add(negotiated.requests as usize, Ordering::SeqCst);
+                negotiated
+                    .result
+                    .map(|waited| waited.batch)
+                    .map_err(|failed| failed.failure)
+            }
+            None => {
+                requests.fetch_add(1, Ordering::SeqCst);
+                client.get_inclusion_proofs(
+                    &BatchRequest {
+                        state_ids: &group.ids,
+                        state_root: root,
+                    },
+                    &options,
+                )
+            }
+        };
         // a done attempt never turns a late response into success or a
         // misleading transport error
         let after = budget.check();
@@ -647,7 +725,14 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
 
         // wave 1: the master's latest batch and partition view
         let mg = &groups[mi];
-        let mbatch = Self::fetch(&self.endpoints, mg, StateRoot::Latest, budget, &requests)?;
+        let mbatch = Self::fetch(
+            &self.endpoints,
+            mg,
+            StateRoot::Latest,
+            budget,
+            &requests,
+            self.master_long_poll.as_ref(),
+        )?;
         Self::check_batch(mg, items, &mbatch, None)?;
         let enclosing = &mbatch.proofs[0].proof.unicity_certificate;
         let Some(view) = &mbatch.partition_view else {
@@ -766,6 +851,7 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
                 StateRoot::Exact(job.root),
                 budget,
                 &requests,
+                None,
             );
             if r.is_err() {
                 budget.abort.cancel();

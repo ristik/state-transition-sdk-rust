@@ -18,6 +18,21 @@ The hint is unauthenticated and is used only for control flow and user feedback.
 
 With several aggregator instances behind a load balancer, an instance that did not admit the request may answer `unknown`. After a restart, the in-memory status is empty, so queued requests answer `unknown` until a round picks them up.
 
+### Long polling
+
+`client::mint` and `client::transfer` wait for the proof through `HttpAggregatorClient::get_inclusion_proof`, which by default asks the aggregator to hold each request while the state is pending (`waitMs`). This reduces the number of requests and returns the proof soon after certification. With long polling on, `with_polling(interval, attempts)` sets the polling interval and a total time budget of `interval * attempts` (default 1 s × 15 = 15 s, for both the long-poll and the attempts-loop path). `HttpAggregatorClient::with_long_poll(false)` restores the attempt-based loop, which sends no `waitMs`. The same wait is available directly as `wait_for_inclusion_proof(&state_id, &WaitOptions::new(total))`, with these options:
+
+- The wait never exceeds `total`. Each request asks for at most the preferred wait (`with_preferred_wait`, default 20 s) and leaves a response margin (`with_margin`, default 2 s) within the remaining time and the per-call limit (`with_max_request_timeout`, default 30 s).
+- `WaitOptions::with_long_poll(false)` sends no `waitMs` and polls at the interval (`with_poll_interval`, default the client's interval).
+- An answer without the `waitedMs` echo to a request that asked for a wait means the server does not support long polling; the rest of that call polls at the interval. Nothing is remembered across calls.
+- The echo is unauthenticated and never extends the deadline. The returned proof is unverified, as with `get_inclusion_proof`.
+- `with_unknown_grace` overrides the client's `unknown` grace for this wait. `with_cancel` is checked before every call and during pauses; a call already in flight ends at its own timeout, because a blocking transport cannot be interrupted.
+- A transport-level failure of a proof read inside a wait (refused or reset connection, stale pooled connection, one call timing out inside the budget, truncated response, an interrupted 502/503/504 body) is inconclusive too: plain reads at the interval within the original budget; TLS certificate/hostname failures, invalid URLs and cancellation stay terminal, submissions are never replayed and one-shot calls surface the error. HTTP 502 and 504 inside a wait are inconclusive like an overload (plain reads for the rest of the wait, original budget, no resubmission); the status counts even when the body is not JSON or exceeds the error-body limit, and one-shot calls still return the error. `Retry-After` accepts delay-seconds and HTTP-date, capped at 60 s. A gateway's HTTP 400 for a batch spanning shards keeps its `-32602` classification (not the retry-without-`waitMs` case).
+- An overload answer (HTTP 503 or 429, JSON-RPC `-32006`, or `data.retryable: true`) is not a failure: the wait pauses the larger of the interval and `Retry-After` (at most 60 s) and then sends plain reads without `waitMs`, or fails at once with `HttpError::OverloadTimeout` (the overload as `source`) when that pause does not fit the time left. The same holds for the attempts loop.
+- `wait_for_inclusion_proof_with_stats` also returns request counts (`WaitStats`).
+
+For batches, `BatchAggregatorClient::get_inclusion_proofs_with_wait(&request, &options, &WaitRequest::new(wait_ms))` applies the wait to a latest-root request; it is never sent for an exact root. `get_latest_negotiating_wait` repeats the request once without `waitMs` when a server rejects the unknown field as `malformed_params`. Consolidation waits only when enabled with `ProofClient::with_master_long_poll(MasterLongPoll::default())`, and then only on the master's latest request.
+
 ### Resubmission
 
 A certification request is signed and deterministic, so sending it again is the same request; the aggregator never creates a second leaf for it.

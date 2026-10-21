@@ -9,12 +9,15 @@
 //! (so the [`mint`](super::mint)/[`transfer`](super::transfer) helpers work
 //! unchanged against live infrastructure).
 
+// the raw failure of one exchange carries the decoded envelope and the status details; it is not a hot path
+#![allow(clippy::result_large_err)]
+
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use crate::api::bft::RootTrustBase;
@@ -28,9 +31,15 @@ use crate::cbor::Decoder;
 use super::{
     rpc_code, AggregatorClient, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
     InclusionProofBatch, MembershipStatus, NonInclusionAggregatorClient, RequestOptions, StateRoot,
-    MAX_BATCH_STATE_IDS, UNCLASSIFIED,
+    WaitRequest, WaitedBatch, WaitedFailure, DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS,
+    MAX_WAIT_MS, UNCLASSIFIED,
 };
 use crate::consolidation::PartitionView;
+
+mod wait;
+pub use wait::{
+    WaitOptions, WaitOutcome, WaitStats, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT,
+};
 
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -44,6 +53,20 @@ const RPC_STATE_NOT_FOUND: i64 = -32020;
 const RPC_INCLUSION_PENDING: i64 = -32021;
 const RPC_STATE_INCLUDED: i64 = -32022;
 const RPC_SERVER_BUSY: i64 = -32023;
+
+/// One proof lookup with the long-poll echo (see
+/// [`HttpAggregatorClient::lookup_inclusion_proof_with_wait`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitedLookup {
+    /// The decoded, **unverified** response.
+    pub response: InclusionProofResponse,
+    /// The unauthenticated status hint.
+    pub status: Option<ProofStatus>,
+    /// `waitedMs`, the server's claim of how long it held the request. `None`
+    /// when the response had no echo. Timing metadata only: never evidence about
+    /// the state, never a reason to extend a deadline.
+    pub waited_ms: Option<u64>,
+}
 
 /// Default number of `unknown` status answers tolerated while waiting for a proof
 /// before failing: right after a submission an HA instance that did not admit the
@@ -84,8 +107,10 @@ pub enum HttpError {
     },
     /// The aggregator rejected the certification request (status != SUCCESS).
     Rejected(String),
-    /// Polling for the inclusion proof exceeded the configured attempts.
+    /// Polling for the inclusion proof exceeded the configured attempts or deadline.
     Timeout,
+    /// The caller cancelled the wait.
+    Cancelled,
     /// The aggregator has no certified or pending record for this state id.
     StateNotFound,
     /// The aggregator reports (an unauthenticated hint, see [`ProofStatus`]) that
@@ -118,6 +143,17 @@ pub enum HttpError {
     /// The aggregator's proof admission limit is reached (`-32023`, normally with
     /// HTTP 429). Retry later; nothing is known about the state.
     ServerBusy,
+    /// The wait ended because the aggregator answered a proof read with an overload answer
+    /// (HTTP 503 or 429, `-32006`, or `data.retryable`) and the pause it asks for (the
+    /// larger of the polling interval and `Retry-After`) does not fit the time left of the
+    /// wait: the timeout form of such an answer, failing at once instead of sleeping
+    /// through the deadline. `cause` is the overload error; the request may be retried later.
+    OverloadTimeout {
+        /// The server's `Retry-After` (capped at 60 s), if it sent one.
+        retry_after: Option<Duration>,
+        /// The overload answer.
+        cause: Box<HttpError>,
+    },
 }
 
 impl fmt::Display for HttpError {
@@ -136,6 +172,13 @@ impl fmt::Display for HttpError {
             }
             HttpError::Rejected(s) => write!(f, "certification rejected: {s:?}"),
             HttpError::Timeout => write!(f, "timed out waiting for inclusion proof"),
+            HttpError::OverloadTimeout { retry_after, cause } => write!(
+                f,
+                "timed out waiting for inclusion proof: the aggregator is overloaded or unavailable \
+                 (retry after {} ms) and the pause does not fit the time left: {cause}",
+                retry_after.map_or(0, |d| d.as_millis())
+            ),
+            HttpError::Cancelled => write!(f, "wait cancelled"),
             HttpError::StateNotFound => write!(f, "state is not known to the aggregator"),
             HttpError::ProofOfOtherData => write!(
                 f,
@@ -165,7 +208,14 @@ impl fmt::Display for HttpError {
     }
 }
 
-impl std::error::Error for HttpError {}
+impl std::error::Error for HttpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HttpError::OverloadTimeout { cause, .. } => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// The error for a proof that certifies other data than the submitted request: authenticated
 /// (`StateCertifiedWithOtherData`) only when the proof verifies under `trust_base` for
@@ -189,6 +239,7 @@ pub struct HttpAggregatorClient {
     agent: ureq::Agent,
     poll_interval: Duration,
     poll_attempts: u32,
+    long_poll: bool,
     unknown_grace: u32,
     allow_insecure_http: bool,
 }
@@ -215,6 +266,7 @@ impl fmt::Debug for HttpAggregatorClient {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("poll_interval", &self.poll_interval)
             .field("poll_attempts", &self.poll_attempts)
+            .field("long_poll", &self.long_poll)
             .field("unknown_grace", &self.unknown_grace)
             .field("allow_insecure_http", &self.allow_insecure_http)
             .finish_non_exhaustive()
@@ -233,7 +285,8 @@ impl HttpAggregatorClient {
                 .redirects(0)
                 .build(),
             poll_interval: Duration::from_secs(1),
-            poll_attempts: 60,
+            poll_attempts: 15,
+            long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: false,
         }
@@ -257,7 +310,8 @@ impl HttpAggregatorClient {
                 .redirects(0)
                 .build(),
             poll_interval: Duration::from_secs(1),
-            poll_attempts: 60,
+            poll_attempts: 15,
+            long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: true,
         }
@@ -269,11 +323,30 @@ impl HttpAggregatorClient {
         self
     }
 
-    /// Configure inclusion-proof polling: wait `interval` between up to
-    /// `attempts` probes.
+    /// Configure inclusion-proof waiting: the pause `interval` between probes and an
+    /// overall budget of `interval * attempts` (defaults: 1 s, 15 attempts, 15 s in total).
+    ///
+    /// With long poll on (the default, see [`with_long_poll`](Self::with_long_poll)) the
+    /// budget is a total deadline of [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
+    /// (`interval * attempts`), within which the aggregator may hold each request, so
+    /// far fewer than `attempts` requests are sent; a plain probe keeps the client's full
+    /// request timeout whatever the budget. With long poll off, or a zero budget (zero
+    /// `interval` or `attempts`), it is the classic count: up to `attempts` probes,
+    /// `interval` apart.
     pub fn with_polling(mut self, interval: Duration, attempts: u32) -> Self {
         self.poll_interval = interval;
         self.poll_attempts = attempts;
+        self
+    }
+
+    /// Whether [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof) (and so
+    /// `client::mint` / `client::transfer`) asks the aggregator to hold a request while
+    /// the proof is pending (`waitMs`; default `true`, as in the JS SDK). A server that
+    /// does not echo `waitedMs` is detected on the first answer and polled at the
+    /// configured interval for the rest of the wait, at no more requests than the
+    /// classic poller. `false` sends no `waitMs` and keeps the plain attempts loop.
+    pub fn with_long_poll(mut self, enabled: bool) -> Self {
+        self.long_poll = enabled;
         self
     }
 
@@ -307,6 +380,7 @@ impl HttpAggregatorClient {
                 code,
                 message,
                 data,
+                ..
             })) if is_queue_duplicate(code, &data) => {
                 return Ok(SubmitReply::QueueDuplicate(HttpError::Rpc {
                     code,
@@ -435,14 +509,53 @@ impl HttpAggregatorClient {
             "includeStatus": true,
         });
         let result = self.rpc("get_inclusion_proof.v2", params, &[])?;
-        let (encoded, status) = split_status_result(&result)?;
-        if encoded.len() > MAX_PROOF_HEX_CHARS {
-            return Err(HttpError::ResponseTooLarge {
-                limit: MAX_PROOF_HEX_CHARS,
-            });
+        let parsed = decode_v2_result(&result)?;
+        Ok((parsed.response, parsed.status))
+    }
+
+    /// One proof lookup that asks the aggregator to hold the request for up to
+    /// `wait_ms` milliseconds while the state is pending (`waitMs`), returning the
+    /// echo (`waitedMs`) next to the response and status hint.
+    ///
+    /// A one-shot building block: it never polls or retries. `timeout` is the
+    /// whole call's limit (connection, the server-side wait and the response);
+    /// the wait sent is limited to `timeout - wait.margin_ms` (the request's
+    /// response margin, default [`DEFAULT_WAIT_MARGIN_MS`]).
+    /// A positive `wait_ms` for which no positive wait fits sends no `waitMs` at
+    /// all (an ordinary immediate lookup); a `wait_ms` of zero is sent and asks
+    /// for the echo only. Servers that do not know `waitMs` ignore it and answer
+    /// a plain result: the lookup then succeeds with `waited_ms == None`.
+    ///
+    /// The unauthenticated hint and echo never replace verification of the
+    /// proof.
+    pub fn lookup_inclusion_proof_with_wait(
+        &self,
+        state_id: &StateId,
+        wait: &WaitRequest,
+        timeout: Duration,
+    ) -> Result<WaitedLookup, HttpError> {
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let mut params = serde_json::json!({
+            "stateId": hex::encode(state_id.bytes()),
+            "includeStatus": true,
+        });
+        if let Some(sent) = super::batch::wait_on_wire(wait.wait_ms, timeout_ms, wait.margin_ms) {
+            params["waitMs"] = serde_json::json!(sent);
         }
-        let bytes = hex::decode(encoded).map_err(|e| HttpError::Decode(e.to_string()))?;
-        Ok((decode_inclusion_proof_response(&bytes)?, status))
+        let result = self
+            .rpc_raw(
+                "get_inclusion_proof.v2",
+                params,
+                &[],
+                Some(timeout.max(Duration::from_millis(1))),
+            )
+            .map_err(raw_to_http)?;
+        let parsed = decode_v2_result(&result)?;
+        Ok(WaitedLookup {
+            response: parsed.response,
+            status: parsed.status,
+            waited_ms: parsed.waited_ms,
+        })
     }
 
     /// Determine whether `state_id` is included or absent at a certified root.
@@ -570,34 +683,245 @@ impl HttpAggregatorClient {
         let response = match request.send_string(&body) {
             Ok(r) => r,
             Err(ureq::Error::Status(status, r)) => {
-                let body = read_response_raw(r, MAX_ERROR_BODY_BYTES)?;
+                let retry_after = parse_retry_after(r.header("Retry-After"));
+                // The status is classified even when the body is oversized or unreadable (an intermediary page):
+                // only a validated matching JSON-RPC envelope adds RPC semantics.
+                let (body, too_large, interrupted) = read_error_body(r);
                 // a JSON-RPC error may ride on a non-2xx status: keep it typed
                 let rpc = match decode_rpc_envelope(&body, &id) {
                     Err(e @ EnvelopeError::Rpc { .. }) => Some(e),
                     _ => None,
                 };
-                return Err(RawFailure::Http { status, body, rpc });
+                return Err(RawFailure::Http {
+                    status,
+                    body,
+                    rpc,
+                    retry_after,
+                    too_large,
+                    interrupted,
+                });
             }
-            Err(e) => return Err(RawFailure::Transport(e.to_string())),
+            Err(e) => return Err(transport_failure(&e)),
         };
         if !(200..300).contains(&response.status()) {
+            let status = response.status();
+            let retry_after = parse_retry_after(response.header("Retry-After"));
+            let (body, too_large, interrupted) = read_error_body(response);
             return Err(RawFailure::Http {
-                status: response.status(),
-                body: read_response_raw(response, MAX_ERROR_BODY_BYTES)?,
+                status,
+                retry_after,
+                body,
                 rpc: None,
+                too_large,
+                interrupted,
             });
         }
 
+        let retry_after = parse_retry_after(response.header("Retry-After"));
         let text = read_response_raw(response, MAX_RESPONSE_BODY_BYTES)?;
-        decode_rpc_envelope(&text, &id).map_err(RawFailure::Envelope)
+        decode_rpc_envelope(&text, &id).map_err(|e| {
+            RawFailure::Envelope(match e {
+                EnvelopeError::Rpc {
+                    code,
+                    message,
+                    data,
+                    ..
+                } => EnvelopeError::Rpc {
+                    code,
+                    message,
+                    data,
+                    retry_after,
+                },
+                EnvelopeError::NullIdRpc { code, data, .. } => EnvelopeError::NullIdRpc {
+                    code,
+                    data,
+                    retry_after,
+                },
+                other => other,
+            })
+        })
     }
+}
+
+/// Greatest `Retry-After` the proof wait honors.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// `Retry-After` (RFC 9110 §10.2.3): delay-seconds (all digits, saturating at the cap) or an HTTP-date (the delay is
+/// the date minus the local clock, floored at zero); anything else is ignored. Capped at 60 s.
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    parse_retry_after_at(value, std::time::SystemTime::now())
+}
+
+fn parse_retry_after_at(value: Option<&str>, now: std::time::SystemTime) -> Option<Duration> {
+    let text = value?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.bytes().all(|b| b.is_ascii_digit()) {
+        // decimal seconds of any length saturate at the cap
+        let seconds: u64 = text.parse().unwrap_or(u64::MAX);
+        return Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
+    }
+    let date = std::time::UNIX_EPOCH + Duration::from_secs(parse_http_date(text)?);
+    Some(
+        date.duration_since(now)
+            .unwrap_or_default()
+            .min(MAX_RETRY_AFTER),
+    )
+}
+
+/// The three HTTP-date forms (IMF-fixdate, obsolete RFC 850 and asctime) as seconds since the Unix epoch.
+fn parse_http_date(text: &str) -> Option<u64> {
+    let tokens: Vec<&str> = text
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let month = |m: &str| {
+        [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ]
+        .iter()
+        .position(|x| x.eq_ignore_ascii_case(m))
+        .map(|i| i as i64 + 1)
+    };
+    // exactly `digits` ASCII digits
+    let num = |t: &str, digits: usize| -> Option<i64> {
+        (t.len() == digits && t.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| t.parse().ok())
+            .flatten()
+    };
+    let (day, mon, year, clock): (i64, i64, i64, &str) = match tokens.as_slice() {
+        // Sun, 06 Nov 1994 08:49:37 GMT
+        [_, d, m, y, t, "GMT"] => (num(d, 2)?, month(m)?, num(y, 4)?, t),
+        // Sunday, 06-Nov-94 08:49:37 GMT
+        [_, dmy, t, "GMT"] => {
+            let mut p = dmy.split('-');
+            let (d, m, y) = (p.next()?, p.next()?, p.next()?);
+            if p.next().is_some() {
+                return None;
+            }
+            let y = num(y, 2)?;
+            (
+                num(d, 2)?,
+                month(m)?,
+                if y < 70 { 2000 + y } else { 1900 + y },
+                t,
+            )
+        }
+        // Sun Nov  6 08:49:37 1994
+        [_, m, d, t, y] => (num(d, d.len().min(2))?, month(m)?, num(y, 4)?, t),
+        _ => return None,
+    };
+    let mut c = clock.split(':');
+    let (h, mi, sec) = (num(c.next()?, 2)?, num(c.next()?, 2)?, num(c.next()?, 2)?);
+    if c.next().is_some() || h > 23 || mi > 59 || sec > 60 || !(1970..=9999).contains(&year) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match mon {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    // days from civil (Howard Hinnant), checked
+    let y = if mon <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (mon + if mon > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(h * 3600 + mi * 60 + sec)?;
+    u64::try_from(seconds).ok()
+}
+
+/// An overload answer to a proof read, or an intermediary timeout/gateway error inside a wait (HTTP 502 or 504): HTTP 503 or 429, JSON-RPC `-32006`, or any
+/// JSON-RPC error whose `data.retryable` is true. Inconclusive, not a failure of the
+/// wait. `Some(retry_after)` when it is one (the header, capped), `None` when not.
+fn retryable_flag(data: &Option<serde_json::Value>) -> bool {
+    data.as_ref()
+        .and_then(|d| d.get("retryable"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
+fn overload_of(failure: &RawFailure) -> Option<Option<Duration>> {
+    // classified before pending / not-found / unknown: any code with `data.retryable: true` is an overload
+    let rpc_overload = |e: &EnvelopeError| match e {
+        EnvelopeError::Rpc { code, data, .. } => {
+            *code == rpc_code::CONCURRENCY_LIMIT || retryable_flag(data)
+        }
+        EnvelopeError::NullIdRpc { code, data, .. } => {
+            *code == rpc_code::CONCURRENCY_LIMIT || retryable_flag(data)
+        }
+        EnvelopeError::Decode(_) => false,
+    };
+    // Retry-After of the HTTP response, whatever its status (on a non-2xx it rides on the failure itself)
+    let rpc_retry_after = |e: &EnvelopeError| match e {
+        EnvelopeError::Rpc { retry_after, .. } | EnvelopeError::NullIdRpc { retry_after, .. } => {
+            *retry_after
+        }
+        EnvelopeError::Decode(_) => None,
+    };
+    match failure {
+        RawFailure::Http {
+            status,
+            rpc,
+            retry_after,
+            ..
+        } if matches!(status, 502 | 503 | 504 | 429) || rpc.as_ref().is_some_and(rpc_overload) => {
+            Some(*retry_after)
+        }
+        RawFailure::Envelope(e) if rpc_overload(e) => Some(rpc_retry_after(e)),
+        _ => None,
+    }
+}
+
+/// The pause after an overload answer, or the error that ends the wait now because the pause
+/// does not fit the `left` budget.
+fn overload_pause(
+    failure: RawFailure,
+    retry_after: Option<Duration>,
+    interval: Duration,
+    left: Duration,
+) -> Result<Duration, HttpError> {
+    let pause = interval.max(retry_after.unwrap_or_default());
+    if pause > left {
+        return Err(HttpError::OverloadTimeout {
+            retry_after,
+            cause: Box::new(raw_to_http(failure)),
+        });
+    }
+    Ok(pause)
 }
 
 fn raw_to_http(e: RawFailure) -> HttpError {
     match e {
+        RawFailure::Http {
+            too_large: Some(limit),
+            ..
+        } => HttpError::ResponseTooLarge { limit },
+        RawFailure::Http {
+            interrupted: Some(cut),
+            ..
+        } if matches!(*cut, RawFailure::TimedOut(_)) => raw_to_http(*cut),
         RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
-        RawFailure::Transport(m) => HttpError::Transport(m),
+        RawFailure::Transport(m) | RawFailure::TimedOut(m) | RawFailure::Fatal(m) => {
+            HttpError::Transport(m)
+        }
         RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
+        // unchanged for everything but the overload decision: an answer to no request of ours
+        RawFailure::Envelope(EnvelopeError::NullIdRpc { .. }) => {
+            HttpError::Decode(NULL_ID_MESSAGE.to_string())
+        }
         RawFailure::Envelope(EnvelopeError::Rpc { code, message, .. }) => {
             HttpError::Rpc { code, message }
         }
@@ -650,11 +974,83 @@ enum RawFailure {
         status: u16,
         body: String,
         rpc: Option<EnvelopeError>,
+        /// The `Retry-After` header (delay-seconds or HTTP-date), if present and parseable.
+        retry_after: Option<Duration>,
+        /// The limit when the error body exceeded the bounded error-body reader (the body is then empty): the status
+        /// still classifies the answer, one-shot calls report [`HttpError::ResponseTooLarge`] as before.
+        too_large: Option<usize>,
+        /// The failure that cut the body short (a timeout, reset or early EOF while it was read). The status still
+        /// classifies the answer; one-shot calls report a timeout as the timeout it was.
+        interrupted: Option<Box<RawFailure>>,
     },
     Transport(String),
+    /// A transport failure no retry can fix: TLS certificate or hostname validation, an invalid URL, scheme or proxy.
+    Fatal(String),
+    /// A transport failure caused by a timeout (an `io::ErrorKind::TimedOut` at the
+    /// root of the error chain).
+    TimedOut(String),
     Envelope(EnvelopeError),
     TooLarge(usize),
     Config(HttpError),
+}
+
+fn is_timeout_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Classify a ureq transport error by walking its source chain to an
+/// `io::Error`, not by its text.
+fn transport_failure(error: &ureq::Error) -> RawFailure {
+    if let ureq::Error::Transport(t) = error {
+        use ureq::ErrorKind::{
+            InvalidProxyUrl, InvalidUrl, ProxyUnauthorized, TooManyRedirects, UnknownScheme,
+        };
+        if matches!(
+            t.kind(),
+            InvalidUrl | UnknownScheme | InvalidProxyUrl | ProxyUnauthorized | TooManyRedirects
+        ) {
+            return RawFailure::Fatal(error.to_string());
+        }
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = source {
+        // TLS certificate / hostname validation: no retry can fix it
+        if format!("{e:?}").contains("InvalidCertificate") {
+            return RawFailure::Fatal(error.to_string());
+        }
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if is_timeout_kind(io.kind()) {
+                return RawFailure::TimedOut(error.to_string());
+            }
+        }
+        source = e.source();
+    }
+    RawFailure::Transport(error.to_string())
+}
+
+fn io_failure(error: &std::io::Error) -> RawFailure {
+    if is_timeout_kind(error.kind()) {
+        RawFailure::TimedOut(error.to_string())
+    } else {
+        RawFailure::Transport(error.to_string())
+    }
+}
+
+/// The bounded body of a non-2xx answer, with how it ended. A body that is too large, not valid text, or cut short
+/// (timeout, reset, early EOF) never hides the status: the interruption is recorded and each caller decides by its own
+/// terminal state (a wait: cancellation and a spent deadline win, otherwise the status stands).
+fn read_error_body(response: ureq::Response) -> (String, Option<usize>, Option<Box<RawFailure>>) {
+    match read_response_raw(response, MAX_ERROR_BODY_BYTES) {
+        Ok(body) => (body, None, None),
+        Err(RawFailure::TooLarge(limit)) => (String::new(), Some(limit), None),
+        Err(e @ (RawFailure::TimedOut(_) | RawFailure::Transport(_))) => {
+            (String::new(), None, Some(Box::new(e)))
+        }
+        Err(_) => (String::new(), None, None),
+    }
 }
 
 fn read_response_raw(response: ureq::Response, limit: usize) -> Result<String, RawFailure> {
@@ -663,7 +1059,7 @@ fn read_response_raw(response: ureq::Response, limit: usize) -> Result<String, R
         .into_reader()
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| RawFailure::Transport(e.to_string()))?;
+        .map_err(|e| io_failure(&e))?;
     if bytes.len() > limit {
         return Err(RawFailure::TooLarge(limit));
     }
@@ -677,8 +1073,20 @@ enum EnvelopeError {
         code: i64,
         message: String,
         data: Option<serde_json::Value>,
+        /// `Retry-After` of the HTTP response that carried the error (set on a 2xx response).
+        retry_after: Option<Duration>,
+    },
+    /// An error answer whose id is `null`: a server that rejects a request before parsing it (aggregator-go's
+    /// server-wide concurrency limit) cannot echo the id. It answers no request of ours, so it is a protocol error
+    /// (`Decode`) for everything except an overload, which [`overload_of`] recognizes.
+    NullIdRpc {
+        code: i64,
+        data: Option<serde_json::Value>,
+        retry_after: Option<Duration>,
     },
 }
+
+const NULL_ID_MESSAGE: &str = "invalid or missing JSON-RPC id";
 
 fn decode_rpc_envelope(text: &str, expected_id: &str) -> Result<serde_json::Value, EnvelopeError> {
     let decode = |m: &str| EnvelopeError::Decode(m.to_string());
@@ -689,6 +1097,20 @@ fn decode_rpc_envelope(text: &str, expected_id: &str) -> Result<serde_json::Valu
         .ok_or_else(|| decode("JSON-RPC response must be an object"))?;
     if object.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
         return Err(decode("invalid or missing JSON-RPC version"));
+    }
+    if object.get("id").is_some_and(serde_json::Value::is_null) && object.get("result").is_none() {
+        if let Some(error) = object.get("error") {
+            if let (Some(code), Some(_)) = (
+                error.get("code").and_then(|v| v.as_i64()),
+                error.get("message").and_then(|v| v.as_str()),
+            ) {
+                return Err(EnvelopeError::NullIdRpc {
+                    code,
+                    data: error.get("data").cloned(),
+                    retry_after: None,
+                });
+            }
+        }
     }
     let response_id = object
         .get("id")
@@ -714,6 +1136,7 @@ fn decode_rpc_envelope(text: &str, expected_id: &str) -> Result<serde_json::Valu
                 code,
                 message: message.to_string(),
                 data: error.get("data").cloned(),
+                retry_after: None,
             })
         }
         (None, None) => Err(decode(
@@ -727,6 +1150,7 @@ fn decode_rpc_response(text: &str, expected_id: &str) -> Result<serde_json::Valu
     decode_rpc_envelope(text, expected_id).map_err(|e| match e {
         EnvelopeError::Decode(m) => HttpError::Decode(m),
         EnvelopeError::Rpc { code, message, .. } => HttpError::Rpc { code, message },
+        EnvelopeError::NullIdRpc { .. } => HttpError::Decode(NULL_ID_MESSAGE.to_string()),
     })
 }
 
@@ -763,6 +1187,14 @@ impl AggregatorClient for HttpAggregatorClient {
 
     /// Wait for the certified proof of `state_id`.
     ///
+    /// By default (long poll on, [`with_long_poll`](HttpAggregatorClient::with_long_poll))
+    /// this is [`wait_for_inclusion_proof`](HttpAggregatorClient::wait_for_inclusion_proof)
+    /// with the total deadline `interval * attempts` of
+    /// [`with_polling`](HttpAggregatorClient::with_polling), the client's interval and
+    /// unknown grace: the aggregator holds each request while the proof is pending, and a
+    /// server that does not echo `waitedMs` is polled at the interval. With long poll off
+    /// it is the attempts loop described below, sending no `waitMs`.
+    ///
     /// Asks for the aggregator's status hint (`includeStatus`) and accepts both
     /// result shapes: a plain string (legacy server) behaves exactly as before.
     /// While the response is not a certified proof: `pending` (or no status)
@@ -774,14 +1206,45 @@ impl AggregatorClient for HttpAggregatorClient {
     /// The status is an unauthenticated hint: a certified proof is returned
     /// whatever the status says, and the caller must still verify it.
     fn get_inclusion_proof(&self, state_id: &StateId) -> Result<InclusionProof, HttpError> {
+        // A zero budget (no pause between probes, or no attempts) has nothing to hold a
+        // request for: the classic loop below sends exactly the probes it always did.
+        let total = self.poll_interval.saturating_mul(self.poll_attempts);
+        if self.long_poll && !total.is_zero() {
+            return self.wait_for_inclusion_proof(
+                state_id,
+                &WaitOptions::new(total).keep_plain_request_timeout(),
+            );
+        }
         let params = serde_json::json!({
             "stateId": hex::encode(state_id.bytes()),
             "includeStatus": true,
         });
         let mut unknown_seen = 0u32;
 
+        let started = Instant::now();
+        let budget = self.poll_interval.saturating_mul(self.poll_attempts);
         for attempt in 0..self.poll_attempts {
-            let result = match self.rpc("get_inclusion_proof.v2", params.clone(), &[]) {
+            let raw = self.rpc_raw("get_inclusion_proof.v2", params.clone(), &[], None);
+            // an overload answer is inconclusive: pause max(interval, Retry-After), or fail at once
+            if let Some(retry_after) = raw.as_ref().err().and_then(overload_of) {
+                let left = budget.saturating_sub(started.elapsed());
+                if let Err(failure) = raw {
+                    let pause = overload_pause(failure, retry_after, self.poll_interval, left)?;
+                    std::thread::sleep(pause);
+                }
+                continue;
+            }
+            // a transport-level failure of a proof read inside the wait is inconclusive too (TLS validation, invalid
+            // URLs and configuration errors are other variants and stay terminal)
+            if matches!(raw, Err(RawFailure::Transport(_) | RawFailure::TimedOut(_))) {
+                if let Err(failure) = raw {
+                    let left = budget.saturating_sub(started.elapsed());
+                    let pause = overload_pause(failure, None, self.poll_interval, left)?;
+                    std::thread::sleep(pause);
+                }
+                continue;
+            }
+            let result = match raw.map_err(raw_to_http) {
                 Ok(result) => result,
                 Err(HttpError::Rpc { code, .. }) if code == RPC_INCLUSION_PENDING => {
                     if attempt + 1 < self.poll_attempts {
@@ -797,13 +1260,9 @@ impl AggregatorClient for HttpAggregatorClient {
                 }
                 Err(error) => return Err(error),
             };
-            let (encoded, status) = split_status_result(&result)?;
-            if encoded.len() > MAX_PROOF_HEX_CHARS {
-                return Err(HttpError::ResponseTooLarge {
-                    limit: MAX_PROOF_HEX_CHARS,
-                });
-            }
-            let bytes = hex::decode(encoded).map_err(|e| HttpError::Decode(e.to_string()))?;
+            let V2Result {
+                response, status, ..
+            } = decode_v2_result(&result)?;
 
             // A response carrying no proof on this method means the leaf is not
             // certified yet. `get_inclusion_proof.v2` never answers with a
@@ -811,7 +1270,7 @@ impl AggregatorClient for HttpAggregatorClient {
             // uncertified response is unambiguous and is aggregator-go's way of
             // reporting pending. The status hint, when present, refines that into
             // "keep waiting" / "will never be certified here".
-            match decode_inclusion_proof_response(&bytes)? {
+            match response {
                 InclusionProofResponse::Certified { proof, .. } => return Ok(proof),
                 InclusionProofResponse::NotCertified { .. } => match status {
                     Some(ProofStatus::Expired) => return Err(HttpError::StateExpired),
@@ -834,26 +1293,58 @@ impl AggregatorClient for HttpAggregatorClient {
     }
 }
 
-/// Split a `get_inclusion_proof.v2` result into the proof hex and the optional
-/// status hint: a string is the legacy result, an object is `{proof, status}`.
-fn split_status_result(
-    result: &serde_json::Value,
-) -> Result<(&str, Option<ProofStatus>), HttpError> {
-    if let Some(s) = result.as_str() {
-        return Ok((s, None));
+/// A decoded `get_inclusion_proof.v2` result.
+struct V2Result {
+    response: InclusionProofResponse,
+    status: Option<ProofStatus>,
+    waited_ms: Option<u64>,
+}
+
+/// Decode a `get_inclusion_proof.v2` result: a string is the legacy result, an
+/// object is `{proof, status?, waitedMs?}`. A present `waitedMs` must be a plain
+/// non-negative safe integer; anything else is a protocol error. Unknown object
+/// fields stay ignored, as before.
+fn decode_v2_result(result: &serde_json::Value) -> Result<V2Result, HttpError> {
+    let (encoded, status, waited_ms) = if let Some(s) = result.as_str() {
+        (s, None, None)
+    } else {
+        let object = result
+            .as_object()
+            .ok_or_else(|| HttpError::Decode("expected hex string".to_string()))?;
+        let proof = object
+            .get("proof")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| HttpError::Decode("status result lacks a proof string".to_string()))?;
+        let status = object
+            .get("status")
+            .and_then(|v| v.as_str())
+            .and_then(ProofStatus::from_wire);
+        let waited_ms = match object.get("waitedMs") {
+            None => None,
+            Some(v) => Some(parse_waited_ms(v).map_err(HttpError::Decode)?),
+        };
+        (proof, status, waited_ms)
+    };
+    if encoded.len() > MAX_PROOF_HEX_CHARS {
+        return Err(HttpError::ResponseTooLarge {
+            limit: MAX_PROOF_HEX_CHARS,
+        });
     }
-    let object = result
-        .as_object()
-        .ok_or_else(|| HttpError::Decode("expected hex string".to_string()))?;
-    let proof = object
-        .get("proof")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| HttpError::Decode("status result lacks a proof string".to_string()))?;
-    let status = object
-        .get("status")
-        .and_then(|v| v.as_str())
-        .and_then(ProofStatus::from_wire);
-    Ok((proof, status))
+    let bytes = hex::decode(encoded).map_err(|e| HttpError::Decode(e.to_string()))?;
+    Ok(V2Result {
+        response: decode_inclusion_proof_response(&bytes)?,
+        status,
+        waited_ms,
+    })
+}
+
+/// A `waitedMs` echo: a JSON integer in `[0, 2^53 - 1]`. Floats (`1.0`, `1e3`),
+/// negatives, strings, null and overflow are all rejected.
+fn parse_waited_ms(value: &serde_json::Value) -> Result<u64, String> {
+    value
+        .as_u64()
+        .filter(|v| *v <= MAX_WAIT_MS)
+        .ok_or_else(|| "malformed waitedMs".to_string())
 }
 
 impl NonInclusionAggregatorClient for HttpAggregatorClient {
@@ -888,12 +1379,15 @@ impl NonInclusionAggregatorClient for HttpAggregatorClient {
     }
 }
 
-impl BatchAggregatorClient for HttpAggregatorClient {
-    fn get_inclusion_proofs(
+impl HttpAggregatorClient {
+    /// One `get_inclusion_proofs.v1` call, optionally with `waitMs`.
+    #[allow(clippy::result_large_err)]
+    fn batch_call(
         &self,
         request: &BatchRequest<'_>,
         options: &RequestOptions,
-    ) -> Result<InclusionProofBatch, BatchFailure> {
+        wait: Option<&WaitRequest>,
+    ) -> Result<WaitedBatch, WaitedFailure> {
         let ids = request.state_ids;
         if ids.is_empty() || ids.len() > MAX_BATCH_STATE_IDS {
             return Err(BatchFailure::Rpc {
@@ -903,16 +1397,26 @@ impl BatchAggregatorClient for HttpAggregatorClient {
                 detail: Some("state_count".to_string()),
                 retryable: Some(false),
                 indexes: BTreeMap::new(),
-            });
+            }
+            .into());
         }
         let state_root = match request.state_root {
             StateRoot::Latest => "latest".to_string(),
             StateRoot::Exact(root) => hex::encode(root),
         };
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "stateIds": ids.iter().map(|s| hex::encode(s.bytes())).collect::<Vec<_>>(),
             "stateRoot": state_root,
         });
+        // Never on an exact root: the server rejects that combination.
+        let mut sent_wait_ms = None;
+        if let (StateRoot::Latest, Some(wait)) = (request.state_root, wait) {
+            sent_wait_ms =
+                super::batch::wait_on_wire(wait.wait_ms, options.timeout_ms, wait.margin_ms);
+            if let Some(sent) = sent_wait_ms {
+                params["waitMs"] = serde_json::json!(sent);
+            }
+        }
         let result = self
             .rpc_raw(
                 "get_inclusion_proofs.v1",
@@ -920,24 +1424,81 @@ impl BatchAggregatorClient for HttpAggregatorClient {
                 &[],
                 Some(Duration::from_millis(options.timeout_ms.max(1))),
             )
-            .map_err(batch_failure)?;
-        decode_batch_result(&result)
+            .map_err(|f| batch_failure_waited(f, sent_wait_ms))?;
+        let (batch, waited_ms) =
+            decode_batch_result(&result).map_err(|f| WaitedFailure::new(f, None, sent_wait_ms))?;
+        Ok(WaitedBatch::new(batch, waited_ms, sent_wait_ms))
+    }
+}
+
+impl BatchAggregatorClient for HttpAggregatorClient {
+    fn get_inclusion_proofs(
+        &self,
+        request: &BatchRequest<'_>,
+        options: &RequestOptions,
+    ) -> Result<InclusionProofBatch, BatchFailure> {
+        self.batch_call(request, options, None)
+            .map(|waited| waited.batch)
+            .map_err(|e| e.failure)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_inclusion_proofs_with_wait(
+        &self,
+        request: &BatchRequest<'_>,
+        options: &RequestOptions,
+        wait: &WaitRequest,
+    ) -> Result<WaitedBatch, WaitedFailure> {
+        self.batch_call(request, options, Some(wait))
+    }
+}
+
+/// [`batch_failure`] plus `error.data.waitedMs`. A malformed echo is a protocol
+/// error (and carries no echo).
+fn batch_failure_waited(failure: RawFailure, sent_wait_ms: Option<u64>) -> WaitedFailure {
+    let echo = match &failure {
+        RawFailure::Http {
+            rpc: Some(EnvelopeError::Rpc { data, .. }),
+            ..
+        }
+        | RawFailure::Envelope(EnvelopeError::Rpc { data, .. }) => {
+            data.as_ref().and_then(|d| d.get("waitedMs")).cloned()
+        }
+        _ => None,
+    };
+    let failure = batch_failure(failure);
+    match echo.as_ref().map(parse_waited_ms) {
+        None => WaitedFailure::new(failure, None, sent_wait_ms),
+        Some(Ok(ms)) => WaitedFailure::new(failure, Some(ms), sent_wait_ms),
+        Some(Err(m)) => WaitedFailure::new(BatchFailure::Decode(m), None, sent_wait_ms),
     }
 }
 
 fn batch_failure(failure: RawFailure) -> BatchFailure {
     match failure {
         RawFailure::Http { rpc: Some(e), .. } => batch_failure(RawFailure::Envelope(e)),
+        RawFailure::Http {
+            interrupted: Some(cut),
+            ..
+        } if matches!(*cut, RawFailure::TimedOut(_)) => BatchFailure::Timeout,
+        RawFailure::Http {
+            too_large: Some(limit),
+            ..
+        } => BatchFailure::TooLarge { limit },
         RawFailure::Http { status, .. } => BatchFailure::Http { status },
-        RawFailure::Transport(m) if m.contains("timed out") => BatchFailure::Timeout,
-        RawFailure::Transport(m) => BatchFailure::Transport(m),
+        RawFailure::TimedOut(_) => BatchFailure::Timeout,
+        RawFailure::Transport(m) | RawFailure::Fatal(m) => BatchFailure::Transport(m),
         RawFailure::TooLarge(limit) => BatchFailure::TooLarge { limit },
         RawFailure::Config(e) => BatchFailure::Transport(e.to_string()),
         RawFailure::Envelope(EnvelopeError::Decode(m)) => BatchFailure::Decode(m),
+        RawFailure::Envelope(EnvelopeError::NullIdRpc { .. }) => {
+            BatchFailure::Decode(NULL_ID_MESSAGE.to_string())
+        }
         RawFailure::Envelope(EnvelopeError::Rpc {
             code,
             message,
             data,
+            ..
         }) => {
             let text = |k: &str| {
                 data.as_ref()
@@ -985,15 +1546,25 @@ fn parse_indexes(value: &serde_json::Value) -> BTreeMap<String, Vec<usize>> {
     }
 }
 
-/// Decode `{"proofs": [<hex CBOR>...], "partitionView": <hex CBOR>?}`.
-fn decode_batch_result(result: &serde_json::Value) -> Result<InclusionProofBatch, BatchFailure> {
+/// Decode `{"proofs": [<hex CBOR>...], "partitionView": <hex CBOR>?, "waitedMs": n?}`
+/// into the batch and the optional echo.
+fn decode_batch_result(
+    result: &serde_json::Value,
+) -> Result<(InclusionProofBatch, Option<u64>), BatchFailure> {
     let bad = |m: &str| BatchFailure::Decode(m.to_string());
     let object = result
         .as_object()
         .ok_or_else(|| bad("batch result must be an object"))?;
-    if object.keys().any(|k| k != "proofs" && k != "partitionView") {
+    if object
+        .keys()
+        .any(|k| k != "proofs" && k != "partitionView" && k != "waitedMs")
+    {
         return Err(bad("unknown field in batch result"));
     }
+    let waited_ms = match object.get("waitedMs") {
+        None => None,
+        Some(v) => Some(parse_waited_ms(v).map_err(BatchFailure::Decode)?),
+    };
     let hex_field = |v: &serde_json::Value| -> Result<Vec<u8>, BatchFailure> {
         let s = v.as_str().ok_or_else(|| bad("expected a hex string"))?;
         if s.len() > MAX_PROOF_HEX_CHARS {
@@ -1032,10 +1603,13 @@ fn decode_batch_result(result: &serde_json::Value) -> Result<InclusionProofBatch
                 .map_err(|e| BatchFailure::Decode(e.to_string()))?,
         ),
     };
-    Ok(InclusionProofBatch {
-        proofs,
-        partition_view,
-    })
+    Ok((
+        InclusionProofBatch {
+            proofs,
+            partition_view,
+        },
+        waited_ms,
+    ))
 }
 
 /// A random JSON-RPC request id.
@@ -1157,5 +1731,178 @@ mod tests {
         assert!(decode_non_inclusion_proof_response(&one).is_err());
         let two = encode_array(&[encode_uint(1).as_slice(), encode_uint(2).as_slice()]);
         assert!(decode_non_inclusion_proof_response(&two).is_err());
+    }
+
+    #[test]
+    fn retry_after_is_delta_seconds_or_http_date_capped() {
+        use std::time::UNIX_EPOCH;
+        // 1994-11-06 08:49:37 GMT = 784111777
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let secs = |v: &str| parse_retry_after_at(Some(v), at(784_111_777));
+        assert_eq!(secs("3"), Some(Duration::from_secs(3)));
+        assert_eq!(secs(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(secs("0"), Some(Duration::ZERO));
+        assert_eq!(secs("61"), Some(MAX_RETRY_AFTER));
+        assert_eq!(secs("99999999999999999999999999"), Some(MAX_RETRY_AFTER));
+        assert_eq!(secs(&"9".repeat(400)), Some(MAX_RETRY_AFTER));
+        // the three HTTP-date forms: 10 s ahead, now, in the past, far ahead
+        assert_eq!(
+            secs("Sun, 06 Nov 1994 08:49:47 GMT"),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            secs("Sunday, 06-Nov-94 08:49:47 GMT"),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            secs("Sun Nov  6 08:49:47 1994"),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(secs("Sun, 06 Nov 1994 08:49:37 GMT"), Some(Duration::ZERO));
+        assert_eq!(secs("Sun, 06 Nov 1994 08:00:00 GMT"), Some(Duration::ZERO));
+        assert_eq!(secs("Mon, 07 Nov 1994 08:49:37 GMT"), Some(MAX_RETRY_AFTER));
+        // far future (year 9999) is capped, never overflows
+        assert_eq!(secs("Fri, 31 Dec 9999 23:59:59 GMT"), Some(MAX_RETRY_AFTER));
+        assert_eq!(
+            secs("Sun, 29 Feb 1996 08:50:00 GMT"),
+            Some(Duration::from_secs(60))
+        );
+        for ignored in [
+            "Sunday, 06-Nov-9223372036854775807 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 99999999999999",
+            "Sun, 06 Nov 10000 08:49:37 GMT",
+            "Sun, 06 Nov 1969 08:49:37 GMT",
+            "Sun, 31 Feb 1994 08:49:37 GMT",
+            "Sun, 29 Feb 1995 08:49:37 GMT",
+            "Sun, 31 Apr 1994 08:49:37 GMT",
+            "Sun, 00 Nov 1994 08:49:37 GMT",
+            "",
+            " ",
+            "+5",
+            "-1",
+            "1.5",
+            "1e3",
+            "3 s",
+            "soon",
+            "Sun, 32 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Foo 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 25:49:37 GMT",
+            "Sun, 06 Nov 1994 08:49:37 PST",
+        ] {
+            assert_eq!(secs(ignored), None, "{ignored:?}");
+        }
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn a_gateway_error_status_is_an_intermediary_timeout_not_a_failure() {
+        for status in [502u16, 504] {
+            let http = RawFailure::Http {
+                status,
+                body: String::new(),
+                rpc: None,
+                retry_after: None,
+                too_large: None,
+                interrupted: None,
+            };
+            assert_eq!(overload_of(&http), Some(None), "{status}");
+        }
+        let http = RawFailure::Http {
+            status: 501,
+            body: String::new(),
+            rpc: None,
+            retry_after: None,
+            too_large: None,
+            interrupted: None,
+        };
+        assert_eq!(overload_of(&http), None);
+    }
+
+    fn rpc_failure(
+        code: i64,
+        data: Option<serde_json::Value>,
+        retry_after: Option<u64>,
+    ) -> RawFailure {
+        RawFailure::Envelope(EnvelopeError::Rpc {
+            code,
+            message: String::new(),
+            data,
+            retry_after: retry_after.map(Duration::from_secs),
+        })
+    }
+
+    #[test]
+    fn overload_is_classified_before_pending_and_unknown() {
+        let retryable = Some(serde_json::json!({"retryable": true}));
+        for code in [RPC_INCLUSION_PENDING, RPC_STATE_NOT_FOUND, -32099, -1] {
+            assert_eq!(
+                overload_of(&rpc_failure(code, retryable.clone(), Some(2))),
+                Some(Some(Duration::from_secs(2))),
+                "{code}"
+            );
+            let not_retryable = Some(serde_json::json!({"retryable": false}));
+            assert_eq!(
+                overload_of(&rpc_failure(code, not_retryable, None)),
+                None,
+                "{code}"
+            );
+            assert_eq!(overload_of(&rpc_failure(code, None, None)), None, "{code}");
+        }
+        assert_eq!(overload_of(&rpc_failure(-32006, None, None)), Some(None));
+        for status in [503u16, 429] {
+            let http = RawFailure::Http {
+                status,
+                body: String::new(),
+                rpc: None,
+                retry_after: Some(Duration::from_secs(1)),
+                too_large: None,
+                interrupted: None,
+            };
+            assert_eq!(overload_of(&http), Some(Some(Duration::from_secs(1))));
+        }
+        for status in [500u16, 404, 400] {
+            let http = RawFailure::Http {
+                status,
+                body: String::new(),
+                rpc: None,
+                retry_after: None,
+                too_large: None,
+                interrupted: None,
+            };
+            assert_eq!(overload_of(&http), None);
+        }
+    }
+
+    #[test]
+    fn the_overload_pause_is_the_larger_of_interval_and_retry_after_and_must_fit() {
+        let ms = Duration::from_millis;
+        let failure = || rpc_failure(-32006, None, None);
+        // the interval when there is no Retry-After or a smaller one
+        assert_eq!(
+            overload_pause(failure(), None, ms(100), ms(1000)).unwrap(),
+            ms(100)
+        );
+        assert_eq!(
+            overload_pause(failure(), Some(ms(50)), ms(100), ms(1000)).unwrap(),
+            ms(100)
+        );
+        // Retry-After when larger, up to exactly what is left
+        assert_eq!(
+            overload_pause(failure(), Some(ms(700)), ms(100), ms(1000)).unwrap(),
+            ms(700)
+        );
+        assert_eq!(
+            overload_pause(failure(), Some(ms(1000)), ms(100), ms(1000)).unwrap(),
+            ms(1000)
+        );
+        // beyond what is left: the timeout form, the overload as cause
+        match overload_pause(failure(), Some(ms(1001)), ms(100), ms(1000)) {
+            Err(HttpError::OverloadTimeout { retry_after, cause }) => {
+                assert_eq!(retry_after, Some(ms(1001)));
+                assert!(matches!(*cause, HttpError::Rpc { code: -32006, .. }));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(overload_pause(failure(), None, ms(100), ms(99)).is_err());
     }
 }

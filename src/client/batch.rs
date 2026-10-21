@@ -19,6 +19,10 @@ use crate::consolidation::PartitionView;
 /// Maximum number of distinct state ids in one batch request (server limit).
 pub const MAX_BATCH_STATE_IDS: usize = 256;
 
+/// Largest value of `waitMs` / `waitedMs` on the wire: 2^53 - 1, the
+/// interoperable safe-integer range.
+pub const MAX_WAIT_MS: u64 = 9_007_199_254_740_991;
+
 /// JSON-RPC error codes of `get_inclusion_proofs.v1`.
 pub mod rpc_code {
     /// Invalid request envelope.
@@ -100,6 +104,112 @@ pub struct InclusionProofBatch {
     pub partition_view: Option<PartitionView>,
 }
 
+/// Default response margin kept between a sent `waitMs` and the call timeout.
+pub const DEFAULT_WAIT_MARGIN_MS: u64 = 2_000;
+
+/// A long-poll request: how long to ask the aggregator to hold the request and
+/// the response margin the **call timeout** must keep beyond it (rev-3 section 10:
+/// the per-request timeout exceeds the sent wait by the margin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WaitRequest {
+    /// Requested wait in milliseconds; zero asks for the echo only.
+    pub wait_ms: u64,
+    /// Margin between the sent wait and the call timeout, in milliseconds.
+    pub margin_ms: u64,
+}
+
+impl WaitRequest {
+    /// Ask for `wait_ms` with the default margin ([`DEFAULT_WAIT_MARGIN_MS`]).
+    pub fn new(wait_ms: u64) -> Self {
+        Self {
+            wait_ms,
+            margin_ms: DEFAULT_WAIT_MARGIN_MS,
+        }
+    }
+
+    /// Use another response margin.
+    pub fn with_margin_ms(mut self, margin_ms: u64) -> Self {
+        self.margin_ms = margin_ms;
+        self
+    }
+}
+
+/// A decoded batch response together with the long-poll echo.
+///
+/// `waited_ms` is **unauthenticated timing metadata**: the server's claim of how
+/// long it held the request. It is `None` when the response carried no echo (a
+/// server without long-poll support, or a request that did not ask for one) and
+/// is never evidence about the proofs, which are verified on their own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WaitedBatch {
+    /// The batch itself.
+    pub batch: InclusionProofBatch,
+    /// `result.waitedMs`, when present.
+    pub waited_ms: Option<u64>,
+    /// The `waitMs` the transport actually put on the wire; `None` when it sent
+    /// none (the default implementation, an exact root, or no positive wait fit).
+    pub sent_wait_ms: Option<u64>,
+}
+
+impl WaitedBatch {
+    /// A batch with its echo and the wait that was really sent.
+    pub fn new(
+        batch: InclusionProofBatch,
+        waited_ms: Option<u64>,
+        sent_wait_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            batch,
+            waited_ms,
+            sent_wait_ms,
+        }
+    }
+}
+
+/// A failed [`BatchAggregatorClient::get_inclusion_proofs_with_wait`] call with
+/// the long-poll echo of the error, if any (`error.data.waitedMs`).
+///
+/// Kept beside [`BatchFailure`] instead of inside it so existing code that
+/// builds or matches `BatchFailure::Rpc` keeps compiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WaitedFailure {
+    /// The typed failure.
+    pub failure: BatchFailure,
+    /// `error.data.waitedMs`, when present on a handled error.
+    pub waited_ms: Option<u64>,
+    /// The `waitMs` the transport actually put on the wire, if any.
+    pub sent_wait_ms: Option<u64>,
+}
+
+impl WaitedFailure {
+    /// A failure with its echo and the wait that was really sent.
+    pub fn new(failure: BatchFailure, waited_ms: Option<u64>, sent_wait_ms: Option<u64>) -> Self {
+        Self {
+            failure,
+            waited_ms,
+            sent_wait_ms,
+        }
+    }
+}
+
+impl From<BatchFailure> for WaitedFailure {
+    /// A failure of a call that sent no wait and saw no echo.
+    fn from(failure: BatchFailure) -> Self {
+        WaitedFailure::new(failure, None, None)
+    }
+}
+
+impl fmt::Display for WaitedFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.failure.fmt(f)
+    }
+}
+
+impl core::error::Error for WaitedFailure {}
+
 /// A typed transport/server failure of one batch call. Orchestration classifies
 /// it; transports must not guess whether it means "unavailable".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,4 +288,133 @@ pub trait BatchAggregatorClient: AggregatorClient {
         request: &BatchRequest<'_>,
         options: &RequestOptions,
     ) -> Result<InclusionProofBatch, BatchFailure>;
+
+    /// [`get_inclusion_proofs`](Self::get_inclusion_proofs) asking the aggregator
+    /// to hold a **latest** request for up to `wait.wait_ms` milliseconds while
+    /// every missing state is still pending (`waitMs`; zero asks for the echo only).
+    ///
+    /// The default implementation does not know the extension: it sends no wait,
+    /// reports no echo (`sent_wait_ms == None`) and behaves exactly like the plain
+    /// call. Transports that
+    /// support it must never send `waitMs` for [`StateRoot::Exact`] (the server
+    /// rejects that combination), must apply `options.timeout_ms` to the whole
+    /// call, keep `wait.margin_ms` between the sent wait and that timeout (see
+    /// [`wait_on_wire`]), report what they sent in `sent_wait_ms` and reject a
+    /// malformed echo as
+    /// [`BatchFailure::Decode`]. It does not retry; see
+    /// [`get_latest_negotiating_wait`] for the parser-compatibility retry.
+    #[allow(clippy::result_large_err)]
+    fn get_inclusion_proofs_with_wait(
+        &self,
+        request: &BatchRequest<'_>,
+        options: &RequestOptions,
+        wait: &WaitRequest,
+    ) -> Result<WaitedBatch, WaitedFailure> {
+        let _ = wait;
+        self.get_inclusion_proofs(request, options)
+            .map(|batch| WaitedBatch::new(batch, None, None))
+            .map_err(WaitedFailure::from)
+    }
+}
+
+/// The `waitMs` a transport puts on a request whose whole call may last
+/// `timeout_ms`: zero stays zero (echo only); a positive wait is limited to
+/// `timeout_ms - margin_ms` and is `None` (not sent) when nothing positive fits.
+pub fn wait_on_wire(wait_ms: u64, timeout_ms: u64, margin_ms: u64) -> Option<u64> {
+    if wait_ms == 0 {
+        return Some(0);
+    }
+    let sent = wait_ms
+        .min(MAX_WAIT_MS)
+        .min(timeout_ms.saturating_sub(margin_ms));
+    (sent > 0).then_some(sent)
+}
+
+/// Whether `failure` is the generic strict-parser rejection (`-32602`,
+/// `invalid_request`, `malformed_params`) that an endpoint without `waitMs`
+/// support answers to a batch carrying it. The field name is not part of the
+/// response, so this is the only signal there is.
+pub fn is_malformed_params(failure: &BatchFailure) -> bool {
+    matches!(
+        failure,
+        BatchFailure::Rpc { code, reason, detail, .. }
+            if *code == rpc_code::INVALID_PARAMS
+                && reason.as_deref() == Some("invalid_request")
+                && detail.as_deref() == Some("malformed_params")
+    )
+}
+
+/// The result of [`get_latest_negotiating_wait`]: the outcome plus accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegotiatedBatch {
+    /// The outcome of the last request made.
+    pub result: Result<WaitedBatch, WaitedFailure>,
+    /// Requests made: 1, or 2 after a parser-negotiation retry.
+    pub requests: u32,
+    /// Whether the retry without `waitMs` happened. The caller should then omit
+    /// the wait for the rest of its operation.
+    pub retried_without_wait: bool,
+}
+
+/// One **latest** batch request with `waitMs`, plus at most one retry without it.
+///
+/// If the endpoint answers with the generic `-32602 invalid_request
+/// malformed_params` error (a strict batch parser that does not know `waitMs`),
+/// (and carries no `waitedMs` echo) the identical request is repeated once without the wait; its outcome, success
+/// or error, is final. No other failure is retried, and other parameters are
+/// untouched. `options.timeout_ms` is the caller's remaining deadline: the retry
+/// gets what is left of it by `elapsed_ms`, never a fresh budget. When nothing is
+/// left the first error is returned.
+///
+/// `now_ms` is a monotonic millisecond clock (the caller's, so `no_std` hosts
+/// can supply their own).
+pub fn get_latest_negotiating_wait<C: BatchAggregatorClient + ?Sized>(
+    client: &C,
+    state_ids: &[StateId],
+    options: &RequestOptions,
+    wait: &WaitRequest,
+    now_ms: &dyn Fn() -> u64,
+) -> NegotiatedBatch {
+    let request = BatchRequest {
+        state_ids,
+        state_root: StateRoot::Latest,
+    };
+    let started = now_ms();
+    let first = client.get_inclusion_proofs_with_wait(&request, options, wait);
+    // When the transport reports that no wait went on the wire the retry would
+    // repeat the identical request: there is nothing to negotiate.
+    let sent_wait = match &first {
+        Ok(ok) => ok.sent_wait_ms.is_some(),
+        Err(e) => e.sent_wait_ms.is_some(),
+    };
+    // A `waitedMs` echo on the error means the server understood `waitMs`: the
+    // rejection is about something else and a retry without the wait can not help.
+    let rejected = sent_wait
+        && matches!(&first, Err(e) if is_malformed_params(&e.failure) && e.waited_ms.is_none());
+    if !rejected {
+        return NegotiatedBatch {
+            result: first,
+            requests: 1,
+            retried_without_wait: false,
+        };
+    }
+    let left = options
+        .timeout_ms
+        .saturating_sub(now_ms().saturating_sub(started));
+    if left == 0 {
+        return NegotiatedBatch {
+            result: first,
+            requests: 1,
+            retried_without_wait: false,
+        };
+    }
+    let second = client
+        .get_inclusion_proofs(&request, &RequestOptions { timeout_ms: left })
+        .map(|batch| WaitedBatch::new(batch, None, None))
+        .map_err(WaitedFailure::from);
+    NegotiatedBatch {
+        result: second,
+        requests: 2,
+        retried_without_wait: true,
+    }
 }
