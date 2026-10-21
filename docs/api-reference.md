@@ -71,3 +71,39 @@ Results:
 Status details from the shards map to `UnavailableReason::StatePending` (retryable), `StateExpired`, `StateUnknown` and `StateNotInRoot` (not retryable).
 
 Examples: `examples/consolidate_for_bridge.rs` and `examples/consolidate_for_zkvm.rs`. Planning and checked reconstruction (`consolidation::{ShardRouter, outer_proofs, rebuild_token, ..}`) are `no_std + alloc`.
+
+## 5. Non-inclusion Proofs
+
+> Non-inclusion proves absence only at the authenticated snapshot returned by verification. It does not prove absence now, continuous absence, or that a token can be spent. Compare the snapshot’s network and root round (or its certified seal timestamp under your application’s time policy) with an independently trusted requirement. The seal timestamp is a consensus-certified time, not proof of real-time freshness. Do not use unverified response metadata for this check.
+
+`AggregatorClient::get_non_inclusion_proof(&state_id)` fetches a proof; it is unverified.
+
+`NonInclusionProof::verify_at_snapshot(&trust_base, &context)` (also `verify_for_at_snapshot` for a directly decoded proof, and `verify::verify_non_inclusion_at_snapshot` / `verify_non_inclusion_in` for explicit sessions) authenticates the unicity certificate before it returns anything: shape, trusted network, authority and epoch interval, quorum, the aggregation partition, the shard and partition commitments together with the optional pins of the `NonInclusionContext`, the query binding and the full state-tree relation. The result is:
+
+- `Ok(NonInclusionOutcome::AbsentAtSnapshot { state_id, snapshot })`: the path proves the key absent.
+- `Ok(NonInclusionOutcome::IncludedAtSnapshot { state_id, snapshot })`: the path proves that exact key present.
+- `Err(VerificationError)`: rejected; no snapshot metadata.
+
+`NonInclusionSnapshot` exposes `network_id`, `partition_id`, `shard_id`, `root_round`, `seal_timestamp_seconds` (Unix seconds), `root_epoch`, `shard_round`, `shard_epoch` and `state_root` (`None` for the certified empty tree). All values are read from the authenticated certificate, not from the RPC block number or the time of receipt. The snapshot owns copies of its data.
+
+There is no freshness option. Freshness is the application's decision on the returned snapshot, against a checkpoint obtained independently of the proof and the server response:
+
+```rust
+// `checkpoint` is obtained independently of the proof and of the server response.
+let outcome = proof.verify_at_snapshot(&trust_base, &NonInclusionContext::new())?;
+let NonInclusionOutcome::AbsentAtSnapshot { snapshot, .. } = outcome else {
+    return Err("no verified absence".into());
+};
+if snapshot.network_id().id() != checkpoint.network_id
+    || snapshot.root_round() < checkpoint.required_root_round
+{
+    return Err("snapshot does not meet application policy".into());
+}
+// Absence at `snapshot` only; any spend or finality decision needs its own policy.
+```
+
+`NonInclusionContext::new()` expects the unsharded partition, where the certificate's shard is the empty shard; this matches the Go verifier with an empty `Shard`. For a sharded partition, pin the served shard with `NonInclusionContext::new().with_shard(shard)`. The certificate's shard ID and complete shard path must then be that shard's, and the query and terminal must belong to it. Because the certificate is authenticated first, a rejection reflects the certificate before the path is examined.
+
+`NonInclusionProof::for_state` only records which state ID a proof was requested for. It is request bookkeeping, not evidence.
+
+`HttpError::StateIncluded` reports the server's claim that the state is included. The claim is unauthenticated; request an inclusion proof and verify it.

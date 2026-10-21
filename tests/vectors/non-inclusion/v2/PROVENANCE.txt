@@ -1,0 +1,3 @@
+Vendored byte for byte from aggregator-go branch non-inclusion @ 02263dd (testdata/non-inclusion/v2, generator commit dd52a67 recorded in manifest.json). Corpus files are unchanged since 13496d4 (Go #252 final head); manifest.json only records the new bft-core / bft-go-base module pins.
+manifest.json lists the SHA-256 of every file (checked by tests/non_inclusion_corpus.rs).
+Schema 2: snapshot outcomes, fixed partition 7, no freshness verdict. Replaces v1.

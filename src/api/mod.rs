@@ -36,7 +36,7 @@ pub use inclusion_proof::InclusionProof;
 pub use inclusion_proof_response::InclusionProofResponse;
 pub use leaf_value::calculate_leaf_value;
 pub use network_id::NetworkId;
-pub use non_inclusion_certificate::NonInclusionCertificate;
+pub use non_inclusion_certificate::{NonInclusionCertificate, PathRelation};
 pub use non_inclusion_proof::NonInclusionProof;
 pub use proof_status::ProofStatus;
 pub use state_id::StateId;

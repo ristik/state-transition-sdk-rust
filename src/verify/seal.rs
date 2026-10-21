@@ -62,9 +62,12 @@ pub trait SealAuthenticator {
 
     /// [`authenticate_seal`](Self::authenticate_seal) under an immutable caller
     /// policy (for example the partition and pinned configuration hashes a view
-    /// is authenticated for). An authenticator that remembers verdicts must
-    /// namespace them by `policy`; the default ignores it, which is only right
-    /// for authenticators that do not memoize.
+    /// is authenticated for). An authenticator that remembers verdicts must key
+    /// each by everything it depends on: a signature-only verdict by the complete
+    /// seal and the authority; anything evaluated under `policy` also by `policy`;
+    /// strict per-call checks (network, epoch, position) are never memoized. The
+    /// default ignores `policy`, which is only right for authenticators that do
+    /// not memoize.
     fn authenticate_seal_under(
         &mut self,
         seal: &UnicitySeal,
@@ -176,12 +179,17 @@ impl<'a> SealSession<'a> {
         id
     }
 
-    fn key(seal: &UnicitySeal, policy: &[u8; 32]) -> [u8; 32] {
+    /// Memo key of the signature verdict: the complete seal encoding. The verdict
+    /// "this exact seal carries a quorum of valid signatures of *this session's*
+    /// authority" does not depend on any caller policy, so one verification serves
+    /// every policy; all policy-dependent rules (network, epoch, position, body,
+    /// pins) are evaluated by the callers each time or kept in the policy-keyed
+    /// body memo.
+    fn key(seal: &UnicitySeal) -> [u8; 32] {
         let encoded = seal.to_cbor();
         let digest = DataHasher::new(HashAlgorithm::Sha256)
             .expect("sha256")
             .update(MEMO_DOMAIN)
-            .update(policy)
             .update(&(encoded.len() as u64).to_be_bytes())
             .update(&encoded)
             .finalize();
@@ -199,18 +207,21 @@ impl<'a> SealSession<'a> {
         self.verify_quorum_under(seal, &[0; 32])
     }
 
-    /// [`verify_quorum`](Self::verify_quorum) with the memo namespaced by an
-    /// immutable policy digest: a verdict reached under one policy is never
-    /// reused under another.
+    /// [`verify_quorum`](Self::verify_quorum) for a caller that evaluates under an
+    /// immutable `policy`. The signature verdict is a property of the complete
+    /// seal and this session's authority only, so it is shared by all policies
+    /// (the total number of native quorum verifications is the number of distinct
+    /// seals); the policy-dependent verdicts of whole certificates stay namespaced
+    /// by it in the body memo.
     pub fn verify_quorum_under(
         &mut self,
         seal: &UnicitySeal,
-        policy: &[u8; 32],
+        _policy: &[u8; 32],
     ) -> Result<(), VerificationError> {
         // an unsafe authority (no validators, zero threshold, ...) never yields
         // or caches a success
         self.ensure_trust_base()?;
-        let key = Self::key(seal, policy);
+        let key = Self::key(seal);
         let hash = u64::from_le_bytes(key[..8].try_into().expect("8 bytes"));
         if self.memo.contains(hash, |k| k == &key) {
             self.stats.memo_hits += 1;
@@ -452,6 +463,51 @@ mod tests {
         let mut work = QuorumWork::default();
         let ok = quorum_met_counted(tb, seal, &mut work).is_ok();
         (ok, work)
+    }
+
+    /// The signature verdict is a property of the complete seal and the session's
+    /// authority: one native verification per distinct seal, whatever the policy that
+    /// asks; a different witness, a failure and another authority are never covered.
+    #[test]
+    fn signature_verdicts_are_shared_across_policies_but_nothing_looser() {
+        let signers = signers(4);
+        let tb = trust_base(&signers, 3);
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = (0..3)
+            .map(|i| (format!("n{i}"), sign(&signers[i], &seal)))
+            .collect();
+
+        let mut session = SealSession::new(&tb);
+        let (p1, p2) = ([1u8; 32], [2u8; 32]);
+        session.verify_quorum(&seal).unwrap(); // zero policy: input evidence
+        session.verify_quorum_under(&seal, &p1).unwrap(); // a view / direct target
+        session.verify_quorum_under(&seal, &p2).unwrap();
+        let s = session.stats();
+        assert_eq!((s.quorum_checks, s.memo_hits), (1, 2));
+        assert_eq!(session.authenticate_seal_under(&seal, &p1), Ok(()));
+        assert_eq!(session.stats().quorum_checks, 1);
+
+        // another witness for the same unsigned seal is another seal
+        let mut other = seal.clone();
+        other
+            .signatures
+            .push(("n3".into(), sign(&signers[3], &seal)));
+        session.verify_quorum_under(&other, &p1).unwrap();
+        assert_eq!(session.stats().quorum_checks, 2);
+
+        // failures are never remembered
+        let mut bad = seal.clone();
+        bad.signatures.truncate(2);
+        for _ in 0..2 {
+            assert!(session.verify_quorum_under(&bad, &p1).is_err());
+        }
+        assert_eq!(session.stats().quorum_checks, 4);
+
+        // another authority never inherits a verdict (the memo belongs to the session)
+        let other_tb = trust_base(&signers, 4);
+        let mut fresh = SealSession::new(&other_tb);
+        assert!(fresh.verify_quorum_under(&seal, &p1).is_err());
+        assert_eq!(fresh.stats().quorum_checks, 1);
     }
 
     #[test]

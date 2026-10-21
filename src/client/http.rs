@@ -43,6 +43,7 @@ const MAX_PROOF_HEX_CHARS: usize = MAX_RESPONSE_BODY_BYTES - 1024;
 const RPC_STATE_NOT_FOUND: i64 = -32020;
 const RPC_INCLUSION_PENDING: i64 = -32021;
 const RPC_STATE_INCLUDED: i64 = -32022;
+const RPC_SERVER_BUSY: i64 = -32023;
 
 /// Default number of `unknown` status answers tolerated while waiting for a proof
 /// before failing: right after a submission an HA instance that did not admit the
@@ -114,6 +115,9 @@ pub enum HttpError {
     CertifiedStateUnavailable,
     /// The requested state is present at the certified root.
     StateIncluded,
+    /// The aggregator's proof admission limit is reached (`-32023`, normally with
+    /// HTTP 429). Retry later; nothing is known about the state.
+    ServerBusy,
 }
 
 impl fmt::Display for HttpError {
@@ -125,6 +129,7 @@ impl fmt::Display for HttpError {
             HttpError::Rpc { code, message } => {
                 write!(f, "json-rpc error {code}: {message:?}")
             }
+            HttpError::ServerBusy => write!(f, "aggregator is busy; retry later"),
             HttpError::Decode(m) => write!(f, "decode error: {m}"),
             HttpError::ResponseTooLarge { limit } => {
                 write!(f, "response exceeds {limit} byte limit")
@@ -446,7 +451,17 @@ impl HttpAggregatorClient {
     /// RPC, while an included state triggers an inclusion-proof lookup after the
     /// non-inclusion endpoint reports that the relation is false. The two RPCs
     /// are not an atomic read if the certified root advances between them; each
-    /// returned proof authenticates the root it carries.
+    /// returned proof speaks only about the root it carries, once verified.
+    ///
+    /// The result is unverified: verify an `Absent` proof with
+    /// [`NonInclusionProof::verify_at_snapshot`] and judge the returned snapshot yourself.
+    ///
+    /// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+    /// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+    /// snapshot’s network and root round (or its certified seal timestamp under your application's
+    /// time policy) with an independently trusted requirement. The seal timestamp is a
+    /// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+    /// metadata for this check.**
     pub fn membership_status(&self, state_id: &StateId) -> Result<MembershipStatus, HttpError> {
         match NonInclusionAggregatorClient::get_non_inclusion_proof(self, state_id) {
             Ok(proof) => Ok(MembershipStatus::Absent(proof)),
@@ -496,6 +511,30 @@ impl HttpAggregatorClient {
     ) -> Result<serde_json::Value, HttpError> {
         self.rpc_raw(method, params, headers, None)
             .map_err(raw_to_http)
+    }
+
+    /// [`rpc`](Self::rpc) for methods whose protocol errors ride on any HTTP status:
+    /// a non-2xx response whose body is a valid JSON-RPC error envelope (version,
+    /// matching id, exclusive error) is the typed [`HttpError::Rpc`], whatever the
+    /// status (the rugregator answers `-32020` with 404 and `-32023` with 429, and
+    /// other servers answer the same codes with 200). A non-2xx response that is
+    /// not such an envelope - a proxy's HTML 404, an unrelated JSON body, a wrong id
+    /// or version - stays an [`HttpError::Http`]: it says nothing about the
+    /// proof service.
+    fn rpc_enveloped(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> Result<serde_json::Value, HttpError> {
+        self.rpc_raw(method, params, headers, None)
+            .map_err(|failure| match failure {
+                RawFailure::Http {
+                    rpc: Some(EnvelopeError::Rpc { code, message, .. }),
+                    ..
+                } => HttpError::Rpc { code, message },
+                other => raw_to_http(other),
+            })
     }
 
     /// One JSON-RPC call with an optional per-request timeout, keeping the
@@ -820,14 +859,18 @@ fn split_status_result(
 impl NonInclusionAggregatorClient for HttpAggregatorClient {
     fn get_non_inclusion_proof(&self, state_id: &StateId) -> Result<NonInclusionProof, HttpError> {
         let params = serde_json::json!({ "stateId": hex::encode(state_id.bytes()) });
-        let result = match self.rpc("get_non_inclusion_proof.v1", params, &[]) {
+        let result = match self.rpc_enveloped("get_non_inclusion_proof.v1", params, &[]) {
             Ok(result) => result,
-            Err(HttpError::Http { status: 404, .. }) => {
+            Err(HttpError::Rpc { code, .. }) if code == RPC_STATE_NOT_FOUND => {
                 return Err(HttpError::CertifiedStateUnavailable)
             }
             Err(HttpError::Rpc { code, .. }) if code == RPC_STATE_INCLUDED => {
                 return Err(HttpError::StateIncluded)
             }
+            Err(HttpError::Rpc { code, .. }) if code == RPC_SERVER_BUSY => {
+                return Err(HttpError::ServerBusy)
+            }
+            // anything else - other codes, bare HTTP errors - is reported as it is
             Err(error) => return Err(error),
         };
         let encoded = result

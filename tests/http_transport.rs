@@ -505,6 +505,138 @@ fn non_inclusion_lookup_maps_false_relation_and_missing_root() {
     ));
 }
 
+fn rpc_error_body(code: i64) -> String {
+    format!(r#"{{"jsonrpc":"2.0","id":"1","error":{{"code":{code},"message":"m"}}}}"#)
+}
+
+/// The protocol error is the RPC envelope's code, whatever the HTTP status carrying
+/// it; a bare HTTP error says nothing about the proof service.
+#[test]
+fn non_inclusion_errors_are_the_rpc_code_on_any_http_status() {
+    let (_, data) = fixture_proof_and_data();
+    let state_id = StateId::derive(data.lock_script(), data.source_state_hash());
+    let lookup = |reply: Vec<u8>| {
+        let server = MockServer::start(vec![reply]);
+        let out = client(&server.url).get_non_inclusion_proof(&state_id);
+        assert_eq!(server.request_count(), 1);
+        out
+    };
+
+    // -32020: unavailable in HTTP 200 as well as 404
+    for status in ["200 OK", "404 Not Found"] {
+        assert!(
+            matches!(
+                lookup(http_response(status, &rpc_error_body(-32020))),
+                Err(HttpError::CertifiedStateUnavailable)
+            ),
+            "{status}"
+        );
+    }
+    // -32022: included, in 200 and 404
+    for status in ["200 OK", "404 Not Found"] {
+        assert!(
+            matches!(
+                lookup(http_response(status, &rpc_error_body(-32022))),
+                Err(HttpError::StateIncluded)
+            ),
+            "{status}"
+        );
+    }
+    // -32023: busy on 429 (and wherever else it is sent)
+    for status in ["429 Too Many Requests", "200 OK", "503 Service Unavailable"] {
+        assert!(
+            matches!(
+                lookup(http_response(status, &rpc_error_body(-32023))),
+                Err(HttpError::ServerBusy)
+            ),
+            "{status}"
+        );
+    }
+    // unknown codes are preserved with their code, on any status
+    for status in [
+        "200 OK",
+        "404 Not Found",
+        "429 Too Many Requests",
+        "500 Internal Server Error",
+    ] {
+        match lookup(http_response(status, &rpc_error_body(-32602))) {
+            Err(HttpError::Rpc { code, message }) => {
+                assert_eq!((code, message.as_str()), (-32602, "m"), "{status}")
+            }
+            other => panic!("{status}: {other:?}"),
+        }
+    }
+    match lookup(http_response("200 OK", &rpc_error_body(-32999))) {
+        Err(HttpError::Rpc { code: -32999, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+
+    // a bare proxy error is not an answer of the proof service
+    for (status, body) in [
+        ("404 Not Found", "<html>404 page not found</html>"),
+        ("404 Not Found", ""),
+        ("404 Not Found", r#"{"error":"not found"}"#),
+        ("429 Too Many Requests", "slow down"),
+        ("502 Bad Gateway", "<html>bad gateway</html>"),
+    ] {
+        match lookup(http_response(status, body)) {
+            Err(HttpError::Http { status: got, .. }) => {
+                assert_eq!(got.to_string(), status[..3], "{status} {body}")
+            }
+            other => panic!("{status} {body:?}: {other:?}"),
+        }
+    }
+    // envelopes that fail validation are not trusted on an error status either: wrong
+    // version, no id, a result next to the error, a non-object error
+    for body in [
+        r#"{"jsonrpc":"1.0","id":"1","error":{"code":-32020,"message":"m"}}"#,
+        r#"{"jsonrpc":"2.0","error":{"code":-32020,"message":"m"}}"#,
+        r#"{"jsonrpc":"2.0","id":"1","result":"00","error":{"code":-32020,"message":"m"}}"#,
+        r#"{"jsonrpc":"2.0","id":"1","error":"not found"}"#,
+        r#"{"jsonrpc":"2.0","id":"1","error":{"code":"-32020","message":"m"}}"#,
+        r#"[{"jsonrpc":"2.0","id":"1","error":{"code":-32020,"message":"m"}}]"#,
+    ] {
+        for status in ["404 Not Found", "429 Too Many Requests"] {
+            assert!(
+                matches!(
+                    lookup(http_response(status, body)),
+                    Err(HttpError::Http { .. })
+                ),
+                "{status} {body}"
+            );
+        }
+        // the same on a 200 is a decode error, never a protocol answer
+        assert!(
+            matches!(
+                lookup(http_response("200 OK", body)),
+                Err(HttpError::Decode(_))
+            ),
+            "{body}"
+        );
+    }
+
+    // and the convenience lookup surfaces them without a second request
+    for (reply, busy) in [
+        (
+            http_response("429 Too Many Requests", &rpc_error_body(-32023)),
+            true,
+        ),
+        (http_response("200 OK", &rpc_error_body(-32020)), false),
+    ] {
+        let server = MockServer::start(vec![reply]);
+        let out = client(&server.url).membership_status(&state_id);
+        assert_eq!(server.request_count(), 1);
+        if busy {
+            assert!(matches!(out, Err(HttpError::ServerBusy)), "{out:?}");
+        } else {
+            assert!(
+                matches!(out, Err(HttpError::CertifiedStateUnavailable)),
+                "{out:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn get_non_inclusion_proof_rejects_malformed_result() {
     let (_, data) = fixture_proof_and_data();

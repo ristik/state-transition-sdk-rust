@@ -482,18 +482,18 @@ fn rebuilt_tree_and_assembled_certificates_equal_the_reference() {
         // all derived certificates share the master seal: one quorum check suffices
         let stats = session.stats();
         assert_eq!(stats.quorum_checks, 1, "{n} shards");
-        // plain (policy-less) authentication is its own namespace: one more check,
-        // then every shared copy of the master seal is a hit
+        // plain (policy-less) authentication reuses the signature verdict of the same
+        // complete seal: every shared copy of the master seal is a hit
         for sc in &ucs {
             let uc = sc.certificate.as_ref().unwrap();
             session.authenticate_seal(&uc.unicity_seal).unwrap();
         }
         assert_eq!(
             session.stats().quorum_checks,
-            2,
-            "{n} shards: shared seal is verified once per policy"
+            1,
+            "{n} shards: the shared seal's signatures are verified once"
         );
-        assert_eq!(session.stats().memo_hits, n as u64 - 1);
+        assert_eq!(session.stats().memo_hits, n as u64);
     }
 }
 
@@ -1099,9 +1099,11 @@ fn pinned_assembly_api_is_preserved() {
     );
 }
 
-/// The memo is namespaced by the pin/partition policy of the authentication.
+/// The signature verdict of a complete seal is shared by every policy (one native
+/// verification per distinct seal); the policy-dependent rules are never memoized
+/// across policies: the strict checks run on every call and bodies are policy-keyed.
 #[test]
-fn strict_memo_is_separated_by_policy() {
+fn signature_memo_is_shared_but_policy_rules_are_not() {
     let c = case(4);
     let mut s = SealSession::new(&c.trust_base);
     let auth = |s: &mut SealSession<'_>, pins: Option<&PartitionTopology>| {
@@ -1118,19 +1120,35 @@ fn strict_memo_is_separated_by_policy() {
     auth(&mut s, Some(&c.topology));
     assert_eq!(
         (s.stats().quorum_checks, s.stats().memo_hits),
-        (2, 1),
-        "pinned is another policy"
+        (1, 2),
+        "the same seal's signatures are not verified again for another policy"
     );
     auth(&mut s, Some(&c.topology));
-    assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (2, 2));
+    assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (1, 3));
     let order = c.topology.canonical_order().unwrap();
     let partial = PartitionTopology::new(order.clone())
         .with_shard_conf_hash(&order[0], *c.topology.shard_conf_hash(&order[0]).unwrap());
     auth(&mut s, Some(&partial));
     assert_eq!(
         s.stats().quorum_checks,
-        3,
-        "different pins are another policy"
+        1,
+        "different pins, same signatures"
+    );
+
+    // policy-dependent rules are still evaluated every time: a pin the certificate
+    // does not satisfy fails even though the seal's signatures are memoized
+    let mut wrong = PartitionTopology::new(order.clone());
+    for shard in &order {
+        wrong = wrong.with_shard_conf_hash(shard, [0xee; 32]);
+    }
+    assert!(c.view.authenticate(&c.uc, Some(&wrong), &mut s).is_err());
+    // and the strict authority is checked by every call, whatever was verified before
+    let mut tb = c.trust_base.clone();
+    tb.epoch += 1;
+    let mut other_epoch = SealSession::new(&tb);
+    assert_eq!(
+        other_epoch.authenticate_seal(&c.uc.unicity_seal),
+        Err(VerificationError::SealEpochMismatch)
     );
 }
 

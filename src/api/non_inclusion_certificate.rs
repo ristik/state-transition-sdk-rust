@@ -31,6 +31,16 @@ struct Body {
     terminal_value: [u8; AGGREGATION_TREE_VALUE_SIZE],
 }
 
+/// How a state id relates to an authenticated non-inclusion path (see
+/// [`NonInclusionCertificate::relation_to_trusted_root`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRelation {
+    /// The authenticated terminal leaf is a different key: the state is absent in that tree.
+    Absent,
+    /// The authenticated terminal leaf is the queried key: the state is present.
+    Present,
+}
+
 impl NonInclusionCertificate {
     /// Construct the distinguished certificate for an empty tree.
     pub fn empty_tree() -> Self {
@@ -170,24 +180,31 @@ impl NonInclusionCertificate {
         self.body.as_ref().map(|body| &body.terminal_value)
     }
 
-    /// Verify both the authenticated path and the non-inclusion relation.
-    /// `expected_root` is `None` only for an empty certified tree.
+    /// Classify the relation of `target` to the authenticated path, against a root the caller
+    /// **already trusts** (`None` is the certified empty tree). It is not certificate
+    /// authentication and exposes no snapshot: use
+    /// [`NonInclusionProof::verify_at_snapshot`](crate::api::NonInclusionProof::verify_at_snapshot)
+    /// when the root still needs BFT-certificate authentication.
     ///
-    /// This low-level method assumes `expected_root` is already trusted. Use
-    /// [`NonInclusionProof::verify`](crate::api::NonInclusionProof::verify) when
-    /// the root still needs BFT-certificate authentication.
-    pub fn verify(
+    /// **Non-inclusion proves absence only at the authenticated snapshot returned by verification.
+    /// It does not prove absence now, continuous absence, or that a token can be spent. Compare the
+    /// snapshot’s network and root round (or its certified seal timestamp under your application's
+    /// time policy) with an independently trusted requirement. The seal timestamp is a
+    /// consensus-certified time, not proof of real-time freshness. Do not use unverified response
+    /// metadata for this check.**
+    pub fn relation_to_trusted_root(
         &self,
         target: &StateId,
-        expected_root: Option<&DataHash>,
-    ) -> Result<(), VerificationError> {
-        if !self.authenticates(target, expected_root) {
+        trusted_root: Option<&DataHash>,
+    ) -> Result<PathRelation, VerificationError> {
+        if !self.authenticates(target, trusted_root) {
             return Err(VerificationError::NonInclusionCertificateInvalid);
         }
-        if self.terminal_matches(target) {
-            return Err(VerificationError::StateIncluded);
-        }
-        Ok(())
+        Ok(if self.terminal_matches(target) {
+            PathRelation::Present
+        } else {
+            PathRelation::Absent
+        })
     }
 
     pub(crate) fn authenticates(&self, target: &StateId, expected_root: Option<&DataHash>) -> bool {
@@ -238,9 +255,12 @@ mod tests {
         let certificate = NonInclusionCertificate::empty_tree();
         let target = state_id([7u8; 32]);
         assert!(certificate.is_empty_tree());
-        assert_eq!(certificate.verify(&target, None), Ok(()));
         assert_eq!(
-            certificate.verify(&target, Some(&leaf_root(&[1; 32], &[2; 32]))),
+            certificate.relation_to_trusted_root(&target, None),
+            Ok(PathRelation::Absent)
+        );
+        assert_eq!(
+            certificate.relation_to_trusted_root(&target, Some(&leaf_root(&[1; 32], &[2; 32]))),
             Err(VerificationError::NonInclusionCertificateInvalid)
         );
         assert!(certificate.encode().is_empty());
@@ -263,12 +283,12 @@ mod tests {
         let root = leaf_root(&terminal_key, &terminal_value);
 
         assert_eq!(
-            certificate.verify(&state_id([3u8; 32]), Some(&root)),
-            Ok(())
+            certificate.relation_to_trusted_root(&state_id([3u8; 32]), Some(&root)),
+            Ok(PathRelation::Absent)
         );
         assert_eq!(
-            certificate.verify(&state_id(terminal_key), Some(&root)),
-            Err(VerificationError::StateIncluded)
+            certificate.relation_to_trusted_root(&state_id(terminal_key), Some(&root)),
+            Ok(PathRelation::Present)
         );
         assert_eq!(certificate.terminal_key(), Some(&terminal_key));
         assert_eq!(certificate.terminal_value(), Some(&terminal_value));
@@ -305,15 +325,15 @@ mod tests {
         let mut target_left = [0u8; 32];
         target_left[31] = 1;
         assert_eq!(
-            certificate.verify(&state_id(target_left), Some(&root)),
-            Ok(())
+            certificate.relation_to_trusted_root(&state_id(target_left), Some(&root)),
+            Ok(PathRelation::Absent)
         );
 
         let mut target_right = [0u8; 32];
         target_right[0] = 0x80;
         target_right[31] = 1;
         assert_eq!(
-            certificate.verify(&state_id(target_right), Some(&root)),
+            certificate.relation_to_trusted_root(&state_id(target_right), Some(&root)),
             Err(VerificationError::NonInclusionCertificateInvalid)
         );
     }
@@ -357,6 +377,9 @@ mod tests {
         let mut target = [0u8; 32];
         target[0] = 0x01;
 
-        assert_eq!(certificate.verify(&state_id(target), Some(&root)), Ok(()));
+        assert_eq!(
+            certificate.relation_to_trusted_root(&state_id(target), Some(&root)),
+            Ok(PathRelation::Absent)
+        );
     }
 }
