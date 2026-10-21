@@ -9,6 +9,7 @@
 //! (so the [`mint`](super::mint)/[`transfer`](super::transfer) helpers work
 //! unchanged against live infrastructure).
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
@@ -16,12 +17,20 @@ use std::io::Read;
 use std::time::Duration;
 use zeroize::Zeroize;
 
+use crate::api::bft::RootTrustBase;
 use crate::api::certification_request::CertificationRequest;
 use crate::api::inclusion_proof::InclusionProof;
-use crate::api::{CertificationData, InclusionProofResponse, NonInclusionProof, StateId};
+use crate::api::{
+    CertificationData, InclusionProofResponse, NonInclusionProof, ProofStatus, StateId,
+};
 use crate::cbor::Decoder;
 
-use super::{AggregatorClient, MembershipStatus, NonInclusionAggregatorClient};
+use super::{
+    rpc_code, AggregatorClient, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
+    InclusionProofBatch, MembershipStatus, NonInclusionAggregatorClient, RequestOptions, StateRoot,
+    MAX_BATCH_STATE_IDS, UNCLASSIFIED,
+};
+use crate::consolidation::PartitionView;
 
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -35,8 +44,17 @@ const RPC_STATE_NOT_FOUND: i64 = -32020;
 const RPC_INCLUSION_PENDING: i64 = -32021;
 const RPC_STATE_INCLUDED: i64 = -32022;
 
+/// Default number of `unknown` status answers tolerated while waiting for a proof
+/// before failing: right after a submission an HA instance that did not admit the
+/// request may not have seen it yet.
+pub const DEFAULT_UNKNOWN_GRACE: u32 = 2;
+
 /// Errors from the HTTP aggregator client.
+///
+/// Non-exhaustive: variants are added as the aggregator API grows (for example
+/// the proof status hints); match with a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HttpError {
     /// Unsafe or invalid client configuration.
     Configuration(String),
@@ -69,6 +87,29 @@ pub enum HttpError {
     Timeout,
     /// The aggregator has no certified or pending record for this state id.
     StateNotFound,
+    /// The aggregator reports (an unauthenticated hint, see [`ProofStatus`]) that
+    /// the request was admitted but dropped before inclusion, because its timeout
+    /// passed. Waiting can not help; the caller may resubmit the same signed request.
+    StateExpired,
+    /// The aggregator returned a proof for this state id whose certification data is
+    /// **not the submitted request** (different transaction hash, unlock script or
+    /// deadline), and the proof was **not authenticated**: it may be a forged answer
+    /// from a faulty aggregator, so this is only a hint that a conflicting spend won the
+    /// race. The submission must not be treated as certified. Authenticate the proof
+    /// (see [`submit_and_wait_verified`](HttpAggregatorClient::submit_and_wait_verified))
+    /// before concluding that the race was lost; resubmitting or asking another
+    /// aggregator is safe.
+    ProofOfOtherData,
+    /// A proof that **verifies under the trust base** certifies this state id, but not
+    /// the submitted request: another request, typically a conflicting spend of the same
+    /// state, won the race. Not retryable. Returned only by
+    /// [`submit_and_wait_verified`](HttpAggregatorClient::submit_and_wait_verified).
+    StateCertifiedWithOtherData,
+    /// The aggregator reports (an unauthenticated hint, see [`ProofStatus`]) that
+    /// it does not know the state id, beyond the configured grace period. This is
+    /// not proof of absence or of non-spending: the request may have been lost,
+    /// misrouted, forgotten by a restart, or be known to another instance.
+    StateUnknown,
     /// No certified state is available from which to prove absence.
     CertifiedStateUnavailable,
     /// The requested state is present at the certified root.
@@ -91,6 +132,24 @@ impl fmt::Display for HttpError {
             HttpError::Rejected(s) => write!(f, "certification rejected: {s:?}"),
             HttpError::Timeout => write!(f, "timed out waiting for inclusion proof"),
             HttpError::StateNotFound => write!(f, "state is not known to the aggregator"),
+            HttpError::ProofOfOtherData => write!(
+                f,
+                "the returned proof is for a different request than the one submitted \
+                 (unauthenticated hint)"
+            ),
+            HttpError::StateCertifiedWithOtherData => write!(
+                f,
+                "the state id is certified with a different request than the one submitted"
+            ),
+            HttpError::StateExpired => {
+                write!(f, "aggregator reports the request expired before inclusion")
+            }
+            HttpError::StateUnknown => {
+                write!(
+                    f,
+                    "aggregator reports the state id as unknown (hint, not proof of absence)"
+                )
+            }
             HttpError::CertifiedStateUnavailable => {
                 write!(f, "no certified state is available")
             }
@@ -103,6 +162,20 @@ impl fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// The error for a proof that certifies other data than the submitted request: authenticated
+/// (`StateCertifiedWithOtherData`) only when the proof verifies under `trust_base` for
+/// `state_id`, at the reference time the proof itself commits to.
+pub(crate) fn conflict_error(
+    proof: &InclusionProof,
+    state_id: &StateId,
+    trust_base: &RootTrustBase,
+) -> HttpError {
+    match proof.verify_for(state_id, proof.reference_time, trust_base) {
+        Ok(()) => HttpError::StateCertifiedWithOtherData,
+        Err(_) => HttpError::ProofOfOtherData,
+    }
+}
+
 /// A blocking JSON-RPC aggregator client.
 #[derive(Clone)]
 pub struct HttpAggregatorClient {
@@ -111,6 +184,7 @@ pub struct HttpAggregatorClient {
     agent: ureq::Agent,
     poll_interval: Duration,
     poll_attempts: u32,
+    unknown_grace: u32,
     allow_insecure_http: bool,
 }
 
@@ -136,6 +210,7 @@ impl fmt::Debug for HttpAggregatorClient {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("poll_interval", &self.poll_interval)
             .field("poll_attempts", &self.poll_attempts)
+            .field("unknown_grace", &self.unknown_grace)
             .field("allow_insecure_http", &self.allow_insecure_http)
             .finish_non_exhaustive()
     }
@@ -154,6 +229,7 @@ impl HttpAggregatorClient {
                 .build(),
             poll_interval: Duration::from_secs(1),
             poll_attempts: 60,
+            unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: false,
         }
     }
@@ -177,6 +253,7 @@ impl HttpAggregatorClient {
                 .build(),
             poll_interval: Duration::from_secs(1),
             poll_attempts: 60,
+            unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: true,
         }
     }
@@ -193,6 +270,174 @@ impl HttpAggregatorClient {
         self.poll_interval = interval;
         self.poll_attempts = attempts;
         self
+    }
+
+    /// How many `unknown` status answers [`get_inclusion_proof`](AggregatorClient::get_inclusion_proof)
+    /// tolerates before failing with [`HttpError::StateUnknown`] (default
+    /// [`DEFAULT_UNKNOWN_GRACE`]; `0` fails on the first one).
+    ///
+    /// Right after a submission the aggregator that serves the lookup may not have
+    /// seen the request yet (a replica behind a load balancer, a queue not yet
+    /// drained), so a short grace avoids reporting a transient `unknown`. The
+    /// counter resets whenever the aggregator answers `pending`. A lookup of an id
+    /// that was never submitted therefore costs `grace + 1` polls before it fails.
+    pub fn with_unknown_grace(mut self, polls: u32) -> Self {
+        self.unknown_grace = polls;
+        self
+    }
+
+    fn submit_inner(&self, data: &CertificationData) -> Result<SubmitReply, HttpError> {
+        let request = CertificationRequest::new(data);
+        let state_id_hex = hex::encode(request.state_id().bytes());
+        let params = serde_json::Value::String(hex::encode(request.to_cbor()));
+
+        let mut headers: Vec<(&str, &str)> = alloc::vec![("X-State-ID", state_id_hex.as_str())];
+        if let Some(key) = &self.api_key {
+            headers.push(("X-API-Key", key.expose()));
+        }
+
+        let result = match self.rpc_raw("certification_request", params, &headers, None) {
+            Ok(result) => result,
+            Err(RawFailure::Envelope(EnvelopeError::Rpc {
+                code,
+                message,
+                data,
+            })) if is_queue_duplicate(code, &data) => {
+                return Ok(SubmitReply::QueueDuplicate(HttpError::Rpc {
+                    code,
+                    message,
+                }));
+            }
+            Err(e) => return Err(raw_to_http(e)),
+        };
+        match result
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+        {
+            "SUCCESS" => Ok(SubmitReply::Accepted),
+            "STATE_ID_EXISTS" => Ok(SubmitReply::StateIdExists),
+            other => Err(HttpError::Rejected(other.to_string())),
+        }
+    }
+
+    /// Submit a certification request **idempotently**: re-sending a request the
+    /// aggregator already holds is not a failure.
+    ///
+    /// The request is signed and carries no fresh randomness, so resubmitting the
+    /// *same* request never produces a second leaf. When the aggregator already has a
+    /// record for the state id the call returns [`SubmitOutcome::AlreadySubmitted`]
+    /// and the caller should wait for the proof - and check that it certifies *its*
+    /// request: the server reports a duplicate by state id alone, so a **different**
+    /// request for the same state (a conflicting spend) is reported the same way.
+    /// ([`submit_and_wait`](Self::submit_and_wait) makes that check.) That covers: the Mongo-backed queue refusing the
+    /// copy of a still-pending request (reported as an internal error whose data names a
+    /// duplicate key; the Redis-backed queue silently accepts and drops it) and
+    /// `STATE_ID_EXISTS` (already certified). Every other rejection (invalid signature,
+    /// `REQUEST_EXPIRED`, ...) is still an error. The plain
+    /// [`submit_certification_request`](AggregatorClient::submit_certification_request)
+    /// keeps reporting both duplicate responses as errors.
+    ///
+    /// The duplicate-key case is recognized from the aggregator's error text, which
+    /// the server gives no machine code for.
+    pub fn resubmit_certification_request(
+        &self,
+        data: &CertificationData,
+    ) -> Result<SubmitOutcome, HttpError> {
+        match self.submit_inner(data)? {
+            SubmitReply::Accepted => Ok(SubmitOutcome::Accepted),
+            SubmitReply::StateIdExists | SubmitReply::QueueDuplicate(_) => {
+                Ok(SubmitOutcome::AlreadySubmitted)
+            }
+        }
+    }
+
+    /// Submit (idempotently) and wait for the proof, resubmitting the same signed
+    /// request when the aggregator reports it lost or expired.
+    ///
+    /// When waiting ends with [`HttpError::StateUnknown`] (lost, misrouted, forgotten
+    /// by a restart) or [`HttpError::StateExpired`] (dropped before inclusion) the
+    /// identical request is sent again, at most `max_resubmits` times, and the wait
+    /// restarts. A resubmission that meets a request still held elsewhere is
+    /// [`AlreadySubmitted`](SubmitOutcome::AlreadySubmitted), not an error. The status
+    /// is an unauthenticated hint: the returned proof still has to be verified.
+    ///
+    /// A returned proof whose certification data differs from `data` is reported as
+    /// [`HttpError::ProofOfOtherData`], an **unauthenticated** hint (this method has no
+    /// trust base); use [`submit_and_wait_verified`](Self::submit_and_wait_verified) to
+    /// learn whether a conflicting spend really won.
+    pub fn submit_and_wait(
+        &self,
+        data: &CertificationData,
+        max_resubmits: u32,
+    ) -> Result<InclusionProof, HttpError> {
+        self.submit_and_wait_with(data, max_resubmits, |_, _| HttpError::ProofOfOtherData)
+    }
+
+    /// Like [`submit_and_wait`](Self::submit_and_wait), but a proof for other data is
+    /// authenticated under `trust_base` before it is believed: only a proof that verifies
+    /// gives [`HttpError::StateCertifiedWithOtherData`] (the race is lost, not retryable);
+    /// a proof that does not verify gives the unauthenticated
+    /// [`HttpError::ProofOfOtherData`].
+    pub fn submit_and_wait_verified(
+        &self,
+        data: &CertificationData,
+        max_resubmits: u32,
+        trust_base: &RootTrustBase,
+    ) -> Result<InclusionProof, HttpError> {
+        self.submit_and_wait_with(data, max_resubmits, |proof, state_id| {
+            conflict_error(proof, state_id, trust_base)
+        })
+    }
+
+    fn submit_and_wait_with(
+        &self,
+        data: &CertificationData,
+        max_resubmits: u32,
+        on_other_data: impl Fn(&InclusionProof, &StateId) -> HttpError,
+    ) -> Result<InclusionProof, HttpError> {
+        let state_id = StateId::derive(data.lock_script(), data.source_state_hash());
+        self.resubmit_certification_request(data)?;
+        let mut resubmits = 0;
+        loop {
+            match AggregatorClient::get_inclusion_proof(self, &state_id) {
+                Err(HttpError::StateUnknown | HttpError::StateExpired)
+                    if resubmits < max_resubmits =>
+                {
+                    resubmits += 1;
+                    self.resubmit_certification_request(data)?;
+                }
+                Ok(proof) if proof.certification_data != *data => {
+                    return Err(on_other_data(&proof, &state_id))
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// One proof lookup, without waiting, returning the aggregator's status hint
+    /// next to the response. The status is `None` for servers that do not support
+    /// it (and for values this version does not know).
+    ///
+    /// The hint is **unauthenticated**: use it for control flow and user feedback
+    /// only. It never replaces verification of the returned proof.
+    pub fn lookup_inclusion_proof(
+        &self,
+        state_id: &StateId,
+    ) -> Result<(InclusionProofResponse, Option<ProofStatus>), HttpError> {
+        let params = serde_json::json!({
+            "stateId": hex::encode(state_id.bytes()),
+            "includeStatus": true,
+        });
+        let result = self.rpc("get_inclusion_proof.v2", params, &[])?;
+        let (encoded, status) = split_status_result(&result)?;
+        if encoded.len() > MAX_PROOF_HEX_CHARS {
+            return Err(HttpError::ResponseTooLarge {
+                limit: MAX_PROOF_HEX_CHARS,
+            });
+        }
+        let bytes = hex::decode(encoded).map_err(|e| HttpError::Decode(e.to_string()))?;
+        Ok((decode_inclusion_proof_response(&bytes)?, status))
     }
 
     /// Determine whether `state_id` is included or absent at a certified root.
@@ -249,7 +494,20 @@ impl HttpAggregatorClient {
         params: serde_json::Value,
         headers: &[(&str, &str)],
     ) -> Result<serde_json::Value, HttpError> {
-        self.validate_endpoint()?;
+        self.rpc_raw(method, params, headers, None)
+            .map_err(raw_to_http)
+    }
+
+    /// One JSON-RPC call with an optional per-request timeout, keeping the
+    /// structured error data.
+    fn rpc_raw(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        headers: &[(&str, &str)],
+        timeout: Option<Duration>,
+    ) -> Result<serde_json::Value, RawFailure> {
+        self.validate_endpoint().map_err(RawFailure::Config)?;
         let id = request_id();
         let body = serde_json::json!({
             "id": id,
@@ -263,6 +521,9 @@ impl HttpAggregatorClient {
             .agent
             .post(&self.url)
             .set("Content-Type", "application/json");
+        if let Some(t) = timeout {
+            request = request.timeout(t);
+        }
         for (k, v) in headers {
             request = request.set(k, v);
         }
@@ -270,80 +531,164 @@ impl HttpAggregatorClient {
         let response = match request.send_string(&body) {
             Ok(r) => r,
             Err(ureq::Error::Status(status, r)) => {
-                return Err(HttpError::Http {
-                    status,
-                    body: read_response(r, MAX_ERROR_BODY_BYTES)?,
-                });
+                let body = read_response_raw(r, MAX_ERROR_BODY_BYTES)?;
+                // a JSON-RPC error may ride on a non-2xx status: keep it typed
+                let rpc = match decode_rpc_envelope(&body, &id) {
+                    Err(e @ EnvelopeError::Rpc { .. }) => Some(e),
+                    _ => None,
+                };
+                return Err(RawFailure::Http { status, body, rpc });
             }
-            Err(e) => return Err(HttpError::Transport(e.to_string())),
+            Err(e) => return Err(RawFailure::Transport(e.to_string())),
         };
         if !(200..300).contains(&response.status()) {
-            return Err(HttpError::Http {
+            return Err(RawFailure::Http {
                 status: response.status(),
-                body: read_response(response, MAX_ERROR_BODY_BYTES)?,
+                body: read_response_raw(response, MAX_ERROR_BODY_BYTES)?,
+                rpc: None,
             });
         }
 
-        let text = read_response(response, MAX_RESPONSE_BODY_BYTES)?;
-        decode_rpc_response(&text, &id)
+        let text = read_response_raw(response, MAX_RESPONSE_BODY_BYTES)?;
+        decode_rpc_envelope(&text, &id).map_err(RawFailure::Envelope)
     }
 }
 
-fn read_response(response: ureq::Response, limit: usize) -> Result<String, HttpError> {
+fn raw_to_http(e: RawFailure) -> HttpError {
+    match e {
+        RawFailure::Http { status, body, .. } => HttpError::Http { status, body },
+        RawFailure::Transport(m) => HttpError::Transport(m),
+        RawFailure::Envelope(EnvelopeError::Decode(m)) => HttpError::Decode(m),
+        RawFailure::Envelope(EnvelopeError::Rpc { code, message, .. }) => {
+            HttpError::Rpc { code, message }
+        }
+        RawFailure::TooLarge(limit) => HttpError::ResponseTooLarge { limit },
+        RawFailure::Config(e) => e,
+    }
+}
+
+/// JSON-RPC "internal error": how the aggregator reports a failure to queue a request.
+const RPC_INTERNAL_ERROR: i64 = -32603;
+
+/// Whether an RPC error is the queue refusing a copy of a request it already holds:
+/// the Mongo commitment queue's unique `stateId` index, surfaced as an internal error
+/// whose data carries the driver's "duplicate key" text. (The Redis queue accepts the
+/// copy silently.) Recognized by text because the server gives no machine code for it.
+fn is_queue_duplicate(code: i64, data: &Option<serde_json::Value>) -> bool {
+    code == RPC_INTERNAL_ERROR
+        && data
+            .as_ref()
+            .and_then(|d| d.as_str())
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|d| d.contains("duplicate key") || d.contains("e11000"))
+}
+
+/// The aggregator's reply to a certification request, as far as resubmission cares.
+enum SubmitReply {
+    Accepted,
+    /// A record for the state id already exists (`STATE_ID_EXISTS`).
+    StateIdExists,
+    /// The queue refused a copy of a request it still holds (original error kept).
+    QueueDuplicate(HttpError),
+}
+
+/// What an idempotent (re)submission achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubmitOutcome {
+    /// The request was queued.
+    Accepted,
+    /// The aggregator already holds a record for this state id - queued or
+    /// certified - and did not queue a second copy. **It may be a different request**
+    /// (a conflicting spend of the same state has the same state id): not a failure,
+    /// but confirm through the proof that it certifies *this* request.
+    AlreadySubmitted,
+}
+
+/// Failure of one raw JSON-RPC exchange.
+enum RawFailure {
+    Http {
+        status: u16,
+        body: String,
+        rpc: Option<EnvelopeError>,
+    },
+    Transport(String),
+    Envelope(EnvelopeError),
+    TooLarge(usize),
+    Config(HttpError),
+}
+
+fn read_response_raw(response: ureq::Response, limit: usize) -> Result<String, RawFailure> {
     let mut bytes = Vec::new();
     response
         .into_reader()
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| HttpError::Transport(e.to_string()))?;
+        .map_err(|e| RawFailure::Transport(e.to_string()))?;
     if bytes.len() > limit {
-        return Err(HttpError::ResponseTooLarge { limit });
+        return Err(RawFailure::TooLarge(limit));
     }
-    String::from_utf8(bytes).map_err(|e| HttpError::Decode(e.to_string()))
+    String::from_utf8(bytes).map_err(|e| RawFailure::Envelope(EnvelopeError::Decode(e.to_string())))
 }
 
-fn decode_rpc_response(text: &str, expected_id: &str) -> Result<serde_json::Value, HttpError> {
+/// A decoded JSON-RPC envelope failure.
+enum EnvelopeError {
+    Decode(String),
+    Rpc {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+}
+
+fn decode_rpc_envelope(text: &str, expected_id: &str) -> Result<serde_json::Value, EnvelopeError> {
+    let decode = |m: &str| EnvelopeError::Decode(m.to_string());
     let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| HttpError::Decode(e.to_string()))?;
+        serde_json::from_str(text).map_err(|e| EnvelopeError::Decode(e.to_string()))?;
     let object = value
         .as_object()
-        .ok_or_else(|| HttpError::Decode("JSON-RPC response must be an object".to_string()))?;
+        .ok_or_else(|| decode("JSON-RPC response must be an object"))?;
     if object.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
-        return Err(HttpError::Decode(
-            "invalid or missing JSON-RPC version".to_string(),
-        ));
+        return Err(decode("invalid or missing JSON-RPC version"));
     }
     let response_id = object
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| HttpError::Decode("invalid or missing JSON-RPC id".to_string()))?;
+        .ok_or_else(|| decode("invalid or missing JSON-RPC id"))?;
     if response_id != expected_id {
-        return Err(HttpError::Decode("JSON-RPC id mismatch".to_string()));
+        return Err(decode("JSON-RPC id mismatch"));
     }
 
     match (object.get("result"), object.get("error")) {
-        (Some(_), Some(_)) => Err(HttpError::Decode(
-            "JSON-RPC response contains both result and error".to_string(),
-        )),
+        (Some(_), Some(_)) => Err(decode("JSON-RPC response contains both result and error")),
         (Some(result), None) => Ok(result.clone()),
         (None, Some(error)) => {
             let code = error
                 .get("code")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| HttpError::Decode("invalid JSON-RPC error code".to_string()))?;
+                .ok_or_else(|| decode("invalid JSON-RPC error code"))?;
             let message = error
                 .get("message")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| HttpError::Decode("invalid JSON-RPC error message".to_string()))?;
-            Err(HttpError::Rpc {
+                .ok_or_else(|| decode("invalid JSON-RPC error message"))?;
+            Err(EnvelopeError::Rpc {
                 code,
                 message: message.to_string(),
+                data: error.get("data").cloned(),
             })
         }
-        (None, None) => Err(HttpError::Decode(
-            "JSON-RPC response contains neither result nor error".to_string(),
+        (None, None) => Err(decode(
+            "JSON-RPC response contains neither result nor error",
         )),
     }
+}
+
+#[cfg(test)]
+fn decode_rpc_response(text: &str, expected_id: &str) -> Result<serde_json::Value, HttpError> {
+    decode_rpc_envelope(text, expected_id).map_err(|e| match e {
+        EnvelopeError::Decode(m) => HttpError::Decode(m),
+        EnvelopeError::Rpc { code, message, .. } => HttpError::Rpc { code, message },
+    })
 }
 
 /// Decode the `[blockNumber, InclusionProof]` response payload.
@@ -370,28 +715,31 @@ impl AggregatorClient for HttpAggregatorClient {
     type Error = HttpError;
 
     fn submit_certification_request(&self, data: &CertificationData) -> Result<(), HttpError> {
-        let request = CertificationRequest::new(data);
-        let state_id_hex = hex::encode(request.state_id().bytes());
-        let params = serde_json::Value::String(hex::encode(request.to_cbor()));
-
-        let mut headers: Vec<(&str, &str)> = alloc::vec![("X-State-ID", state_id_hex.as_str())];
-        if let Some(key) = &self.api_key {
-            headers.push(("X-API-Key", key.expose()));
+        match self.submit_inner(data)? {
+            SubmitReply::Accepted => Ok(()),
+            SubmitReply::StateIdExists => Err(HttpError::Rejected("STATE_ID_EXISTS".to_string())),
+            SubmitReply::QueueDuplicate(error) => Err(error),
         }
-
-        let result = self.rpc("certification_request", params, &headers)?;
-        let status = result
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default();
-        if status != "SUCCESS" {
-            return Err(HttpError::Rejected(status.to_string()));
-        }
-        Ok(())
     }
 
+    /// Wait for the certified proof of `state_id`.
+    ///
+    /// Asks for the aggregator's status hint (`includeStatus`) and accepts both
+    /// result shapes: a plain string (legacy server) behaves exactly as before.
+    /// While the response is not a certified proof: `pending` (or no status)
+    /// keeps polling, `expired` fails at once with [`HttpError::StateExpired`] and
+    /// `unknown` fails with [`HttpError::StateUnknown`] after the configured
+    /// grace ([`with_unknown_grace`](HttpAggregatorClient::with_unknown_grace)),
+    /// so lost or expired submissions are reported instead of waited out.
+    ///
+    /// The status is an unauthenticated hint: a certified proof is returned
+    /// whatever the status says, and the caller must still verify it.
     fn get_inclusion_proof(&self, state_id: &StateId) -> Result<InclusionProof, HttpError> {
-        let params = serde_json::json!({ "stateId": hex::encode(state_id.bytes()) });
+        let params = serde_json::json!({
+            "stateId": hex::encode(state_id.bytes()),
+            "includeStatus": true,
+        });
+        let mut unknown_seen = 0u32;
 
         for attempt in 0..self.poll_attempts {
             let result = match self.rpc("get_inclusion_proof.v2", params.clone(), &[]) {
@@ -410,9 +758,7 @@ impl AggregatorClient for HttpAggregatorClient {
                 }
                 Err(error) => return Err(error),
             };
-            let encoded = result
-                .as_str()
-                .ok_or_else(|| HttpError::Decode("expected hex string".to_string()))?;
+            let (encoded, status) = split_status_result(&result)?;
             if encoded.len() > MAX_PROOF_HEX_CHARS {
                 return Err(HttpError::ResponseTooLarge {
                     limit: MAX_PROOF_HEX_CHARS,
@@ -424,21 +770,51 @@ impl AggregatorClient for HttpAggregatorClient {
             // certified yet. `get_inclusion_proof.v2` never answers with a
             // non-inclusion proof (that is `get_non_inclusion_proof.v1`), so the
             // uncertified response is unambiguous and is aggregator-go's way of
-            // reporting pending. An aggregator that sends the explicit
-            // INCLUSION_PENDING code above never reaches this branch, and only
-            // that one lets the client tell "not yet" apart from "no such state".
+            // reporting pending. The status hint, when present, refines that into
+            // "keep waiting" / "will never be certified here".
             match decode_inclusion_proof_response(&bytes)? {
                 InclusionProofResponse::Certified { proof, .. } => return Ok(proof),
-                InclusionProofResponse::NotCertified { .. } => {
-                    if attempt + 1 < self.poll_attempts {
-                        std::thread::sleep(self.poll_interval);
+                InclusionProofResponse::NotCertified { .. } => match status {
+                    Some(ProofStatus::Expired) => return Err(HttpError::StateExpired),
+                    Some(ProofStatus::Unknown) => {
+                        unknown_seen += 1;
+                        if unknown_seen > self.unknown_grace {
+                            return Err(HttpError::StateUnknown);
+                        }
                     }
-                    continue;
-                }
+                    // pending, an `included` hint without a proof, no status, or a
+                    // status this version does not know: the legacy behavior
+                    _ => unknown_seen = 0,
+                },
+            }
+            if attempt + 1 < self.poll_attempts {
+                std::thread::sleep(self.poll_interval);
             }
         }
         Err(HttpError::Timeout)
     }
+}
+
+/// Split a `get_inclusion_proof.v2` result into the proof hex and the optional
+/// status hint: a string is the legacy result, an object is `{proof, status}`.
+fn split_status_result(
+    result: &serde_json::Value,
+) -> Result<(&str, Option<ProofStatus>), HttpError> {
+    if let Some(s) = result.as_str() {
+        return Ok((s, None));
+    }
+    let object = result
+        .as_object()
+        .ok_or_else(|| HttpError::Decode("expected hex string".to_string()))?;
+    let proof = object
+        .get("proof")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| HttpError::Decode("status result lacks a proof string".to_string()))?;
+    let status = object
+        .get("status")
+        .and_then(|v| v.as_str())
+        .and_then(ProofStatus::from_wire);
+    Ok((proof, status))
 }
 
 impl NonInclusionAggregatorClient for HttpAggregatorClient {
@@ -467,6 +843,156 @@ impl NonInclusionAggregatorClient for HttpAggregatorClient {
             .for_state(state_id)
             .map_err(|error| HttpError::Decode(error.to_string()))
     }
+}
+
+impl BatchAggregatorClient for HttpAggregatorClient {
+    fn get_inclusion_proofs(
+        &self,
+        request: &BatchRequest<'_>,
+        options: &RequestOptions,
+    ) -> Result<InclusionProofBatch, BatchFailure> {
+        let ids = request.state_ids;
+        if ids.is_empty() || ids.len() > MAX_BATCH_STATE_IDS {
+            return Err(BatchFailure::Rpc {
+                code: rpc_code::INVALID_PARAMS,
+                message: "state id count out of range".to_string(),
+                reason: Some("invalid_request".to_string()),
+                detail: Some("state_count".to_string()),
+                retryable: Some(false),
+                indexes: BTreeMap::new(),
+            });
+        }
+        let state_root = match request.state_root {
+            StateRoot::Latest => "latest".to_string(),
+            StateRoot::Exact(root) => hex::encode(root),
+        };
+        let params = serde_json::json!({
+            "stateIds": ids.iter().map(|s| hex::encode(s.bytes())).collect::<Vec<_>>(),
+            "stateRoot": state_root,
+        });
+        let result = self
+            .rpc_raw(
+                "get_inclusion_proofs.v1",
+                params,
+                &[],
+                Some(Duration::from_millis(options.timeout_ms.max(1))),
+            )
+            .map_err(batch_failure)?;
+        decode_batch_result(&result)
+    }
+}
+
+fn batch_failure(failure: RawFailure) -> BatchFailure {
+    match failure {
+        RawFailure::Http { rpc: Some(e), .. } => batch_failure(RawFailure::Envelope(e)),
+        RawFailure::Http { status, .. } => BatchFailure::Http { status },
+        RawFailure::Transport(m) if m.contains("timed out") => BatchFailure::Timeout,
+        RawFailure::Transport(m) => BatchFailure::Transport(m),
+        RawFailure::TooLarge(limit) => BatchFailure::TooLarge { limit },
+        RawFailure::Config(e) => BatchFailure::Transport(e.to_string()),
+        RawFailure::Envelope(EnvelopeError::Decode(m)) => BatchFailure::Decode(m),
+        RawFailure::Envelope(EnvelopeError::Rpc {
+            code,
+            message,
+            data,
+        }) => {
+            let text = |k: &str| {
+                data.as_ref()
+                    .and_then(|d| d.get(k))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            };
+            BatchFailure::Rpc {
+                code,
+                message,
+                reason: text("reason"),
+                detail: text("detail"),
+                retryable: data
+                    .as_ref()
+                    .and_then(|d| d.get("retryable"))
+                    .and_then(|v| v.as_bool()),
+                indexes: data
+                    .as_ref()
+                    .and_then(|d| d.get("indexes"))
+                    .map(parse_indexes)
+                    .unwrap_or_default(),
+            }
+        }
+    }
+}
+
+/// `data.indexes`: an object of per-class arrays (the contract), tolerating a bare
+/// array as one unclassified entry; anything else is ignored.
+fn parse_indexes(value: &serde_json::Value) -> BTreeMap<String, Vec<usize>> {
+    let list = |v: &serde_json::Value| -> Option<Vec<usize>> {
+        v.as_array().map(|a| {
+            a.iter()
+                .filter_map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()))
+                .collect()
+        })
+    };
+    match value {
+        serde_json::Value::Object(classes) => classes
+            .iter()
+            .filter_map(|(class, v)| list(v).map(|l| (class.clone(), l)))
+            .collect(),
+        other => list(other)
+            .map(|l| BTreeMap::from([(UNCLASSIFIED.to_string(), l)]))
+            .unwrap_or_default(),
+    }
+}
+
+/// Decode `{"proofs": [<hex CBOR>...], "partitionView": <hex CBOR>?}`.
+fn decode_batch_result(result: &serde_json::Value) -> Result<InclusionProofBatch, BatchFailure> {
+    let bad = |m: &str| BatchFailure::Decode(m.to_string());
+    let object = result
+        .as_object()
+        .ok_or_else(|| bad("batch result must be an object"))?;
+    if object.keys().any(|k| k != "proofs" && k != "partitionView") {
+        return Err(bad("unknown field in batch result"));
+    }
+    let hex_field = |v: &serde_json::Value| -> Result<Vec<u8>, BatchFailure> {
+        let s = v.as_str().ok_or_else(|| bad("expected a hex string"))?;
+        if s.len() > MAX_PROOF_HEX_CHARS {
+            return Err(BatchFailure::TooLarge {
+                limit: MAX_PROOF_HEX_CHARS,
+            });
+        }
+        hex::decode(s).map_err(|e| BatchFailure::Decode(e.to_string()))
+    };
+    let proofs = object
+        .get("proofs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| bad("missing proofs array"))?
+        .iter()
+        .map(|v| {
+            let bytes = hex_field(v)?;
+            match decode_inclusion_proof_response(&bytes) {
+                Ok(InclusionProofResponse::Certified {
+                    block_number,
+                    proof,
+                }) => Ok(BatchProof {
+                    block_number,
+                    proof,
+                }),
+                Ok(InclusionProofResponse::NotCertified { .. }) => {
+                    Err(bad("batch carries an uncertified proof"))
+                }
+                Err(e) => Err(BatchFailure::Decode(e.to_string())),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let partition_view = match object.get("partitionView") {
+        None => None,
+        Some(v) => Some(
+            PartitionView::from_cbor(&hex_field(v)?)
+                .map_err(|e| BatchFailure::Decode(e.to_string()))?,
+        ),
+    };
+    Ok(InclusionProofBatch {
+        proofs,
+        partition_view,
+    })
 }
 
 /// A random JSON-RPC request id.

@@ -38,8 +38,10 @@ pub mod api;
 pub mod cbor;
 #[cfg(feature = "client")]
 pub mod client;
+pub mod consolidation;
 pub mod crypto;
 pub mod error;
+mod fifo_index;
 pub mod payment;
 pub mod predicate;
 mod radix;
@@ -47,6 +49,7 @@ pub mod rsmst;
 pub mod transaction;
 pub mod verify;
 
+pub use api::AGGREGATION_PARTITION_ID;
 pub use error::{Error, Result};
 pub use transaction::Token;
 pub use verify::VerificationError;

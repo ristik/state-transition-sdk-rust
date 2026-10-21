@@ -71,6 +71,8 @@ The SDK handles cryptography and token encoding. Your application manages keys, 
 
 `client::mint` and `client::transfer` submit the transaction, wait for its unicity proof (`InclusionProof` in the API), and return the verified token. The [split example](./examples/split.rs) includes payment verifier setup.
 
+While waiting, the client stops early with `HttpError::StateExpired` or `HttpError::StateUnknown` when the aggregator reports that it dropped the request or does not know it. The same signed request can then be submitted again. See the [API reference](./docs/api-reference.md#1-waiting-for-inclusion-proofs).
+
 ### Store, send, and receive
 
 Serialize with `token.to_cbor()` to save or send a token, and deserialize with `Token::from_cbor(bytes)` to load it. Verify received tokens before accepting them:
@@ -84,6 +86,10 @@ token.verify(&trust_base)?;
 ```
 
 `Token::verify` checks cryptographic history; application data remains opaque. Use `Token::verify_with` for registered mint justifications and `payment::verify_payment_token` for payments.
+
+### Proof consolidation
+
+Each transaction in a token's history has its own unicity proof, usually certified in a different round. Verifying the history in a constrained environment, such as a smart contract or a zkVM guest, means authenticating every one of those certificates. `client::ProofClient::consolidate` fetches new proofs for the token's history so that they share one unicity certificate, which then has to be authenticated only once. It is optional and the SDK never calls it on its own. See the [API reference](./docs/api-reference.md#4-proof-consolidation) and [`examples/consolidate_for_zkvm.rs`](./examples/consolidate_for_zkvm.rs).
 
 ### Run the examples
 
@@ -141,6 +147,7 @@ cargo test --features http --test e2e -- --ignored --nocapture
 ## Resources
 
 - [Unicity Network](https://github.com/unicitynetwork/)
+- [API reference](./docs/api-reference.md)
 - [Examples](./examples) and [standalone demo](./e2e/README.md)
 - [Report an issue](https://github.com/unicitynetwork/state-transition-sdk-rust/issues)
 

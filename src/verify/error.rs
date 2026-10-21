@@ -82,6 +82,21 @@ pub enum VerificationError {
     ShardMismatch,
     /// The unicity seal's network id does not match the trust base.
     SealNetworkMismatch,
+    /// The certificate body violates bft-go-base's `IsValid` rules (input record or
+    /// technical record hash).
+    CertificateBodyInvalid,
+    /// The certificate is of a partition other than
+    /// [`AGGREGATION_PARTITION_ID`](crate::api::AGGREGATION_PARTITION_ID).
+    PartitionMismatch,
+    /// The authority uses a configuration this verifier can not judge (stake
+    /// weights other than one); not a statement about any signature.
+    UnsupportedAuthority,
+    /// The unicity seal's epoch is not the epoch of the authority's trust base.
+    SealEpochMismatch,
+    /// The unicity seal predates the start of the trust base's epoch.
+    SealBeforeEpochStart,
+    /// The unicity seal is structurally unusable (no signatures, zero round, ...).
+    SealMalformed,
     /// The recomputed unicity-tree root does not match the signed seal hash.
     SealRootMismatch,
     /// Fewer than `quorumThreshold` distinct root-node signatures were valid.
@@ -207,6 +222,28 @@ impl fmt::Display for VerificationError {
             VerificationError::SealNetworkMismatch => {
                 write!(f, "unicity seal network does not match trust base")
             }
+            VerificationError::CertificateBodyInvalid => {
+                write!(
+                    f,
+                    "certificate body violates the unicity certificate validity rules"
+                )
+            }
+            VerificationError::PartitionMismatch => {
+                write!(
+                    f,
+                    "certificate is of another partition than the aggregation partition"
+                )
+            }
+            VerificationError::UnsupportedAuthority => {
+                write!(f, "unsupported authority configuration (non-unit stake)")
+            }
+            VerificationError::SealEpochMismatch => {
+                write!(f, "unicity seal epoch does not match trust base")
+            }
+            VerificationError::SealBeforeEpochStart => {
+                write!(f, "unicity seal predates the trust base epoch")
+            }
+            VerificationError::SealMalformed => write!(f, "malformed unicity seal"),
             VerificationError::SealRootMismatch => {
                 write!(f, "unicity tree root does not match seal hash")
             }

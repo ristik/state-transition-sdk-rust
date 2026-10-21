@@ -119,6 +119,41 @@ fn verifies_against_trust_base() {
     }
 }
 
+/// The same flow certified under partition 0 by the same trusted key: every signature, seal
+/// and path is valid, only the partition is not the aggregation partition.
+#[test]
+fn rejects_validly_signed_tokens_of_another_partition() {
+    const OTHER: &str = include_str!("vectors/transition_flow_partition0.json");
+    let pk =
+        PublicKey::from_bytes(&hex::decode(field(OTHER, "aggregatorPublicKey")).unwrap()).unwrap();
+    let tb = RootTrustBase::new(
+        0,
+        NetworkId::LOCAL,
+        0,
+        0,
+        vec![RootTrustBaseNodeInfo {
+            node_id: "NODE".into(),
+            signing_key: pk,
+            stake: 1,
+        }],
+        1,
+    );
+    for name in [
+        "aliceToken",
+        "bobToken",
+        "carolToken",
+        "explicitTimeoutToken",
+    ] {
+        let token = Token::from_cbor(&hex::decode(field(OTHER, name)).unwrap()).unwrap();
+        // the wrapper names the failing transaction; the cause is the partition rule
+        let err = token.verify(&tb).expect_err(name);
+        assert!(
+            format!("{err:?}").contains("PartitionMismatch"),
+            "{name}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn rejects_wrong_aggregator_key() {
     // A trust base with a different validator key must fail the quorum check:
@@ -301,4 +336,49 @@ fn inclusion_proof_response_round_trips_both_shapes() {
     // decoding into one with empty fields.
     let items = Decoder::new(&bytes).array(Some(2)).unwrap();
     assert!(unicity_token::api::InclusionProof::from_cbor(items[1]).is_err());
+}
+
+/// Verification authenticates each distinct seal once per operation: the
+/// number of quorum-signature checks equals the number of distinct complete
+/// seals among the token's proofs, however many proofs share them.
+#[test]
+fn verification_checks_each_distinct_seal_once() {
+    use std::collections::BTreeSet;
+    use unicity_token::verify::{
+        verify_token_with_seal_stats, MintJustificationRegistry, VerificationPolicy,
+    };
+
+    let tb = trust_base();
+    for name in ["aliceToken", "bobToken", "carolToken"] {
+        let (_, token) = token(name);
+        let mut seals = vec![token
+            .genesis()
+            .inclusion_proof()
+            .unicity_certificate
+            .unicity_seal
+            .to_cbor()];
+        for t in token.transactions() {
+            seals.push(
+                t.inclusion_proof()
+                    .unicity_certificate
+                    .unicity_seal
+                    .to_cbor(),
+            );
+        }
+        let distinct: BTreeSet<_> = seals.iter().collect();
+
+        let (result, stats) = verify_token_with_seal_stats(
+            &token,
+            &tb,
+            &MintJustificationRegistry::new(),
+            VerificationPolicy::default(),
+        );
+        result.unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(stats.quorum_checks as usize, distinct.len(), "{name}");
+        assert_eq!(
+            (stats.quorum_checks + stats.memo_hits) as usize,
+            seals.len(),
+            "{name}"
+        );
+    }
 }

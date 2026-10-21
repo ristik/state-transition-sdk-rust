@@ -1,0 +1,17 @@
+{
+  "partitionId": 7,
+  "shardIds": [
+    "20",
+    "60",
+    "a0",
+    "e0"
+  ],
+  "shardConfHashes": [
+    "efb315af969a8b25544a2670d5186610a931f1b208ae2ffec97bbb986c34de00",
+    "de3dbf4a6f6bf2635115f6adceba12ff8fdc2d8ffc34c2ce59ebbf0cbc0b7eb5",
+    "85c0800c3868aa2614e9652ea15d730dc9b10e6323a7a0fac4d53c73bd796953",
+    "727e2a45240e3ccf367fea3e7ef2fea014921bf16e7ff501a477caee8f8defad"
+  ],
+  "shardTreeRoot": "d4ebd3163aeb46d3c38b5e6c1c72a155a8660feec246d7c27e5e12e19d7bd768",
+  "sealHash": "70343a3df6b6fe46bf99d1963f4fcbdc2cce7aa0cb1b600d2b598fda3c6fe5b8"
+}

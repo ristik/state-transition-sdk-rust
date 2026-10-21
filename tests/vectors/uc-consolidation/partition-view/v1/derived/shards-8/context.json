@@ -1,0 +1,25 @@
+{
+  "partitionId": 7,
+  "shardIds": [
+    "10",
+    "30",
+    "50",
+    "70",
+    "90",
+    "b0",
+    "d0",
+    "f0"
+  ],
+  "shardConfHashes": [
+    "c742f8131ee3b16a76d3b24fe24134c6ac03f6068c49b24f300b5c580c59348d",
+    "8f2ae5f732abd1163a108c90c0e6dbc7e8caa69f234938da72e60d4263a7d93e",
+    "5ea7c55ab35cece441e715fd36642641fadbf22de9cf8840e9e88c7128a0227d",
+    "a92fd7593afbb28722ad51e06dd58e8799b223bbcef42d9c6894aee1b8e01990",
+    "260a6d9ea8ccd8c4ab2320f3012dfc867f15d274e3666d1c85e43e6105518ede",
+    "42d4d85471cf2e19de39b3726129725c9f7ae365dc55e9580e01869cedb133a3",
+    "051c6d09630bdda8b4a942c8d135660d49b60d80ac223bf8a4399a43c0d203e4",
+    "46c9882583cfb6b85bd5d144ecb70eaa9e95740ffd6b0fde88d659a4d83521ec"
+  ],
+  "shardTreeRoot": "6138fd22f982198f4d7ae03835d65de5583d4b4d8a9dea6e5d7394a55ba97562",
+  "sealHash": "fad8c2bbbeb7b49803c9b6e17500581310d1a661adcbccd55cac9177edd5195e"
+}

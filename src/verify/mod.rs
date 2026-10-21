@@ -32,20 +32,20 @@
 mod context;
 mod error;
 mod mint_justification;
+mod seal;
 
 pub use context::{VerificationContext, VerificationLimits, VerificationPolicy};
 pub use error::VerificationError;
 pub use mint_justification::{
     MintJustificationRegistry, MintJustificationVerifier, TokenDataVerifier,
 };
-
-use alloc::collections::BTreeSet;
-use alloc::vec::Vec;
+pub(crate) use seal::check_seal_shape;
+pub use seal::{SealAuthenticator, SealSession, SealStats, DEFAULT_SEAL_MEMO_CAPACITY};
 
 use crate::api::bft::{RootTrustBase, UnicityCertificate};
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::leaf_value::calculate_leaf_value;
-use crate::api::{NonInclusionProof, StateId};
+use crate::api::{NonInclusionProof, StateId, AGGREGATION_PARTITION_ID};
 use crate::crypto::hash::{DataHash, HashAlgorithm};
 use crate::predicate::builtin::SignaturePredicate;
 use crate::predicate::unlock::verify_signature_unlock;
@@ -77,11 +77,62 @@ pub fn verify_token_with_policy(
     registry: &MintJustificationRegistry,
     policy: VerificationPolicy,
 ) -> Result<(), VerificationError> {
-    trust_base
+    verify_token_with_seal_stats(token, trust_base, registry, policy).0
+}
+
+/// Like [`verify_token_with_policy`], additionally reporting how much quorum
+/// signature work the (operation-scoped) seal session performed. Seals shared
+/// by several proofs of the token, including nested source tokens, are
+/// authenticated once while they remain in the session's bounded memo.
+pub fn verify_token_with_seal_stats(
+    token: &Token,
+    trust_base: &RootTrustBase,
+    registry: &MintJustificationRegistry,
+    policy: VerificationPolicy,
+) -> (Result<(), VerificationError>, SealStats) {
+    verify_token_with_memo_capacity(
+        token,
+        trust_base,
+        registry,
+        policy,
+        DEFAULT_SEAL_MEMO_CAPACITY,
+    )
+}
+
+/// [`verify_token_with_seal_stats`] with an explicit memo capacity; `0` is the
+/// reference behavior that repeats every body and quorum check.
+pub(crate) fn verify_token_with_memo_capacity(
+    token: &Token,
+    trust_base: &RootTrustBase,
+    registry: &MintJustificationRegistry,
+    policy: VerificationPolicy,
+    capacity: usize,
+) -> (Result<(), VerificationError>, SealStats) {
+    let mut context =
+        VerificationContext::with_memo_capacity(trust_base, registry, policy, capacity);
+    let result = trust_base
         .validate()
-        .map_err(VerificationError::InvalidTrustBase)?;
-    let mut context = VerificationContext::new(trust_base, registry, policy);
-    verify_token_in_context(token, &mut context)
+        .map_err(VerificationError::InvalidTrustBase)
+        .and_then(|()| verify_token_in_context(token, &mut context));
+    (result, context.seals().stats())
+}
+
+/// Verify `token` inside an existing operation's seal session and return the
+/// session, so that later steps of the same operation reuse what was authenticated.
+#[cfg(feature = "client")]
+pub(crate) fn verify_token_in_session<'a>(
+    token: &Token,
+    session: SealSession<'a>,
+    registry: &'a MintJustificationRegistry,
+    policy: VerificationPolicy,
+) -> (Result<(), VerificationError>, SealSession<'a>) {
+    let trust_base = session.trust_base();
+    let mut context = VerificationContext::with_session(session, registry, policy);
+    let result = trust_base
+        .validate()
+        .map_err(VerificationError::InvalidTrustBase)
+        .and_then(|()| verify_token_in_context(token, &mut context));
+    (result, context.into_session())
 }
 
 pub(crate) fn verify_token_in_context(
@@ -97,7 +148,7 @@ pub(crate) fn verify_token_in_context(
 
     for (i, transfer) in token.transactions().iter().enumerate() {
         verify_inclusion_proof(
-            context.trust_base(),
+            context.seals(),
             transfer.inclusion_proof(),
             transfer.transaction(),
             transfer.reference_time(),
@@ -137,7 +188,7 @@ fn verify_genesis(
     }
 
     verify_inclusion_proof(
-        trust_base,
+        context.seals(),
         genesis.inclusion_proof(),
         mint,
         genesis.reference_time(),
@@ -156,7 +207,7 @@ fn verify_genesis(
 
 /// Verify a single inclusion proof for `transaction`.
 fn verify_inclusion_proof(
-    trust_base: &RootTrustBase,
+    seals: &mut SealSession<'_>,
     proof: &InclusionProof,
     transaction: &impl Transaction,
     reference_time: u64,
@@ -180,7 +231,7 @@ fn verify_inclusion_proof(
     // delegate the relation, shard, UC, and witness checks to the public
     // state-membership verifier.
     let state_id = StateId::derive(transaction.lock_script(), transaction.source_state_hash());
-    verify_inclusion_proof_for(trust_base, proof, &state_id, reference_time)
+    verify_inclusion_proof_in(seals, proof, &state_id, reference_time)
 }
 
 /// Verify that `state_id` is included at the certified root carried by `proof`.
@@ -193,9 +244,65 @@ pub fn verify_inclusion_proof_for(
     state_id: &StateId,
     reference_time: u64,
 ) -> Result<(), VerificationError> {
-    trust_base
-        .validate()
-        .map_err(VerificationError::InvalidTrustBase)?;
+    verify_inclusion_proof_in(
+        &mut SealSession::new(trust_base),
+        proof,
+        state_id,
+        reference_time,
+    )
+}
+
+/// [`verify_inclusion_proof_for`] within a caller-owned seal session, so that
+/// several proofs under one seal share a single signature check.
+pub fn verify_inclusion_proof_in(
+    seals: &mut SealSession<'_>,
+    proof: &InclusionProof,
+    state_id: &StateId,
+    reference_time: u64,
+) -> Result<(), VerificationError> {
+    verify_membership_in(seals, proof, state_id, reference_time)?;
+    let certification_data = &proof.certification_data;
+
+    // Finally, the unlock script must satisfy the (reconstructed) lock script.
+    verify_predicate(
+        certification_data.lock_script(),
+        reference_time,
+        certification_data.source_state_hash(),
+        certification_data.transaction_hash(),
+        certification_data.unlock_script(),
+    )
+}
+
+/// Everything [`verify_inclusion_proof_in`] checks **except** the unlock
+/// script: that the proof certifies `state_id` at `reference_time` (binding,
+/// expiry, reference-time order, tree path, shard) under a seal authenticated
+/// by the session's authority.
+///
+/// This is the evidence an already certified state needs for consolidation: the
+/// aggregator checked the witness when it certified the request, and token
+/// verification checks it again for every transaction; a seal replacement does
+/// not touch it.
+pub fn verify_membership_in(
+    seals: &mut SealSession<'_>,
+    proof: &InclusionProof,
+    state_id: &StateId,
+    reference_time: u64,
+) -> Result<(), VerificationError> {
+    verify_membership_under(seals, proof, state_id, reference_time, &[0; 32])
+}
+
+/// [`verify_membership_in`] with the seal memo namespaced by `policy`: a seal
+/// already authenticated under that policy (for example the master seal of an
+/// authenticated partition view, see `AuthenticatedView::policy`) is not
+/// checked again.
+pub fn verify_membership_under(
+    seals: &mut SealSession<'_>,
+    proof: &InclusionProof,
+    state_id: &StateId,
+    reference_time: u64,
+    policy: &[u8; 32],
+) -> Result<(), VerificationError> {
+    seals.ensure_trust_base()?;
     let inclusion_certificate = &proof.inclusion_certificate;
     let certification_data = &proof.certification_data;
 
@@ -216,11 +323,15 @@ pub fn verify_inclusion_proof_for(
         }
     }
 
-    let expected_root = DataHash::new(
-        HashAlgorithm::Sha256,
-        proof.unicity_certificate.input_record.hash.clone(),
-    )
-    .map_err(|_| VerificationError::PathInvalid)?;
+    // An inclusion proof needs a real 32-byte root: the empty tree (null) contains nothing.
+    let root = proof
+        .unicity_certificate
+        .input_record
+        .root_hash()
+        .map_err(|_| VerificationError::PathInvalid)?
+        .ok_or(VerificationError::PathInvalid)?;
+    let expected_root = DataHash::new(HashAlgorithm::Sha256, root.to_vec())
+        .map_err(|_| VerificationError::PathInvalid)?;
     if proof.reference_time != reference_time {
         return Err(VerificationError::ReferenceTimeMismatch);
     }
@@ -239,27 +350,37 @@ pub fn verify_inclusion_proof_for(
     }
 
     // The unicity certificate must chain to a quorum-signed seal on our network.
-    verify_unicity_certificate(trust_base, &proof.unicity_certificate)?;
-
-    // Finally, the unlock script must satisfy the (reconstructed) lock script.
-    verify_predicate(
-        certification_data.lock_script(),
-        reference_time,
-        certification_data.source_state_hash(),
-        certification_data.transaction_hash(),
-        certification_data.unlock_script(),
-    )?;
-
-    Ok(())
+    verify_unicity_certificate(seals, &proof.unicity_certificate, policy)
 }
 
 fn verify_unicity_certificate(
-    trust_base: &RootTrustBase,
+    seals: &mut SealSession<'_>,
     uc: &UnicityCertificate,
+    policy: &[u8; 32],
 ) -> Result<(), VerificationError> {
+    // The body (network, shard path and partition path folding to the seal hash)
+    // and the seal's quorum are properties of the certificate alone: an identical
+    // certificate that already passed in this operation is not recomputed. Only
+    // complete equality (seal witness included) hits; every per-proof check -
+    // request, expiry, reference time, leaf path, shard membership, predicate - is
+    // done by the caller for each proof. The fixed partition is checked first, so
+    // a memo hit can never carry a certificate of another partition.
+    if uc.unicity_tree_certificate.partition_identifier != AGGREGATION_PARTITION_ID {
+        return Err(VerificationError::PartitionMismatch);
+    }
+    if seals.body_verified(uc, policy) {
+        return Ok(());
+    }
+    seals.note_body_check();
     let seal = &uc.unicity_seal;
 
-    if seal.network_id != trust_base.network_id {
+    // Go's UnicityCertificate.IsValid structure, before any hashing or signature work: the
+    // input record's conditional rules, the technical record hash and the seal's shape.
+    uc.check_body()
+        .map_err(|_| VerificationError::CertificateBodyInvalid)?;
+    check_seal_shape(seal)?;
+
+    if seal.network_id != seals.trust_base().network_id {
         return Err(VerificationError::SealNetworkMismatch);
     }
 
@@ -271,32 +392,10 @@ fn verify_unicity_certificate(
         return Err(VerificationError::SealRootMismatch);
     }
 
-    // Count distinct, valid root-node signatures over the seal hash.
-    let seal_hash = seal.calculate_hash();
-    let mut counted: BTreeSet<&str> = BTreeSet::new();
-    let mut counted_keys = Vec::new();
-    for (node_id, signature) in &seal.signatures {
-        if counted.contains(node_id.as_str()) {
-            continue;
-        }
-        let Some(key) = trust_base.signing_key(node_id) else {
-            continue;
-        };
-        if counted_keys.contains(&key) {
-            continue;
-        }
-        let Ok(sig) = crate::crypto::signature::Signature::decode(signature) else {
-            continue;
-        };
-        if sig.verify(seal_hash.data(), key) {
-            counted.insert(node_id.as_str());
-            counted_keys.push(key);
-        }
-    }
-
-    if (counted.len() as u64) < trust_base.quorum_threshold {
-        return Err(VerificationError::QuorumNotMet);
-    }
+    // The root must be signed by a quorum of the trusted validators; an
+    // identical seal already authenticated in this session is not re-checked.
+    seals.verify_quorum_under(seal, policy)?;
+    seals.remember_body(uc, policy);
     Ok(())
 }
 
@@ -309,18 +408,22 @@ pub fn verify_non_inclusion_proof(
     proof: &NonInclusionProof,
     target: &StateId,
 ) -> Result<(), VerificationError> {
-    trust_base
-        .validate()
-        .map_err(VerificationError::InvalidTrustBase)?;
+    let mut seals = SealSession::new(trust_base);
+    seals.ensure_trust_base()?;
 
     let uc = proof.unicity_certificate();
-    let expected_root = match uc.input_record.hash.as_slice() {
-        [] => None,
-        bytes if bytes.len() == 32 => Some(
+    // Only an authenticated native `null` is the empty tree. An empty byte string (`40`), the
+    // all-zero hash and any other length are not: they are rejected, never mapped to "empty".
+    let expected_root = match uc
+        .input_record
+        .root_hash()
+        .map_err(|_| VerificationError::NonInclusionCertificateInvalid)?
+    {
+        None => None,
+        Some(bytes) => Some(
             DataHash::new(HashAlgorithm::Sha256, bytes.to_vec())
                 .map_err(|_| VerificationError::NonInclusionCertificateInvalid)?,
         ),
-        _ => return Err(VerificationError::NonInclusionCertificateInvalid),
     };
 
     if !proof
@@ -343,7 +446,7 @@ pub fn verify_non_inclusion_proof(
 
     // Authenticate the root before reporting whether the terminal is the
     // requested state. An untrusted certificate must never yield StateIncluded.
-    verify_unicity_certificate(trust_base, uc)?;
+    verify_unicity_certificate(&mut seals, uc, &[0; 32])?;
 
     if proof.certificate().terminal_matches(target) {
         return Err(VerificationError::StateIncluded);
@@ -382,6 +485,21 @@ fn verify_predicate(
 #[cfg(all(test, feature = "client"))]
 mod tests {
     use super::*;
+
+    /// Verify with a fresh seal session per call (the pre-session behavior).
+    fn verify_inclusion_proof(
+        trust_base: &RootTrustBase,
+        proof: &InclusionProof,
+        transaction: &impl Transaction,
+        reference_time: u64,
+    ) -> Result<(), VerificationError> {
+        super::verify_inclusion_proof(
+            &mut SealSession::new(trust_base),
+            proof,
+            transaction,
+            reference_time,
+        )
+    }
 
     /// Reference time every fixture in this module certifies under.
     const REFERENCE_TIME: u64 = 1755000000;
@@ -435,7 +553,7 @@ mod tests {
     fn mk_seal(hash: Vec<u8>, signatures: Vec<(String, Vec<u8>)>) -> UnicitySeal {
         UnicitySeal {
             network_id: NetworkId::LOCAL,
-            root_chain_round_number: 0,
+            root_chain_round_number: 1,
             epoch: 0,
             timestamp: REFERENCE_TIME,
             previous_hash: None,
@@ -479,27 +597,36 @@ mod tests {
 
     /// A unicity certificate committing to `root`, signed by `node`.
     fn signed_uc(node: &Secp256k1Signer, root: [u8; 32]) -> UnicityCertificate {
-        let input_record = InputRecord {
-            round_number: 0,
-            epoch: 0,
-            previous_hash: None,
-            hash: root.to_vec(),
-            summary_value: Vec::new(),
-            timestamp: REFERENCE_TIME,
-            block_hash: None,
-            sum_of_earned_fees: 0,
-            executed_transactions_hash: None,
-        };
+        signed_uc_with(
+            node,
+            InputRecord {
+                round_number: 0,
+                epoch: 0,
+                previous_hash: None,
+                hash: Some(root.to_vec()),
+                summary_value: Some(Vec::new()),
+                timestamp: REFERENCE_TIME,
+                block_hash: Some(alloc::vec![5; 32]),
+                sum_of_earned_fees: 0,
+                executed_transactions_hash: None,
+            },
+        )
+    }
+
+    /// A unicity certificate carrying exactly `input_record`, independently signed by `node`
+    /// (the signature covers the record as given, so a rejection is never caused by a broken
+    /// signature).
+    fn signed_uc_with(node: &Secp256k1Signer, input_record: InputRecord) -> UnicityCertificate {
         let mut uc = UnicityCertificate {
             input_record,
-            technical_record_hash: None,
+            technical_record_hash: Some(alloc::vec![6; 32]),
             shard_configuration_hash: alloc::vec![0u8; 32],
             shard_tree_certificate: ShardTreeCertificate {
                 shard: empty_shard(),
                 sibling_hash_list: Vec::new(),
             },
             unicity_tree_certificate: UnicityTreeCertificate {
-                partition_identifier: 0,
+                partition_identifier: crate::api::AGGREGATION_PARTITION_ID,
                 steps: Vec::new(),
             },
             unicity_seal: mk_seal(alloc::vec![0u8; 32], Vec::new()),
@@ -604,6 +731,75 @@ mod tests {
         );
     }
 
+    // --- inclusion-path shard binding ---------------------------------------
+
+    /// A certificate the root signed for a shard that does not own the state id must not verify
+    /// after it is relabelled to a longer label that does (same seal and siblings, no new signature).
+    #[test]
+    fn relabel_without_resealing() {
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        let sid = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        let bit = |i: usize| (sid.bytes()[i / 8] >> (7 - (i % 8))) & 1;
+        let b0 = bit(0);
+        let l = (2..64).find(|&l| bit(l - 1) != b0).unwrap(); // last label bit != first state-id bit
+        let child = |s: &ShardId, b: u8| {
+            let (z, o) = s.split();
+            if b == 0 {
+                z
+            } else {
+                o
+            }
+        };
+        let real = child(&ShardId::root(), 1 - b0); // 1-bit shard that does NOT own sid
+        let mut forged = ShardId::root();
+        for i in 0..l {
+            forged = child(&forged, bit(i)); // l-bit prefix of sid
+        }
+        let uc = &mut proof.unicity_certificate;
+        uc.input_record.block_hash = Some(alloc::vec![5; 32]);
+        uc.technical_record_hash = Some(alloc::vec![6; 32]);
+        uc.shard_tree_certificate.shard = real;
+        uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
+        reseal(&mut proof, &node); // the root certifies shard `real`
+        assert_eq!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+            Err(VerificationError::ShardMismatch)
+        );
+        proof.unicity_certificate.shard_tree_certificate.shard = forged; // no re-signing
+        assert!(
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME).is_err(),
+            "a relabelled shard with a different sibling count must not verify"
+        );
+    }
+
+    // --- authenticating a proof of other data ------------------------------
+
+    /// `submit_and_wait_verified` believes "another request won the race" only for a proof
+    /// that verifies under the trust base.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_proof_of_other_data_is_believed_only_when_it_verifies() {
+        use crate::client::{conflict_error, HttpError};
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        let sid = StateId::derive(transfer.lock_script(), transfer.source_state_hash());
+        assert!(matches!(
+            conflict_error(&proof, &sid, &tb),
+            HttpError::StateCertifiedWithOtherData
+        ));
+        // a seal signed by an untrusted key is only an unauthenticated hint
+        assert!(matches!(
+            conflict_error(&proof, &sid, &trust_base(&signer(0x99))),
+            HttpError::ProofOfOtherData
+        ));
+        // so is a certificate whose seal does not cover the contents
+        proof.unicity_certificate.input_record.block_hash = Some(alloc::vec![1; 32]);
+        assert!(matches!(
+            conflict_error(&proof, &sid, &tb),
+            HttpError::ProofOfOtherData
+        ));
+        let _ = node;
+    }
+
     // --- non-inclusion proof rules ----------------------------------------
 
     #[test]
@@ -685,6 +881,7 @@ mod tests {
         // One-bit shard `0`: the target belongs to it, but the authenticated
         // terminal starts with `1` and therefore cannot belong to this root.
         uc.shard_tree_certificate.shard = ShardId::decode(&[0b0100_0000]).unwrap();
+        uc.shard_tree_certificate.sibling_hash_list = alloc::vec![alloc::vec![7; 32]];
         let seal_hash = uc.computed_seal_hash().unwrap().data().to_vec();
         let signature = node
             .sign(&mk_seal(seal_hash.clone(), Vec::new()).calculate_hash())
@@ -850,7 +1047,7 @@ mod tests {
     fn rule_path_invalid() {
         let (tb, node, _o, transfer, mut proof) = transfer_case();
         // Point the inclusion proof at a different state-tree root.
-        proof.unicity_certificate.input_record.hash = alloc::vec![0xCDu8; 32];
+        proof.unicity_certificate.input_record.hash = Some(alloc::vec![0xCDu8; 32]);
         reseal(&mut proof, &node); // keep the seal consistent so PATH fails first
         assert_eq!(
             verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
@@ -868,6 +1065,83 @@ mod tests {
         assert_eq!(
             verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
             Err(VerificationError::ShardMismatch)
+        );
+    }
+
+    #[test]
+    fn the_aggregation_partition_is_fixed_at_seven() {
+        assert_eq!(crate::api::AGGREGATION_PARTITION_ID, 7);
+        assert_eq!(crate::AGGREGATION_PARTITION_ID, 7);
+    }
+
+    /// A certificate of another partition, validly signed by the trusted root (so only the
+    /// partition rule can fire), is rejected by every application verification path.
+    #[test]
+    fn rule_partition_mismatch_is_enforced_on_a_validly_signed_proof() {
+        let (tb, node, _o, transfer, mut proof) = transfer_case();
+        for other in [0u32, 1, 6, 8, 0x0a0b_0c0d] {
+            proof
+                .unicity_certificate
+                .unicity_tree_certificate
+                .partition_identifier = other;
+            reseal(&mut proof, &node);
+            assert_eq!(
+                verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+                Err(VerificationError::PartitionMismatch),
+                "partition {other}"
+            );
+        }
+    }
+
+    /// A seal memo hit for a certificate of the fixed partition never lets another partition's
+    /// certificate through in the same session, and the rejected one is not remembered.
+    #[test]
+    fn partition_is_checked_on_a_session_with_a_warm_seal_memo() {
+        let (tb, node, _o, transfer, proof) = transfer_case();
+        let mut session = SealSession::new(&tb);
+        assert_eq!(
+            super::verify_inclusion_proof(&mut session, &proof, &transfer, REFERENCE_TIME),
+            Ok(())
+        );
+        let mut foreign = proof.clone();
+        foreign
+            .unicity_certificate
+            .unicity_tree_certificate
+            .partition_identifier += 1;
+        reseal(&mut foreign, &node);
+        assert_eq!(
+            super::verify_inclusion_proof(&mut session, &foreign, &transfer, REFERENCE_TIME),
+            Err(VerificationError::PartitionMismatch)
+        );
+        // the same session keeps accepting the real partition (a memo hit)
+        assert_eq!(
+            super::verify_inclusion_proof(&mut session, &proof, &transfer, REFERENCE_TIME),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn non_inclusion_rejects_a_validly_signed_foreign_partition() {
+        let node = signer(0x11);
+        let tb = trust_base(&node);
+        let mut proof = singleton_non_inclusion_proof(&node, [0x10; 32], [0x20; 32]);
+        let target = state_id([0x30; 32]);
+        assert_eq!(
+            super::verify_non_inclusion_proof(&tb, &proof, &target),
+            Ok(())
+        );
+        let mut uc = proof.unicity_certificate().clone();
+        uc.unicity_tree_certificate.partition_identifier = 8;
+        let seal_hash = uc.computed_seal_hash().unwrap().data().to_vec();
+        let signature = node
+            .sign(&mk_seal(seal_hash.clone(), Vec::new()).calculate_hash())
+            .encode()
+            .to_vec();
+        uc.unicity_seal = mk_seal(seal_hash, alloc::vec![("NODE".to_string(), signature)]);
+        proof = NonInclusionProof::new(proof.certificate().clone(), uc);
+        assert_eq!(
+            super::verify_non_inclusion_proof(&tb, &proof, &target),
+            Err(VerificationError::PartitionMismatch)
         );
     }
 
@@ -892,13 +1166,112 @@ mod tests {
     }
 
     #[test]
-    fn rule_quorum_not_met_without_signatures() {
+    fn rule_seal_without_signatures_is_malformed_before_any_quorum_work() {
         let (tb, _n, _o, transfer, mut proof) = transfer_case();
         proof.unicity_certificate.unicity_seal.signatures = Vec::new();
         assert_eq!(
             verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
-            Err(VerificationError::QuorumNotMet)
+            Err(VerificationError::SealMalformed)
         );
+    }
+
+    /// Go's `UnicityCertificate.IsValid` on the ordinary path, with its conditional semantics.
+    /// Every certificate here is validly signed by the trusted key (re-sealed after the change),
+    /// so only the structural rule can fire, and a rejection is a typed error, never a panic.
+    #[test]
+    fn go_is_valid_rules_on_the_ordinary_path() {
+        let (tb, node, _o, transfer, base) = transfer_case();
+        let check = |change: &dyn Fn(&mut UnicityCertificate)| {
+            let mut proof = base.clone();
+            change(&mut proof.unicity_certificate);
+            reseal(&mut proof, &node);
+            verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME)
+        };
+        assert_eq!(check(&|_| {}), Ok(()));
+        let body = Err(VerificationError::CertificateBodyInvalid);
+        // round != 0: summary value present and timestamp assigned
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.round_number = 1;
+                uc.input_record.summary_value = None;
+            }),
+            body
+        );
+        // an unassigned timestamp: the inclusion path's reference-time rule fires first, so the
+        // structural rule is asserted on the shared helper itself
+        let mut uc = base.unicity_certificate.clone();
+        uc.input_record.round_number = 1;
+        uc.input_record.timestamp = 0;
+        assert!(uc.check_body().is_err());
+        // ... but a null summary value is legal at round 0
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.round_number = 0;
+                uc.input_record.summary_value = None;
+            }),
+            Ok(())
+        );
+        // unchanged state hash => empty block hash; changed => non-empty
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.previous_hash = uc.input_record.hash.clone();
+            }),
+            body
+        );
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.previous_hash = uc.input_record.hash.clone();
+                uc.input_record.block_hash = None;
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            check(&|uc| {
+                uc.input_record.previous_hash = uc.input_record.hash.clone();
+                uc.input_record.block_hash = Some(Vec::new());
+            }),
+            Ok(()),
+            "empty and null block hash are the same for Go"
+        );
+        assert_eq!(check(&|uc| uc.input_record.block_hash = None), body);
+        // technical record hash: exactly 32 bytes
+        assert_eq!(check(&|uc| uc.technical_record_hash = None), body);
+        assert_eq!(
+            check(&|uc| uc.technical_record_hash = Some(alloc::vec![6; 31])),
+            body
+        );
+        // seal shape
+        let malformed = Err(VerificationError::SealMalformed);
+        // (the shape rules run before the signature work, so the seal is changed in place)
+        for change in [
+            (|s: &mut UnicitySeal| s.root_chain_round_number = 0) as fn(&mut UnicitySeal),
+            |s| s.timestamp = 0,
+        ] {
+            let mut proof = base.clone();
+            change(&mut proof.unicity_certificate.unicity_seal);
+            assert_eq!(
+                verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+                malformed
+            );
+        }
+    }
+
+    #[test]
+    fn seal_signature_entries_must_not_be_empty() {
+        let (tb, _n, _o, transfer, base) = transfer_case();
+        for tamper in [0, 1] {
+            let mut proof = base.clone();
+            let sigs = &mut proof.unicity_certificate.unicity_seal.signatures;
+            if tamper == 0 {
+                sigs[0].0 = String::new();
+            } else {
+                sigs[0].1 = Vec::new();
+            }
+            assert_eq!(
+                verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
+                Err(VerificationError::SealMalformed)
+            );
+        }
     }
 
     #[test]

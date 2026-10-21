@@ -1,0 +1,12 @@
+{
+  "corpus": "uc-consolidation/partition-view/v1",
+  "description": "PartitionViewV1 golden bytes (verbatim) and derived cross-implementation vectors produced by the frozen Go reference.",
+  "provenance": {
+    "repository": "unicitynetwork/bft-go-base",
+    "branch": "uc-consolidation",
+    "commit": "6251c1d73eeefd660b26f3bb1d351dd9c7d683bd",
+    "golden": "types/testdata/partition-view/v1 (copied byte-for-byte into golden/, including its manifest.json)",
+    "derived": "generator/gen_rust_vectors_test.go.txt dropped into types/ of that commit as gen_rust_vectors_test.go, run with GEN_RUST_VECTORS_DIR=<dir> go test ./types -run Test_GenRustVectors (deterministic: fixed key 0x11*32, fixed seal time; two runs are byte-identical)"
+  },
+  "note": "Not yet frozen upstream: get_inclusion_proofs.v1 JSON shapes (aggregator-go PR 193) and the F1 fixture corpus. This directory only covers the frozen PartitionViewV1 codec and the shard-tree/UC assembly of bft-go-base."
+}

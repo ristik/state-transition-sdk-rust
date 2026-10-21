@@ -7,10 +7,27 @@
 //! unlock script, submit the certification request, fetch the inclusion proof,
 //! assemble the token, and **verify it** before returning.
 
+mod batch;
+mod consolidate;
 #[cfg(feature = "http")]
 mod http;
+#[cfg(all(test, feature = "http"))]
+pub(crate) use http::conflict_error;
 #[cfg(feature = "http")]
-pub use http::{HttpAggregatorClient, HttpError};
+pub use http::{HttpAggregatorClient, HttpError, SubmitOutcome, DEFAULT_UNKNOWN_GRACE};
+
+pub use batch::{
+    detail, rpc_code, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
+    InclusionProofBatch, RequestOptions, StateRoot, MAX_BATCH_STATE_IDS, UNCLASSIFIED,
+};
+pub use consolidate::{
+    AdmissionWork, BundleOutcome, CancelToken, Clock, ConsolidateOptions, ConsolidationError,
+    ConsolidationOutcome, ConsolidationSummary, IntegrityError, ProofBundle, ProofClient,
+    ProofClientConfig, ProofItem, SequentialExecutor, UnavailableReason, WaveExecutor,
+    DEFAULT_TIMEOUT_MS,
+};
+#[cfg(feature = "std")]
+pub use consolidate::{SystemClock, ThreadedExecutor};
 
 use alloc::vec::Vec;
 use core::fmt;

@@ -50,8 +50,17 @@ impl InclusionProof {
     ///
     /// [`InclusionProofResponse`]: super::InclusionProofResponse
     pub fn from_cbor(d: Decoder<'_>) -> Result<Self, Error> {
-        let parts = DecodedParts::from_cbor(d)?;
+        let parts = DecodedParts::from_cbor(d, None)?;
         parts.into_certified()
+    }
+
+    /// Like [`from_cbor`](Self::from_cbor), decoding the unicity certificate
+    /// through `interner` so identical certificates of one operation are parsed once.
+    pub fn from_cbor_interned(
+        d: Decoder<'_>,
+        interner: &mut super::bft::UcInterner,
+    ) -> Result<Self, Error> {
+        DecodedParts::from_cbor(d, Some(interner))?.into_certified()
     }
 
     /// Encode to CBOR (tagged).
@@ -100,7 +109,10 @@ pub(super) struct DecodedParts {
 }
 
 impl DecodedParts {
-    pub(super) fn from_cbor(d: Decoder<'_>) -> Result<Self, Error> {
+    pub(super) fn from_cbor(
+        d: Decoder<'_>,
+        interner: Option<&mut super::bft::UcInterner>,
+    ) -> Result<Self, Error> {
         let inner = d.expect_tag(INCLUSION_PROOF_TAG)?;
         let items = inner.array(Some(5))?;
         if items[0].uint()? != VERSION {
@@ -128,7 +140,10 @@ impl DecodedParts {
             certification_data,
             reference_time,
             inclusion_certificate,
-            unicity_certificate: UnicityCertificate::from_cbor(items[4])?,
+            unicity_certificate: match interner {
+                Some(i) => i.decode(items[4])?,
+                None => UnicityCertificate::from_cbor(items[4])?,
+            },
         })
     }
 

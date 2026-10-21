@@ -9,7 +9,7 @@ repository = "https://github.com/unicitynetwork/state-transition-sdk-rust"
 categories = ["cryptography", "no-std"]
 keywords = ["unicity", "token", "zkvm", "cbor", "secp256k1"]
 # Internal design doc; not part of the published API surface.
-exclude = ["rust-sdk-plan.md"]
+exclude = ["rust-sdk-plan.md", "zkvm"]
 
 # Build docs.rs with every feature so the `http`/`client` types are documented.
 [package.metadata.docs.rs]
@@ -57,6 +57,14 @@ required-features = ["http"]
 
 [[example]]
 name = "split"
+required-features = ["http"]
+
+[[example]]
+name = "consolidate_for_bridge"
+required-features = ["http"]
+
+[[example]]
+name = "consolidate_for_zkvm"
 required-features = ["http"]
 
 [profile.release]

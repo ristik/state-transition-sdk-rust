@@ -47,7 +47,7 @@ impl InclusionProofResponse {
     pub fn from_cbor(d: Decoder<'_>) -> Result<Self, Error> {
         let items = d.array(Some(2))?;
         let block_number = items[0].uint()?;
-        let parts = DecodedParts::from_cbor(items[1])?;
+        let parts = DecodedParts::from_cbor(items[1], None)?;
 
         if parts.certification_data.is_none() {
             return Ok(InclusionProofResponse::NotCertified {

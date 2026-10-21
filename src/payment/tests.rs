@@ -72,7 +72,7 @@ fn empty_shard() -> ShardId {
 fn mk_seal(hash: Vec<u8>, signatures: Vec<(String, Vec<u8>)>) -> UnicitySeal {
     UnicitySeal {
         network_id: NetworkId::LOCAL,
-        root_chain_round_number: 0,
+        root_chain_round_number: 1,
         epoch: 0,
         timestamp: REFERENCE_TIME,
         previous_hash: None,
@@ -95,23 +95,23 @@ fn signed_uc(node: &Secp256k1Signer, root: [u8; 32]) -> UnicityCertificate {
         round_number: 0,
         epoch: 0,
         previous_hash: None,
-        hash: root.to_vec(),
-        summary_value: Vec::new(),
+        hash: Some(root.to_vec()),
+        summary_value: Some(Vec::new()),
         timestamp: REFERENCE_TIME,
-        block_hash: None,
+        block_hash: Some(vec![5; 32]),
         sum_of_earned_fees: 0,
         executed_transactions_hash: None,
     };
     let mut uc = UnicityCertificate {
         input_record,
-        technical_record_hash: None,
+        technical_record_hash: Some(vec![6; 32]),
         shard_configuration_hash: vec![0u8; 32],
         shard_tree_certificate: ShardTreeCertificate {
             shard: empty_shard(),
             sibling_hash_list: Vec::new(),
         },
         unicity_tree_certificate: UnicityTreeCertificate {
-            partition_identifier: 0,
+            partition_identifier: crate::api::AGGREGATION_PARTITION_ID,
             steps: Vec::new(),
         },
         unicity_seal: mk_seal(vec![0u8; 32], Vec::new()),

@@ -1,10 +1,10 @@
 //! Shared state and cumulative limits for recursive token verification.
 
-use crate::api::bft::RootTrustBase;
+use crate::api::bft::{RootTrustBase, UcInterner};
 use crate::cbor::DecodeLimits;
 use crate::transaction::Token;
 
-use super::{verify_token_in_context, MintJustificationRegistry, VerificationError};
+use super::{verify_token_in_context, MintJustificationRegistry, SealSession, VerificationError};
 
 /// Resource limits applied across one complete, possibly recursive verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,8 @@ pub struct VerificationContext<'a> {
     trust_base: &'a RootTrustBase,
     registry: &'a MintJustificationRegistry,
     policy: VerificationPolicy,
+    seals: SealSession<'a>,
+    interner: UcInterner,
     embedded_token_depth: usize,
     total_embedded_token_bytes: usize,
 }
@@ -67,23 +69,65 @@ impl core::fmt::Debug for VerificationContext<'_> {
 }
 
 impl<'a> VerificationContext<'a> {
-    pub(crate) fn new(
+    /// A context whose seal/certificate memos hold at most `capacity` entries
+    /// (`0` disables reuse: the slow reference behavior).
+    pub(crate) fn with_memo_capacity(
         trust_base: &'a RootTrustBase,
         registry: &'a MintJustificationRegistry,
         policy: VerificationPolicy,
+        capacity: usize,
     ) -> Self {
         Self {
             trust_base,
             registry,
             policy,
+            seals: SealSession::with_capacity(trust_base, capacity),
+            interner: UcInterner::with_capacity(capacity),
             embedded_token_depth: 0,
             total_embedded_token_bytes: 0,
         }
     }
 
+    /// A context that continues an existing operation's seal session (so seals
+    /// authenticated earlier in the same operation are not checked again).
+    #[cfg(feature = "client")]
+    pub(crate) fn with_session(
+        seals: SealSession<'a>,
+        registry: &'a MintJustificationRegistry,
+        policy: VerificationPolicy,
+    ) -> Self {
+        Self {
+            trust_base: seals.trust_base(),
+            registry,
+            policy,
+            seals,
+            interner: UcInterner::new(),
+            embedded_token_depth: 0,
+            total_embedded_token_bytes: 0,
+        }
+    }
+
+    /// Hand the operation's seal session back.
+    #[cfg(feature = "client")]
+    pub(crate) fn into_session(self) -> SealSession<'a> {
+        self.seals
+    }
+
     /// Root of trust used by the entire recursive verification chain.
     pub fn trust_base(&self) -> &RootTrustBase {
         self.trust_base
+    }
+
+    /// The seal authentication session shared by the whole recursive
+    /// verification: repeated seals are checked against the quorum once.
+    pub fn seals(&mut self) -> &mut SealSession<'a> {
+        &mut self.seals
+    }
+
+    /// The operation's certificate interner: decode embedded tokens through it
+    /// so identical certificates are parsed once per verification.
+    pub fn interner(&mut self) -> &mut UcInterner {
+        &mut self.interner
     }
 
     /// Active verification policy and limits.
