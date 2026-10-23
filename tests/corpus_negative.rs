@@ -227,6 +227,8 @@ fn seal_class(e: &VerificationError) -> String {
         // is refused by name, not as a missed quorum
         QuorumNotMet
         | SealNetworkMismatch
+        // the fork's native seal rule refuses a seal carrying any unknown or invalid signature
+        // (the other-authority case) instead of counting the valid ones towards a quorum
         | SealSignerInvalid
         | EpochBeforeGenesis
         | UnknownTrustEpoch { .. }
