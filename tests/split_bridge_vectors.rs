@@ -277,9 +277,11 @@ fn refusals() {
     // the issuance policy is applied to every ancestor: refusing the root refuses the leaf
     let strict = registry(&v.token_type, splits_only);
     let refused = verify_payment_token(&leaf, &v.history, &strict, wallet_value);
-    assert!(
-        format!("{refused:?}").contains("PaymentIssuanceRejected"),
-        "{refused:?}"
+    // the leaf is two splits below the root: the root's refusal surfaces through each burned ancestor
+    let burned = |e| VerificationError::BurnTokenVerificationFailed(Box::new(e));
+    assert_eq!(
+        refused,
+        Err(burned(burned(VerificationError::PaymentIssuanceRejected)))
     );
     // and the same leaf verifies once the root is admitted (the refusal above is the root's)
     let admitted = registry(&v.token_type, issuance);
@@ -315,7 +317,15 @@ fn refusals() {
         None,
         None,
     );
-    assert!(matches!(r, Err(SplitError::Build(_))), "{r:?}");
+    assert!(
+        matches!(
+            r,
+            Err(SplitError::Build(Error::UnexpectedValue(
+                "split asset total does not match source amount"
+            )))
+        ),
+        "{r:?}"
+    );
 
     // an envelope with a memo is not a wallet value
     let amount = BigUint::from(1u8);
