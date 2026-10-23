@@ -30,29 +30,96 @@ use crate::transaction::{Token, TransferTransaction};
 use crate::verify::MintJustificationRegistry;
 use crate::VerificationError;
 
+/// The payment payload of one split output: the assets it is allocated plus the
+/// exact bytes minted as its auxiliary data (the Rust counterpart of the
+/// TypeScript `IPaymentData`).
+///
+/// The bytes are what the allocation commitment `d_j` hashes, so they may wrap
+/// the asset collection in an application envelope. Fields are private and the
+/// only constructors are [`bare`](Self::bare) and the checked
+/// [`new`](Self::new), so a payload whose bytes disagree with its assets cannot
+/// exist. The bytes are owned and immutable once frozen here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitOutputPayload {
+    assets: PaymentAssetCollection,
+    bytes: Vec<u8>,
+}
+
+impl SplitOutputPayload {
+    /// Bare payload: the bytes are exactly the canonical encoding of `assets`.
+    pub fn bare(assets: PaymentAssetCollection) -> Self {
+        let bytes = assets.to_cbor();
+        SplitOutputPayload { assets, bytes }
+    }
+
+    /// Checked constructor for an application-specific payload. `bytes` is
+    /// decoded with `decode_payment_data` (the decoder the verifier will use)
+    /// and the decoded assets must equal `assets`; otherwise nothing is built.
+    pub fn new(
+        assets: PaymentAssetCollection,
+        bytes: Vec<u8>,
+        decode_payment_data: PaymentDataDecoder,
+    ) -> Result<Self, Error> {
+        let decoded = decode_payment_data(&bytes)?;
+        if decoded != assets {
+            return Err(Error::UnexpectedValue(
+                "split output payload does not decode to the declared assets",
+            ));
+        }
+        Ok(SplitOutputPayload { assets, bytes })
+    }
+
+    /// The assets allocated to the output.
+    pub fn assets(&self) -> &PaymentAssetCollection {
+        &self.assets
+    }
+
+    /// The exact bytes to mint and to commit to.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// A request to mint one new token as part of a split.
 #[derive(Debug, Clone)]
 pub struct SplitTokenRequest {
     recipient: EncodedPredicate,
     token_type: TokenType,
-    assets: PaymentAssetCollection,
+    payload: SplitOutputPayload,
     salt: TokenSalt,
 }
 
 impl SplitTokenRequest {
     /// Create a request: `recipient` locks the new token, which receives
-    /// `assets` and is identified by `token_type` and `salt`. `token_type` must
-    /// equal the source token type (splitting is not a type-conversion).
+    /// `assets` (minted as their bare canonical encoding) and is identified by
+    /// `token_type` and `salt`. `token_type` must equal the source token type
+    /// (splitting is not a type-conversion).
     pub fn create(
         recipient: EncodedPredicate,
         assets: PaymentAssetCollection,
         token_type: TokenType,
         salt: TokenSalt,
     ) -> Self {
+        Self::create_with_payload(
+            recipient,
+            SplitOutputPayload::bare(assets),
+            token_type,
+            salt,
+        )
+    }
+
+    /// Like [`create`](Self::create), for an output whose mint data is an
+    /// application-specific payload (see [`SplitOutputPayload::new`]).
+    pub fn create_with_payload(
+        recipient: EncodedPredicate,
+        payload: SplitOutputPayload,
+        token_type: TokenType,
+        salt: TokenSalt,
+    ) -> Self {
         SplitTokenRequest {
             recipient,
             token_type,
-            assets,
+            payload,
             salt,
         }
     }
@@ -71,6 +138,9 @@ pub struct SplitToken {
     pub salt: TokenSalt,
     /// Assets the new token receives (canonical order).
     pub assets: PaymentAssetCollection,
+    /// The exact bytes to mint as the new token's data: the bytes the allocation
+    /// proofs commit to (the bare encoding of `assets` for a bare request).
+    pub payload: Vec<u8>,
     /// One allocation proof per asset, in canonical output-asset order.
     pub proofs: Vec<RsmstInclusionProof>,
 }
@@ -201,7 +271,7 @@ impl TokenSplit {
                     "split output token type must equal source token type",
                 ));
             }
-            for asset in request.assets.as_slice() {
+            for asset in request.payload.assets.as_slice() {
                 if assets.get(asset.id()).is_none() {
                     return Err(Error::UnexpectedValue(
                         "split output asset is absent from source token",
@@ -219,7 +289,7 @@ impl TokenSplit {
                 &request.salt,
                 &token_id,
                 &request.token_type,
-                &request.assets.to_cbor(),
+                request.payload.bytes(),
             );
             entries.push((request, token_id, commitment));
         }
@@ -232,7 +302,7 @@ impl TokenSplit {
         for source_asset in assets.as_slice() {
             let mut tree = Rsmst::new();
             for (request, token_id, commitment) in &entries {
-                if let Some(output_asset) = request.assets.get(source_asset.id()) {
+                if let Some(output_asset) = request.payload.assets.get(source_asset.id()) {
                     tree.insert(*token_id.bytes(), *commitment, output_asset.value().clone())?;
                 }
             }
@@ -271,7 +341,7 @@ impl TokenSplit {
         let mut tokens = Vec::new();
         for (request, token_id, _commitment) in entries {
             let mut proofs = Vec::new();
-            for asset in request.assets.as_slice() {
+            for asset in request.payload.assets.as_slice() {
                 let (_, built) = built_trees
                     .iter()
                     .find(|(id, _)| id == asset.id())
@@ -286,7 +356,8 @@ impl TokenSplit {
                 recipient: request.recipient,
                 token_type: request.token_type,
                 salt: request.salt,
-                assets: request.assets,
+                assets: request.payload.assets,
+                payload: request.payload.bytes,
                 proofs,
             });
         }

@@ -13,7 +13,7 @@ use num_bigint::BigUint;
 use super::{
     split_output_commitment, verify_payment_token, Asset, AssetId, PaymentAssetCollection,
     PaymentDataVerifier, SplitManifest, SplitMintJustification, SplitMintJustificationVerifier,
-    SplitTokenRequest, TokenSplit,
+    SplitOutputPayload, SplitTokenRequest, TokenSplit,
 };
 use crate::api::bft::{
     InputRecord, RootTrustBase, RootTrustBaseNodeInfo, ShardId, ShardTreeCertificate,
@@ -210,12 +210,33 @@ fn mint_output(
     justification: &SplitMintJustification,
     node: &Secp256k1Signer,
 ) -> Token {
+    mint_output_bytes(
+        network,
+        recipient,
+        token_type,
+        salt,
+        assets.to_cbor(),
+        justification,
+        node,
+    )
+}
+
+/// Like [`mint_output`], minting exactly `data` as the payload.
+fn mint_output_bytes(
+    network: NetworkId,
+    recipient: EncodedPredicate,
+    token_type: TokenType,
+    salt: TokenSalt,
+    data: Vec<u8>,
+    justification: &SplitMintJustification,
+    node: &Secp256k1Signer,
+) -> Token {
     let mint = MintTransaction::create(
         network,
         recipient,
         token_type,
         salt,
-        Some(assets.to_cbor()),
+        Some(data),
         Some(justification.to_cbor()),
         Some(TIMEOUT),
     )
@@ -782,4 +803,249 @@ fn rejects_unbalanced_split_at_build_time() {
         Some(TIMEOUT)
     )
     .is_err());
+}
+
+// --- application-specific output payloads -----------------------------------
+
+/// Test-local application envelope `tag(39050, [1, assets, ext])`; the SDK
+/// itself knows nothing of it. `ext` is `null` as encoded here.
+fn wrap(assets: &PaymentAssetCollection, ext: &[u8]) -> Vec<u8> {
+    crate::cbor::encode_tag(
+        39050,
+        &crate::cbor::encode_array(&[&crate::cbor::encode_uint(1), &assets.to_cbor(), ext]),
+    )
+}
+
+/// Decoder for [`wrap`]. Deliberately ignores `ext`, so the envelope carries
+/// bytes the decoded assets do not reflect.
+fn unwrap(bytes: &[u8]) -> Result<PaymentAssetCollection, crate::Error> {
+    let d = crate::cbor::Decoder::new(bytes);
+    d.finish()?;
+    let items = d.expect_tag(39050)?.array(Some(3))?;
+    if items[0].uint()? != 1 {
+        return Err(crate::Error::UnexpectedValue("bad envelope version"));
+    }
+    PaymentAssetCollection::from_cbor_bytes(items[1].bytes())
+}
+
+const NULL: [u8; 1] = [0xf6];
+
+fn wrapped_registry() -> MintJustificationRegistry {
+    let mut r = MintJustificationRegistry::new();
+    r.register(Box::new(
+        SplitMintJustificationVerifier::with_payment_decoder(unwrap),
+    ))
+    .unwrap();
+    r.register_token_data(Box::new(PaymentDataVerifier::with_payment_decoder(
+        coin_type(),
+        unwrap,
+        authorize_test_payment,
+    )))
+    .unwrap();
+    r
+}
+
+fn one_asset(n: u32) -> PaymentAssetCollection {
+    PaymentAssetCollection::create([Asset::new(asset_a(), BigUint::from(n))]).unwrap()
+}
+
+fn wrapped_request(owner: &Secp256k1Signer, amount: u32, salt: u8) -> SplitTokenRequest {
+    let assets = one_asset(amount);
+    let bytes = wrap(&assets, &NULL);
+    SplitTokenRequest::create_with_payload(
+        sig_pred(owner),
+        SplitOutputPayload::new(assets, bytes, unwrap).unwrap(),
+        coin_type(),
+        TokenSalt::from_bytes([salt; 32]),
+    )
+}
+
+/// Mint a wrapped source token of `amount` to `owner`.
+fn wrapped_source(node: &Secp256k1Signer, owner: &Secp256k1Signer, amount: u32) -> Token {
+    let mint = MintTransaction::create(
+        NetworkId::LOCAL,
+        sig_pred(owner),
+        coin_type(),
+        TokenSalt::from_bytes([0x02; 32]),
+        Some(wrap(&one_asset(amount), &NULL)),
+        None,
+        Some(TIMEOUT),
+    )
+    .unwrap();
+    let minter = Minter::signer(mint.token_id()).unwrap();
+    let proof = valid_proof(&mint, &minter, node);
+    Token::new(CertifiedMintTransaction::new(mint, proof), Vec::new())
+}
+
+/// Split `source` (owned by `owner`) and mint every output with exactly the
+/// bytes the split returned.
+fn split_and_mint(
+    tb: &RootTrustBase,
+    node: &Secp256k1Signer,
+    owner: &Secp256k1Signer,
+    source: &Token,
+    requests: Vec<SplitTokenRequest>,
+) -> Vec<Token> {
+    let registry = wrapped_registry();
+    let split = TokenSplit::split(
+        source,
+        tb,
+        &registry,
+        unwrap,
+        requests,
+        Some([7u8; 32]),
+        Some(TIMEOUT),
+    )
+    .unwrap();
+    let burned = burned_token(source, split.burn.transaction.clone(), owner, node);
+    split
+        .tokens
+        .iter()
+        .map(|out| {
+            let just = SplitMintJustification::create(burned.clone(), out.proofs.clone()).unwrap();
+            mint_output_bytes(
+                out.network_id,
+                out.recipient.clone(),
+                out.token_type.clone(),
+                out.salt.clone(),
+                out.payload.clone(),
+                &just,
+                node,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn wrapped_payload_split_and_resplit_verify() {
+    let node = signer(0x11);
+    let alice = signer(0x22);
+    let bob = signer(0x33);
+    let carol = signer(0x44);
+    let tb = trust_base(&node);
+    let registry = wrapped_registry();
+
+    let source = wrapped_source(&node, &alice, 10);
+    let outputs = split_and_mint(
+        &tb,
+        &node,
+        &alice,
+        &source,
+        vec![
+            wrapped_request(&bob, 3, 0x10),
+            wrapped_request(&carol, 7, 0x20),
+        ],
+    );
+    for token in &outputs {
+        assert_eq!(token.verify_with(&tb, &registry), Ok(()));
+        // The minted bytes are the envelope, not the bare collection.
+        let data = token.genesis().transaction().data().unwrap();
+        assert_eq!(unwrap(data).unwrap().len(), 1);
+        assert_ne!(data, unwrap(data).unwrap().to_cbor().as_slice());
+    }
+
+    // Split the 7-unit child again and verify the whole ancestry.
+    let grandchildren = split_and_mint(
+        &tb,
+        &node,
+        &carol,
+        &outputs[1],
+        vec![
+            wrapped_request(&alice, 2, 0x30),
+            wrapped_request(&bob, 5, 0x40),
+        ],
+    );
+    for token in &grandchildren {
+        assert_eq!(token.verify_with(&tb, &registry), Ok(()));
+    }
+}
+
+#[test]
+fn bare_request_payload_is_the_bare_encoding() {
+    let s = scenario();
+    let split = TokenSplit::split_unchecked(
+        &s.source,
+        PaymentAssetCollection::from_cbor_bytes,
+        s.requests,
+        Some([7u8; 32]),
+        Some(TIMEOUT),
+    )
+    .unwrap();
+    for out in &split.tokens {
+        assert_eq!(out.payload, out.assets.to_cbor());
+    }
+}
+
+#[test]
+fn rejects_declared_assets_that_do_not_match_payload() {
+    let bytes = wrap(&one_asset(3), &NULL);
+    // Different amount, different asset, bare bytes under the envelope decoder,
+    // and garbage all fail before any request (hence any burn) exists.
+    assert!(SplitOutputPayload::new(one_asset(4), bytes.clone(), unwrap).is_err());
+    let other =
+        PaymentAssetCollection::create([Asset::new(asset_b(), BigUint::from(3u32))]).unwrap();
+    assert!(SplitOutputPayload::new(other, bytes.clone(), unwrap).is_err());
+    assert!(SplitOutputPayload::new(one_asset(3), one_asset(3).to_cbor(), unwrap).is_err());
+    assert!(SplitOutputPayload::new(one_asset(3), vec![0xff], unwrap).is_err());
+    // Trailing bytes are not a valid encoding either.
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(SplitOutputPayload::new(one_asset(3), trailing, unwrap).is_err());
+    // The matching payload is accepted and keeps its exact bytes.
+    let ok = SplitOutputPayload::new(one_asset(3), bytes.clone(), unwrap).unwrap();
+    assert_eq!(ok.bytes(), bytes.as_slice());
+    assert_eq!(ok.assets(), &one_asset(3));
+}
+
+#[test]
+fn rejects_payload_tampering_that_preserves_decoded_amounts() {
+    let node = signer(0x11);
+    let alice = signer(0x22);
+    let bob = signer(0x33);
+    let carol = signer(0x44);
+    let tb = trust_base(&node);
+    let registry = wrapped_registry();
+    let source = wrapped_source(&node, &alice, 10);
+
+    let split = TokenSplit::split(
+        &source,
+        &tb,
+        &registry,
+        unwrap,
+        vec![
+            wrapped_request(&bob, 3, 0x10),
+            wrapped_request(&carol, 7, 0x20),
+        ],
+        Some([7u8; 32]),
+        Some(TIMEOUT),
+    )
+    .unwrap();
+    let burned = burned_token(&source, split.burn.transaction.clone(), &alice, &node);
+    let out = &split.tokens[0];
+    let just = SplitMintJustification::create(burned, out.proofs.clone()).unwrap();
+
+    let mint = |data: Vec<u8>| {
+        mint_output_bytes(
+            out.network_id,
+            out.recipient.clone(),
+            out.token_type.clone(),
+            out.salt.clone(),
+            data,
+            &just,
+            &node,
+        )
+    };
+    // Untampered bytes verify.
+    assert_eq!(
+        mint(out.payload.clone()).verify_with(&tb, &registry),
+        Ok(())
+    );
+    // Same decoded assets, different envelope bytes (ext field): rejected.
+    let tampered = wrap(&one_asset(3), &[0x00]);
+    assert_eq!(unwrap(&tampered).unwrap(), out.assets);
+    assert_ne!(tampered, out.payload);
+    assert_eq!(
+        mint(tampered).verify_with(&tb, &registry),
+        Err(VerificationError::SplitAllocationProofInvalid)
+    );
 }
