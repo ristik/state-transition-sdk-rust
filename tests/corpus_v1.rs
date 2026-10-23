@@ -5,7 +5,8 @@
 //! expected certificates (`ucs/*.cbor`) are re-derived from the case's partition
 //! view plus one of them as the enclosing certificate, under the case's trust
 //! base, and must be byte-identical. The negative `view-*` and `trust-base-*`
-//! cases must be refused. RPC/evidence-stage cases await the batch client.
+//! cases must be refused. The remaining negative cases (RPC, evidence, seal, proof, ...)
+//! run through the HTTP batch client in `corpus_negative.rs`.
 
 mod trust_support;
 
