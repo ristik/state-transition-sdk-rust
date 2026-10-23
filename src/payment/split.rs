@@ -222,8 +222,15 @@ impl TokenSplit {
     ) -> Result<Split, SplitError> {
         let assets = verify_payment_token(token, trust_base, registry, decode_payment_data)
             .map_err(SplitError::Verification)?;
-        Self::build_split(token, assets, requests, burn_state_mask, burn_expires_at)
-            .map_err(SplitError::Build)
+        Self::build_split(
+            token,
+            assets,
+            decode_payment_data,
+            requests,
+            burn_state_mask,
+            burn_expires_at,
+        )
+        .map_err(SplitError::Build)
     }
 
     /// Split `token` **without verifying it first**.
@@ -247,15 +254,23 @@ impl TokenSplit {
             .data()
             .ok_or(Error::UnexpectedValue("source token has no payment data"))?;
         let assets = decode_payment_data(source_bytes)?;
-        Self::build_split(token, assets, requests, burn_state_mask, burn_expires_at)
+        Self::build_split(
+            token,
+            assets,
+            decode_payment_data,
+            requests,
+            burn_state_mask,
+            burn_expires_at,
+        )
     }
 
     /// Construct the split from the source token's already-decoded canonical
-    /// asset collection. Shared by [`split`](Self::split) and
+    /// asset collection; every output payload is re-checked with `decode_payment_data`. Shared by [`split`](Self::split) and
     /// [`split_unchecked`](Self::split_unchecked).
     fn build_split(
         token: &Token,
         assets: PaymentAssetCollection,
+        decode_payment_data: PaymentDataDecoder,
         requests: Vec<SplitTokenRequest>,
         burn_state_mask: Option<[u8; 32]>,
         burn_expires_at: Option<u64>,
@@ -269,6 +284,13 @@ impl TokenSplit {
             if request.token_type != source_token_type {
                 return Err(Error::UnexpectedValue(
                     "split output token type must equal source token type",
+                ));
+            }
+            // The payload must decode, under the decoder the verifier will use,
+            // to exactly the assets being allocated (bare payloads included).
+            if decode_payment_data(request.payload.bytes())? != request.payload.assets {
+                return Err(Error::UnexpectedValue(
+                    "split output payload does not decode to the declared assets",
                 ));
             }
             for asset in request.payload.assets.as_slice() {

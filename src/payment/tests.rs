@@ -1049,3 +1049,79 @@ fn rejects_payload_tampering_that_preserves_decoded_amounts() {
         Err(VerificationError::SplitAllocationProofInvalid)
     );
 }
+
+#[test]
+fn rejects_payloads_that_do_not_decode_under_the_split_decoder() {
+    let node = signer(0x11);
+    let alice = signer(0x22);
+    let bob = signer(0x33);
+    let carol = signer(0x44);
+    let tb = trust_base(&node);
+    let registry = wrapped_registry();
+    let source = wrapped_source(&node, &alice, 10);
+
+    // Decoder that reads the envelope but inflates the first asset by one.
+    fn skewed(bytes: &[u8]) -> Result<PaymentAssetCollection, crate::Error> {
+        let a = unwrap(bytes)?;
+        let first = &a.as_slice()[0];
+        PaymentAssetCollection::create([Asset::new(
+            first.id().clone(),
+            first.value() + BigUint::from(1u32),
+        )])
+    }
+    let both = |first: SplitTokenRequest| vec![first, wrapped_request(&carol, 7, 0x20)];
+
+    // Payload built under `unwrap` but split under `skewed`: rejected before a burn.
+    let r = TokenSplit::split(
+        &source,
+        &tb,
+        &registry,
+        unwrap,
+        both(SplitTokenRequest::create_with_payload(
+            sig_pred(&bob),
+            SplitOutputPayload::new(one_asset(3), wrap(&one_asset(3), &NULL), unwrap).unwrap(),
+            coin_type(),
+            TokenSalt::from_bytes([0x10; 32]),
+        )),
+        Some([7u8; 32]),
+        Some(TIMEOUT),
+    );
+    assert!(r.is_ok());
+    let unchecked = |decoder, reqs| {
+        TokenSplit::split_unchecked(&source, decoder, reqs, Some([7u8; 32]), Some(TIMEOUT))
+    };
+    assert!(unchecked(skewed, both(wrapped_request(&bob, 3, 0x10))).is_err());
+
+    // Bare outputs under a wrapped decoder: bare bytes are not a valid envelope.
+    let bare = SplitTokenRequest::create(
+        sig_pred(&bob),
+        one_asset(3),
+        coin_type(),
+        TokenSalt::from_bytes([0x10; 32]),
+    );
+    assert!(unchecked(unwrap, both(bare.clone())).is_err());
+    let checked = TokenSplit::split(
+        &source,
+        &tb,
+        &registry,
+        unwrap,
+        both(bare),
+        Some([7u8; 32]),
+        Some(TIMEOUT),
+    );
+    assert!(matches!(checked, Err(super::SplitError::Build(_))));
+
+    // A bare payload checked under a decoder that skews it is rejected too.
+    let s = scenario();
+    assert!(TokenSplit::split_unchecked(
+        &s.source,
+        |b| {
+            let a = PaymentAssetCollection::from_cbor_bytes(b)?;
+            Ok(if a.len() == 1 { one_asset(1) } else { a })
+        },
+        s.requests,
+        Some([7u8; 32]),
+        Some(TIMEOUT)
+    )
+    .is_err());
+}
