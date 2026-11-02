@@ -678,6 +678,60 @@ fn negotiation_does_not_retry_when_the_rejection_echoes_the_wait() {
 }
 
 #[test]
+fn invalid_wait_answers_are_final_when_echoed_and_never_retried_without_the_wait() {
+    // The SDK rejects an invalid waitMs locally; these are the server's answers to a valid,
+    // locally validated wait request. Only the bare generic malformed_params of an old strict
+    // parser (no echo) is retried; an echoed rejection or a preflight rejection is final.
+    let ids = batch_ids();
+    let mut echoed = 0;
+    let mut preflight = 0;
+    for case in cases(ECHO) {
+        let name = case["name"].as_str().unwrap().to_string();
+        if !(name.starts_with("batch/invalid-wait") || name.starts_with("v2/error-invalid-wait")) {
+            continue;
+        }
+        let error = case["response"]["error"].clone();
+        let echo = error["data"].get("waitedMs").and_then(|v| v.as_u64());
+        if name.starts_with("batch/") {
+            let body = error.to_string();
+            let server = Scripted::start(move |_, _| Reply::error(body.clone()));
+            let now = clock();
+            let out = get_latest_negotiating_wait(
+                &client(&server.url),
+                &ids,
+                &opts(5_000),
+                &WaitRequest::new(3_000),
+                &now,
+            );
+            assert_eq!(
+                (out.requests, out.retried_without_wait),
+                (1, false),
+                "{name}"
+            );
+            assert_eq!(server.count(), 1, "{name}");
+            assert_eq!(out.result.unwrap_err().waited_ms, echo, "{name}");
+        } else {
+            let body = error.to_string();
+            let server = Scripted::start(move |_, _| Reply::error(body.clone()));
+            let out = client(&server.url).lookup_inclusion_proof_with_wait(
+                &sid(),
+                &WaitRequest::new(5_000),
+                Duration::from_secs(20),
+            );
+            assert!(out.is_err(), "{name}");
+            assert_eq!(server.count(), 1, "{name}");
+        }
+        if echo == Some(0) {
+            echoed += 1;
+        } else {
+            assert!(name.contains("preflight"), "{name}");
+            preflight += 1;
+        }
+    }
+    assert!(echoed >= 10 && preflight == 2, "{echoed}/{preflight}");
+}
+
+#[test]
 fn negotiation_does_not_repeat_an_identical_request_when_no_wait_was_sent() {
     // timeout 1 ms: no positive wait fits, so waitMs is absent from the wire and a
     // malformed_params answer is not about it; there is nothing to retry.
