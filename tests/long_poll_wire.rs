@@ -718,7 +718,15 @@ fn invalid_wait_answers_are_final_when_echoed_and_never_retried_without_the_wait
                 &WaitRequest::new(5_000),
                 Duration::from_secs(20),
             );
-            assert!(out.is_err(), "{name}");
+            let Err(HttpError::Rpc { code, .. }) = out else {
+                panic!("{name}: {out:?}")
+            };
+            // -32000 for an invalid wait, -32602 for the preflight rejection
+            assert_eq!(
+                code,
+                case["response"]["error"]["code"].as_i64().unwrap(),
+                "{name}"
+            );
             assert_eq!(server.count(), 1, "{name}");
         }
         if echo == Some(0) {
