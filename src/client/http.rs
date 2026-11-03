@@ -510,7 +510,7 @@ impl HttpAggregatorClient {
             "includeStatus": true,
         });
         let result = self.rpc("get_inclusion_proof.v2", params, &[])?;
-        let parsed = decode_v2_result(&result)?;
+        let parsed = decode_v2_result(&result, false)?;
         Ok((parsed.response, parsed.status))
     }
 
@@ -540,7 +540,8 @@ impl HttpAggregatorClient {
             "stateId": hex::encode(state_id.bytes()),
             "includeStatus": true,
         });
-        if let Some(sent) = super::batch::wait_on_wire(wait.wait_ms, timeout_ms, wait.margin_ms) {
+        let sent = super::batch::wait_on_wire(wait.wait_ms, timeout_ms, wait.margin_ms);
+        if let Some(sent) = sent {
             params["waitMs"] = serde_json::json!(sent);
         }
         let result = self
@@ -551,7 +552,7 @@ impl HttpAggregatorClient {
                 Some(timeout.max(Duration::from_millis(1))),
             )
             .map_err(raw_to_http)?;
-        let parsed = decode_v2_result(&result)?;
+        let parsed = decode_v2_result(&result, sent.is_some())?;
         Ok(WaitedLookup {
             response: parsed.response,
             status: parsed.status,
@@ -904,6 +905,17 @@ fn overload_pause(
     Ok(pause)
 }
 
+/// The pause after a transport failure inside a wait: the larger of the interval and
+/// nothing, which must fit the time left. A pause that does not fit ends the wait as
+/// [`HttpError::Timeout`], as JS ends it with a budget error: an unreachable
+/// aggregator is not an overloaded one.
+fn transport_pause(interval: Duration, left: Duration) -> Result<Duration, HttpError> {
+    if interval > left {
+        return Err(HttpError::Timeout);
+    }
+    Ok(interval)
+}
+
 fn raw_to_http(e: RawFailure) -> HttpError {
     match e {
         RawFailure::Http {
@@ -1240,7 +1252,8 @@ impl AggregatorClient for HttpAggregatorClient {
             if matches!(raw, Err(RawFailure::Transport(_) | RawFailure::TimedOut(_))) {
                 if let Err(failure) = raw {
                     let left = budget.saturating_sub(started.elapsed());
-                    let pause = overload_pause(failure, None, self.poll_interval, left)?;
+                    drop(failure);
+                    let pause = transport_pause(self.poll_interval, left)?;
                     std::thread::sleep(pause);
                 }
                 continue;
@@ -1248,6 +1261,7 @@ impl AggregatorClient for HttpAggregatorClient {
             let result = match raw.map_err(raw_to_http) {
                 Ok(result) => result,
                 Err(HttpError::Rpc { code, .. }) if code == RPC_INCLUSION_PENDING => {
+                    unknown_seen = 0;
                     if attempt + 1 < self.poll_attempts {
                         std::thread::sleep(self.poll_interval);
                     }
@@ -1263,7 +1277,7 @@ impl AggregatorClient for HttpAggregatorClient {
             };
             let V2Result {
                 response, status, ..
-            } = decode_v2_result(&result)?;
+            } = decode_v2_result(&result, false)?;
 
             // A response carrying no proof on this method means the leaf is not
             // certified yet. `get_inclusion_proof.v2` never answers with a
@@ -1304,8 +1318,9 @@ struct V2Result {
 /// Decode a `get_inclusion_proof.v2` result: a string is the legacy result, an
 /// object is `{proof, status?, waitedMs?}`. A present `waitedMs` must be a plain
 /// non-negative safe integer; anything else is a protocol error. Unknown object
-/// fields stay ignored, as before.
-fn decode_v2_result(result: &serde_json::Value) -> Result<V2Result, HttpError> {
+/// fields stay ignored, as before. `wait_sent` is whether the request carried
+/// `waitMs`: an echo to a request that did not ask is a protocol error, malformed or not.
+fn decode_v2_result(result: &serde_json::Value, wait_sent: bool) -> Result<V2Result, HttpError> {
     let (encoded, status, waited_ms) = if let Some(s) = result.as_str() {
         (s, None, None)
     } else {
@@ -1321,8 +1336,9 @@ fn decode_v2_result(result: &serde_json::Value) -> Result<V2Result, HttpError> {
             .and_then(|v| v.as_str())
             .and_then(ProofStatus::from_wire);
         let waited_ms = match object.get("waitedMs") {
-            None => None,
+            Some(_) if !wait_sent => return Err(HttpError::Decode(UNSOLICITED_ECHO.to_string())),
             Some(v) => Some(parse_waited_ms(v).map_err(HttpError::Decode)?),
+            None => None,
         };
         (proof, status, waited_ms)
     };
@@ -1337,6 +1353,21 @@ fn decode_v2_result(result: &serde_json::Value) -> Result<V2Result, HttpError> {
         status,
         waited_ms,
     })
+}
+
+/// A `waitedMs` echo to a request that sent no `waitMs`.
+const UNSOLICITED_ECHO: &str = "waitedMs echoed to a request without waitMs";
+
+/// `error.data.waitedMs` of a failed call, if the error carries one.
+fn error_echo_of(failure: &RawFailure) -> Option<serde_json::Value> {
+    match failure {
+        RawFailure::Envelope(EnvelopeError::Rpc { data, .. })
+        | RawFailure::Http {
+            rpc: Some(EnvelopeError::Rpc { data, .. }),
+            ..
+        } => data.as_ref().and_then(|d| d.get("waitedMs")).cloned(),
+        _ => None,
+    }
 }
 
 /// A `waitedMs` echo: a JSON integer in `[0, 2^53 - 1]`. Floats (`1.0`, `1e3`),
@@ -1492,8 +1523,8 @@ impl HttpAggregatorClient {
                 Some(Duration::from_millis(options.timeout_ms.max(1))),
             )
             .map_err(|f| batch_failure_waited(f, sent_wait_ms))?;
-        let (batch, waited_ms) =
-            decode_batch_result(&result).map_err(|f| WaitedFailure::new(f, None, sent_wait_ms))?;
+        let (batch, waited_ms) = decode_batch_result(&result, sent_wait_ms.is_some())
+            .map_err(|f| WaitedFailure::new(f, None, sent_wait_ms))?;
         Ok(WaitedBatch::new(batch, waited_ms, sent_wait_ms))
     }
 }
@@ -1521,18 +1552,11 @@ impl BatchAggregatorClient for HttpAggregatorClient {
 }
 
 /// [`batch_failure`] plus `error.data.waitedMs`. A malformed echo is a protocol
-/// error (and carries no echo).
+/// error (and carries no echo). An error to a request that sent no `waitMs` has
+/// no echo to read: its metadata is ignored, even if malformed, and the error
+/// keeps its classification.
 fn batch_failure_waited(failure: RawFailure, sent_wait_ms: Option<u64>) -> WaitedFailure {
-    let echo = match &failure {
-        RawFailure::Http {
-            rpc: Some(EnvelopeError::Rpc { data, .. }),
-            ..
-        }
-        | RawFailure::Envelope(EnvelopeError::Rpc { data, .. }) => {
-            data.as_ref().and_then(|d| d.get("waitedMs")).cloned()
-        }
-        _ => None,
-    };
+    let echo = error_echo_of(&failure).filter(|_| sent_wait_ms.is_some());
     let failure = batch_failure(failure);
     match echo.as_ref().map(parse_waited_ms) {
         None => WaitedFailure::new(failure, None, sent_wait_ms),
@@ -1614,9 +1638,11 @@ fn parse_indexes(value: &serde_json::Value) -> BTreeMap<String, Vec<usize>> {
 }
 
 /// Decode `{"proofs": [<hex CBOR>...], "partitionView": <hex CBOR>?, "waitedMs": n?}`
-/// into the batch and the optional echo.
+/// into the batch and the optional echo. `waitedMs` is accepted only when the
+/// request sent `waitMs`; otherwise it is an unknown field, as in the base.
 fn decode_batch_result(
     result: &serde_json::Value,
+    wait_sent: bool,
 ) -> Result<(InclusionProofBatch, Option<u64>), BatchFailure> {
     let bad = |m: &str| BatchFailure::Decode(m.to_string());
     let object = result
@@ -1624,7 +1650,7 @@ fn decode_batch_result(
         .ok_or_else(|| bad("batch result must be an object"))?;
     if object
         .keys()
-        .any(|k| k != "proofs" && k != "partitionView" && k != "waitedMs")
+        .any(|k| k != "proofs" && k != "partitionView" && !(wait_sent && k == "waitedMs"))
     {
         return Err(bad("unknown field in batch result"));
     }
@@ -1938,6 +1964,55 @@ mod tests {
             };
             assert_eq!(overload_of(&http), None);
         }
+    }
+
+    #[test]
+    fn a_transport_pause_that_does_not_fit_ends_the_wait_as_a_timeout() {
+        let ms = Duration::from_millis;
+        assert_eq!(transport_pause(ms(100), ms(1000)).unwrap(), ms(100));
+        assert_eq!(transport_pause(ms(1000), ms(1000)).unwrap(), ms(1000));
+        assert!(matches!(
+            transport_pause(ms(1001), ms(1000)),
+            Err(HttpError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn a_batch_echo_is_accepted_only_when_the_request_sent_a_wait() {
+        let body = serde_json::json!({"proofs": [], "waitedMs": 5});
+        let (batch, echo) = decode_batch_result(&body, true).unwrap();
+        assert!(batch.proofs.is_empty());
+        assert_eq!(echo, Some(5));
+        assert!(matches!(
+            decode_batch_result(&body, false),
+            Err(BatchFailure::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn an_unsolicited_error_echo_is_ignored_and_the_error_keeps_its_classification() {
+        let busy = |echo: serde_json::Value| {
+            RawFailure::Envelope(EnvelopeError::Rpc {
+                code: -32006,
+                message: "busy".into(),
+                data: Some(serde_json::json!({"retryable": true, "waitedMs": echo})),
+                retry_after: None,
+            })
+        };
+        let plain = batch_failure(busy(serde_json::json!(0)));
+        assert!(matches!(plain, BatchFailure::Rpc { code: -32006, .. }));
+        for echo in [
+            serde_json::json!(-1),
+            serde_json::json!("x"),
+            serde_json::json!(7),
+        ] {
+            let w = batch_failure_waited(busy(echo.clone()), None);
+            assert_eq!(w.failure, plain, "{echo}");
+            assert_eq!(w.waited_ms, None);
+        }
+        // on a request that sent `waitMs` a malformed echo is still a protocol error
+        let w = batch_failure_waited(busy(serde_json::json!(-1)), Some(1000));
+        assert!(matches!(w.failure, BatchFailure::Decode(_)));
     }
 
     #[test]

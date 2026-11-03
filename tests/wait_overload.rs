@@ -25,7 +25,7 @@ fn patient(url: &str) -> HttpAggregatorClient {
 
 fn pending() -> String {
     format!(
-        r#"{{"proof":"{}","status":"pending","waitedMs":0}}"#,
+        r#"{{"proof":"{}","status":"pending"}}"#,
         empty_proof_response_hex(&fixture_proof_and_data().0)
     )
 }

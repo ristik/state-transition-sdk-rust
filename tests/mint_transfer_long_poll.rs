@@ -48,6 +48,8 @@ fn script(pending_polls: usize, echo: bool) -> Scripted {
             return Reply::result(r#"{"status":"SUCCESS"}"#);
         }
         let polls_before = i - 1;
+        // a long-poll aware server echoes only a wait it was asked for
+        let echo = echo && seen.params.get("waitMs").is_some();
         if polls_before < pending_polls {
             let r = Reply::result(obj(&empty, "pending", echo.then_some(100)));
             if echo {

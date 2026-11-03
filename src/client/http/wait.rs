@@ -314,19 +314,18 @@ impl HttpAggregatorClient {
                 }
                 stats.transport_failures += 1;
                 send_wait = false;
-                let pause = overload_pause(failure, None, interval.max(MIN_PAUSE), left)?;
+                drop(failure);
+                let pause = transport_pause(interval.max(MIN_PAUSE), left)?;
                 self.pause(Pace::Sleep(pause), deadline, options)?;
                 continue;
             }
             // `error.data.waitedMs` of a handled error: a server that echoes understood `waitMs`.
-            let error_echo = match &raw {
-                Err(RawFailure::Envelope(EnvelopeError::Rpc { data, .. }))
-                | Err(RawFailure::Http {
-                    rpc: Some(EnvelopeError::Rpc { data, .. }),
-                    ..
-                }) => data.as_ref().and_then(|d| d.get("waitedMs")).cloned(),
-                _ => None,
-            };
+            // Read only when this call sent `waitMs`; otherwise the metadata is ignored, even if malformed.
+            let error_echo = raw
+                .as_ref()
+                .err()
+                .and_then(error_echo_of)
+                .filter(|_| plan.wait_ms.is_some());
             // An overload answer (503, 429, -32006, `data.retryable`) is inconclusive: pause
             // max(interval, Retry-After) or, when that does not fit the time left, fail now
             // with the overload as cause; the rest of this wait sends plain reads (no `waitMs`).
@@ -357,6 +356,7 @@ impl HttpAggregatorClient {
                 Ok(result) => result,
                 Err(HttpError::Rpc { code, .. }) if code == RPC_INCLUSION_PENDING => {
                     stats.pending += 1;
+                    unknown_seen = 0;
                     // A legacy server's own pending error (dispatched method, no
                     // `data.waitedMs`) is as good evidence of "no long-poll" as a result
                     // without `waitedMs`: stop sending `waitMs` for the rest of this wait
@@ -389,7 +389,7 @@ impl HttpAggregatorClient {
                 response,
                 status,
                 waited_ms,
-            } = decode_v2_result(&result)?;
+            } = decode_v2_result(&result, plan.wait_ms.is_some())?;
             if plan.wait_ms.is_some() && waited_ms.is_none() {
                 send_wait = false;
                 stats.wait_dropped_for_missing_echo = true;
@@ -417,7 +417,7 @@ impl HttpAggregatorClient {
             // Pending: immediate re-call only if the server really waited and the
             // call already consumed the polling interval.
             let proven_wait = plan.wait_ms.is_some() && waited_ms.is_some_and(|w| w > 0);
-            if proven_wait && call_took >= interval {
+            if proven_wait && call_took >= interval.max(MIN_PAUSE) {
                 stats.immediate_rechecks += 1;
                 continue;
             }

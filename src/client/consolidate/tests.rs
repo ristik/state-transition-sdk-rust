@@ -169,6 +169,8 @@ struct Sim {
     batch_calls: usize,
     /// Every `waitMs` received: (is a latest request, wait).
     waits: Vec<(bool, u64)>,
+    /// The call timeout of every waited request.
+    wait_timeouts: Vec<u64>,
     faults: Faults,
     /// One partition with the empty shard id: no sidecar view is ever served.
     unsharded: bool,
@@ -239,6 +241,7 @@ impl Sim {
             submissions: 0,
             batch_calls: 0,
             waits: Vec::new(),
+            wait_timeouts: Vec::new(),
             faults: Faults::default(),
             unsharded,
             partition,
@@ -429,6 +432,7 @@ impl BatchAggregatorClient for Node {
                 matches!(request.state_root, StateRoot::Latest),
                 wait.wait_ms,
             ));
+            sim.wait_timeouts.push(options.timeout_ms);
             if sim.faults.reject_wait {
                 sim.batch_calls += 1;
                 return Err(WaitedFailure::new(
@@ -810,6 +814,21 @@ fn a_caller_margin_below_two_seconds_sizes_the_sent_wait() {
     let (_, wait) = sim.lock().unwrap().waits[0];
     // 10 s deadline - 0.5 s margin, less host time already spent; not capped at 8 s
     assert!(wait > 8_000 && wait <= 9_500, "{wait}");
+}
+
+#[test]
+fn a_waiting_call_is_bounded_by_its_wait_plus_margin() {
+    let (sim, token) = spread_token(3);
+    let c = client(&sim, false).with_master_long_poll(MasterLongPoll::default());
+    let opts = ConsolidateOptions {
+        timeout_ms: 600_000,
+        ..Default::default()
+    };
+    c.consolidate(&token, &opts).unwrap();
+    let s = sim.lock().unwrap();
+    // 20 s wait + 2 s margin, not the 10 minutes left of the attempt
+    assert_eq!(s.waits[0].1, 20_000);
+    assert_eq!(s.wait_timeouts, vec![22_000]);
 }
 
 #[test]
