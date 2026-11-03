@@ -514,13 +514,17 @@ impl<C: BatchAggregatorClient + Sync, K: Clock, X: WaveExecutor> ProofClient<C, 
     ) -> Res<InclusionProofBatch> {
         let remaining = budget.check()?;
         let (shard, client) = &endpoints[group.endpoint];
-        let options = RequestOptions {
-            timeout_ms: remaining,
-        };
         // Only the master's latest fetch may wait; an exact root never does.
         let wait = match root {
             StateRoot::Latest => long_poll.and_then(|lp| lp.wait_for(remaining)),
             StateRoot::Exact(_) => None,
+        };
+        // a waiting call lasts at most its wait plus the response margin (so `max_request_ms` holds)
+        let options = RequestOptions {
+            timeout_ms: match (wait, long_poll) {
+                (Some(wait_ms), Some(lp)) => remaining.min(wait_ms.saturating_add(lp.margin_ms)),
+                _ => remaining,
+            },
         };
         let result = match wait {
             Some(wait_ms) => {

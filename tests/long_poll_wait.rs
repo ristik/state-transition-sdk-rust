@@ -145,7 +145,11 @@ fn a_missing_echo_drops_the_wait_for_the_rest_of_the_call_and_paces() {
 #[test]
 fn a_zero_echo_keeps_asking_but_never_loops_tightly() {
     let e = empty();
-    let server = Scripted::start(move |_, _| Reply::result(obj(&e, Some("pending"), Some(0))));
+    let server = Scripted::start(move |_, seen| {
+        // a server echoes only a wait it was asked for
+        let echo = seen.params.get("waitMs").map(|_| 0);
+        Reply::result(obj(&e, Some("pending"), echo))
+    });
     let c = client(&server.url, 100);
     let out = c.wait_for_inclusion_proof_with_stats(&state_id(7), &WaitOptions::new(secs(3)));
     assert!(matches!(out.result, Err(HttpError::Timeout)));
@@ -300,7 +304,11 @@ fn a_malformed_echo_is_rejected_and_never_extends_anything() {
 #[test]
 fn the_total_deadline_is_not_renewed_by_repeated_calls() {
     let e = empty();
-    let server = Scripted::start(move |_, _| Reply::result(obj(&e, Some("pending"), Some(0))));
+    let server = Scripted::start(move |_, seen| {
+        // a server echoes only a wait it was asked for
+        let echo = seen.params.get("waitMs").map(|_| 0);
+        Reply::result(obj(&e, Some("pending"), echo))
+    });
     let c = client(&server.url, 50);
     let started = Instant::now();
     let r = c.wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(Duration::from_millis(700)));
@@ -404,10 +412,7 @@ fn a_refused_connection_is_inconclusive_in_a_wait_and_ends_with_the_budget() {
             .wait_for_inclusion_proof_with_stats(&state_id(7), &WaitOptions::new(total));
         // retried within the original budget; the end is the SDK timeout
         assert!(
-            matches!(
-                out.result,
-                Err(HttpError::Timeout) | Err(HttpError::OverloadTimeout { .. })
-            ),
+            matches!(out.result, Err(HttpError::Timeout)),
             "{total:?}: {:?}",
             out.result
         );
@@ -494,4 +499,89 @@ fn a_pending_error_with_a_malformed_echo_is_a_protocol_error() {
     let r =
         client(&server.url, 20).wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(secs(5)));
     assert!(matches!(r, Err(HttpError::Decode(_))), "{r:?}");
+}
+
+#[test]
+fn a_positive_echo_with_a_zero_interval_keeps_the_pause_floor() {
+    let (e, f) = (empty(), full());
+    let server = Scripted::start(move |i, _| match i {
+        0..=2 => Reply::result(obj(&e, Some("pending"), Some(5))),
+        _ => Reply::result(obj(&f, None, Some(0))),
+    });
+    let c = client(&server.url, 0);
+    let out = c.wait_for_inclusion_proof_with_stats(&state_id(7), &WaitOptions::new(secs(10)));
+    assert!(out.result.is_ok());
+    assert_eq!(out.stats.immediate_rechecks, 0);
+    for i in 0..3 {
+        let gap = server.request(i + 1).at - server.request(i).at;
+        assert!(gap >= Duration::from_millis(9), "{gap:?}");
+    }
+}
+
+#[test]
+fn an_echo_to_a_request_that_sent_no_wait_is_a_protocol_error_in_results_only() {
+    let (e, f) = (empty(), full());
+    // a valid and a malformed echo in a result, each unsolicited on a plain read
+    for body in [
+        format!(r#"{{"proof":"{f}","waitedMs":5}}"#),
+        format!(r#"{{"proof":"{e}","status":"pending","waitedMs":-1}}"#),
+    ] {
+        let server = Scripted::start(move |_, _| Reply::result(body.clone()));
+        let c = client(&server.url, 5).with_long_poll(false);
+        let err = c.get_inclusion_proof(&state_id(7)).unwrap_err();
+        assert!(matches!(err, HttpError::Decode(_)), "{err:?}");
+        assert_eq!(wait_param(&server, 0), None);
+    }
+    // error metadata is another rule: unsolicited (even malformed) `data.waitedMs` is ignored and the
+    // error keeps its classification, here pending then an overload (-32006), then the proof
+    let f3 = f.clone();
+    let server = Scripted::start(move |i, _| match i {
+        0 => Reply::error(r#"{"code":-32021,"message":"pending","data":{"waitedMs":-1}}"#),
+        1 => Reply::error(
+            r#"{"code":-32006,"message":"busy","data":{"retryable":true,"waitedMs":"x"}}"#,
+        ),
+        _ => Reply::result(format!("\"{f3}\"")),
+    });
+    let c = client(&server.url, 5).with_long_poll(false);
+    assert!(c.get_inclusion_proof(&state_id(7)).is_ok());
+    assert_eq!(server.count(), 3);
+    // a plain read inside a wait (after the wait was dropped) is the same
+    let (e2, f2) = (e.clone(), f.clone());
+    let server = Scripted::start(move |i, _| match i {
+        0 => Reply::result(format!(r#"{{"proof":"{e2}","status":"pending"}}"#)),
+        _ => Reply::result(format!(r#"{{"proof":"{f2}","waitedMs":5}}"#)),
+    });
+    let out =
+        client(&server.url, 5).wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(secs(5)));
+    assert!(matches!(out, Err(HttpError::Decode(_))), "{out:?}");
+    // the same malformed echo on a request that did send `waitMs` stays a protocol error
+    let server = Scripted::start(move |_, _| {
+        Reply::result(format!(
+            r#"{{"proof":"{e}","status":"pending","waitedMs":-1}}"#
+        ))
+    });
+    let out =
+        client(&server.url, 5).wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(secs(5)));
+    assert!(matches!(out, Err(HttpError::Decode(_))), "{out:?}");
+}
+
+#[test]
+fn a_legacy_pending_error_resets_the_unknown_grace() {
+    let (e, f) = (empty(), full());
+    // grace 2: unknown, unknown, -32021, unknown, unknown, proof
+    let script = move |i: usize, _: &_| match i {
+        0 | 1 | 3 | 4 => Reply::result(obj(&e, Some("unknown"), None)),
+        2 => Reply::error(r#"{"code":-32021,"message":"pending"}"#),
+        _ => Reply::result(obj(&f, None, None)),
+    };
+    let server = Scripted::start(script.clone());
+    let out =
+        client(&server.url, 5).wait_for_inclusion_proof(&state_id(7), &WaitOptions::new(secs(5)));
+    assert!(out.is_ok(), "wait loop: {out:?}");
+    // the attempts loop
+    let server = Scripted::start(script);
+    let c = client(&server.url, 5)
+        .with_polling(Duration::from_millis(5), 6)
+        .with_long_poll(false);
+    assert!(c.get_inclusion_proof(&state_id(7)).is_ok(), "attempts loop");
 }

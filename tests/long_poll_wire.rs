@@ -141,9 +141,11 @@ fn v2_malformed_echo_is_a_protocol_error() {
             )
             .unwrap_err();
         assert!(matches!(err, HttpError::Decode(_)), "{bad}: {err}");
-        // The legacy poller rejects the same malformed metadata.
-        let err = client(&server.url).get_inclusion_proof(&sid()).unwrap_err();
-        assert!(matches!(err, HttpError::Decode(_)), "legacy {bad}: {err}");
+        // A read that sent no `waitMs` was not echoed to: the same body is a protocol error.
+        let err = client(&server.url)
+            .lookup_inclusion_proof(&sid())
+            .unwrap_err();
+        assert!(matches!(err, HttpError::Decode(_)), "plain {bad}: {err}");
     }
     // The maximum safe integer is fine.
     let h = hexp.clone();
@@ -485,11 +487,13 @@ fn batch_success_echo_is_decoded_and_strictly_validated() {
             .get_inclusion_proofs_with_wait(&latest, &opts(20_000), &WaitRequest::new(5_000))
             .unwrap();
         assert_eq!((ok.batch.proofs.len(), ok.waited_ms), (2, want), "{extra}");
-        // The plain call decodes the same body (an unrequested echo is admitted).
-        let plain = client(&server.url)
-            .get_inclusion_proofs(&latest, &opts(5_000))
-            .unwrap();
-        assert_eq!(plain, ok.batch);
+        // The plain call sent no `waitMs`: an echo is an unknown field, as in the base.
+        let plain = client(&server.url).get_inclusion_proofs(&latest, &opts(5_000));
+        if extra.is_empty() {
+            assert_eq!(plain.unwrap(), ok.batch);
+        } else {
+            assert!(matches!(plain, Err(BatchFailure::Decode(_))), "{extra}");
+        }
     }
     for bad in [
         r#","waitedMs":-1"#,
@@ -671,6 +675,68 @@ fn negotiation_does_not_retry_when_the_rejection_echoes_the_wait() {
     assert_eq!((out.requests, out.retried_without_wait), (1, false));
     assert_eq!(server.count(), 1);
     assert_eq!(out.result.unwrap_err().waited_ms, Some(0));
+}
+
+#[test]
+fn invalid_wait_answers_are_final_when_echoed_and_never_retried_without_the_wait() {
+    // The SDK rejects an invalid waitMs locally; these are the server's answers to a valid,
+    // locally validated wait request. Only the bare generic malformed_params of an old strict
+    // parser (no echo) is retried; an echoed rejection or a preflight rejection is final.
+    let ids = batch_ids();
+    let mut echoed = 0;
+    let mut preflight = 0;
+    for case in cases(ECHO) {
+        let name = case["name"].as_str().unwrap().to_string();
+        if !(name.starts_with("batch/invalid-wait") || name.starts_with("v2/error-invalid-wait")) {
+            continue;
+        }
+        let error = case["response"]["error"].clone();
+        let echo = error["data"].get("waitedMs").and_then(|v| v.as_u64());
+        if name.starts_with("batch/") {
+            let body = error.to_string();
+            let server = Scripted::start(move |_, _| Reply::error(body.clone()));
+            let now = clock();
+            let out = get_latest_negotiating_wait(
+                &client(&server.url),
+                &ids,
+                &opts(5_000),
+                &WaitRequest::new(3_000),
+                &now,
+            );
+            assert_eq!(
+                (out.requests, out.retried_without_wait),
+                (1, false),
+                "{name}"
+            );
+            assert_eq!(server.count(), 1, "{name}");
+            assert_eq!(out.result.unwrap_err().waited_ms, echo, "{name}");
+        } else {
+            let body = error.to_string();
+            let server = Scripted::start(move |_, _| Reply::error(body.clone()));
+            let out = client(&server.url).lookup_inclusion_proof_with_wait(
+                &sid(),
+                &WaitRequest::new(5_000),
+                Duration::from_secs(20),
+            );
+            let Err(HttpError::Rpc { code, .. }) = out else {
+                panic!("{name}: {out:?}")
+            };
+            // -32000 for an invalid wait, -32602 for the preflight rejection
+            assert_eq!(
+                code,
+                case["response"]["error"]["code"].as_i64().unwrap(),
+                "{name}"
+            );
+            assert_eq!(server.count(), 1, "{name}");
+        }
+        if echo == Some(0) {
+            echoed += 1;
+        } else {
+            assert!(name.contains("preflight"), "{name}");
+            preflight += 1;
+        }
+    }
+    assert!(echoed >= 10 && preflight == 2, "{echoed}/{preflight}");
 }
 
 #[test]
