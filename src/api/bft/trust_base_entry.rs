@@ -362,98 +362,11 @@ impl TrustBaseEntry {
         Ok(entry)
     }
 
-    /// Parse the JSON form of an entry (bft-go-base `RootTrustBaseV2` JSON tags), meant for an
-    /// on-disk genesis file. Host only. An absent, `null` or empty hash is read as absent
-    /// (`null`, the one canonical form). Compare the result's identity with the deployment's pin
-    /// ([`TrustBaseHistory::from_genesis`](super::TrustBaseHistory::from_genesis)); a mismatch
-    /// means the file is not the pinned genesis.
-    #[cfg(feature = "std")]
-    pub fn from_json(input: &str) -> Result<Self, TrustBaseError> {
-        use serde_json::Value;
-        const MAX_JSON_BYTES: usize = 1 << 20;
-        let bad = TrustBaseError::Encoding;
-        if input.len() > MAX_JSON_BYTES {
-            return Err(bad("trust base JSON exceeds the size bound"));
-        }
-        let root: Value = serde_json::from_str(input).map_err(|_| bad("invalid JSON"))?;
-        let num = |v: &Value| -> Result<u64, TrustBaseError> {
-            match v {
-                Value::Number(n) => n.as_u64().ok_or(bad("not an unsigned integer")),
-                Value::String(s) => s.parse::<u64>().map_err(|_| bad("not an unsigned integer")),
-                _ => Err(bad("not an unsigned integer")),
-            }
-        };
-        let hex_bytes = |v: &Value| -> Result<Vec<u8>, TrustBaseError> {
-            match v {
-                Value::Null => Ok(Vec::new()),
-                Value::String(s) => {
-                    hex::decode(s.strip_prefix("0x").unwrap_or(s)).map_err(|_| bad("invalid hex"))
-                }
-                _ => Err(bad("not a hex string")),
-            }
-        };
-        if num(&root["version"])? != TRUST_BASE_V2_VERSION {
-            return Err(bad("record version is not 2"));
-        }
-        let network_id = NetworkId::new(
-            u16::try_from(num(&root["networkId"])?).map_err(|_| bad("network id out of range"))?,
-        )?;
-        let nodes = root["rootNodes"]
-            .as_array()
-            .ok_or(bad("rootNodes is not an array"))?;
-        if nodes.len() > MAX_MEMBERS {
-            return Err(bad("too many members"));
-        }
-        let mut members = Vec::with_capacity(nodes.len());
-        for n in nodes {
-            members.push(TrustBaseMember {
-                node_id: String::from(n["nodeId"].as_str().ok_or(bad("nodeId is not a string"))?),
-                signing_key: PublicKey::from_bytes(&hex_bytes(&n["sigKey"])?).map_err(|_| {
-                    TrustBaseError::Invalid("member key is not a valid compressed key")
-                })?,
-                weight: num(&n["stake"])?,
-            });
-        }
-        let opt_hash = |v: &Value| -> Result<OptionalHash, TrustBaseError> {
-            let b = hex_bytes(v)?;
-            Ok(if b.is_empty() { None } else { Some(b) })
-        };
-        let previous_entry_id: [u8; ID_LEN] = hex_bytes(&root["previousEntryId"])?
-            .try_into()
-            .map_err(|_| TrustBaseError::Invalid("previous entry id is not 32 bytes"))?;
-        let signatures = match &root["signatures"] {
-            Value::Null => None,
-            Value::Object(m) => {
-                let mut v = Vec::with_capacity(m.len());
-                for (k, s) in m {
-                    v.push((k.clone(), hex_bytes(s)?));
-                }
-                v.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-                Some(v)
-            }
-            _ => return Err(bad("signatures is not an object")),
-        };
-        let entry = TrustBaseEntry {
-            network_id,
-            epoch: num(&root["epoch"])?,
-            epoch_start: num(&root["epochStartRound"])?,
-            members,
-            quorum_threshold: num(&root["quorumThreshold"])?,
-            state_hash: opt_hash(&root["stateHash"])?,
-            change_record_hash: opt_hash(&root["changeRecordHash"])?,
-            previous_entry_id,
-            signatures,
-        };
-        entry.validate()?;
-        Ok(entry)
-    }
-
     /// Check the entry's structure, not its signatures: epoch, members (sorted by raw node
     /// id bytes, unique, valid keys, positive bounded weights), the exact threshold, hash
     /// lengths, and genesis (zero predecessor, null signatures) versus non-genesis
     /// (non-empty signature map).
     pub fn validate(&self) -> Result<(), TrustBaseError> {
-
         let bad = TrustBaseError::Invalid;
         if self.epoch == 0 {
             return Err(bad("epoch is zero"));

@@ -20,7 +20,10 @@ fn entry(v: &Value, name: &str) -> (TrustBaseEntry, Value) {
         .iter()
         .find(|e| e["name"] == name)
         .unwrap_or_else(|| panic!("no entry {name}"));
-    (TrustBaseEntry::from_cbor(&unhex(&e["hex"])).expect(name), e.clone())
+    (
+        TrustBaseEntry::from_cbor(&unhex(&e["hex"])).expect(name),
+        e.clone(),
+    )
 }
 
 #[test]
@@ -33,8 +36,16 @@ fn entries_round_trip_with_the_reference_bytes_and_identity() {
         let bytes = unhex(&e["hex"]);
         let parsed = TrustBaseEntry::from_cbor(&bytes).expect(name);
         assert_eq!(parsed.to_cbor(), bytes, "{name}: re-encoding");
-        assert_eq!(parsed.sig_bytes(), unhex(&e["sigBytes"]), "{name}: sig bytes");
-        assert_eq!(parsed.entry_id().to_vec(), unhex(&e["entryId"]), "{name}: entry id");
+        assert_eq!(
+            parsed.sig_bytes(),
+            unhex(&e["sigBytes"]),
+            "{name}: sig bytes"
+        );
+        assert_eq!(
+            parsed.entry_id().to_vec(),
+            unhex(&e["entryId"]),
+            "{name}: entry id"
+        );
     }
 }
 
@@ -78,10 +89,19 @@ fn successors_verify_against_their_predecessor() {
     e2.verify_successor(&g).unwrap();
     e2_abd.verify_successor(&g).unwrap();
     e3.verify_successor(&e2).unwrap();
-    assert!(matches!(e2.verify_genesis(), Err(TrustBaseError::Invalid(_))));
-    assert!(matches!(g.verify_successor(&g), Err(TrustBaseError::Chain(_))));
+    assert!(matches!(
+        e2.verify_genesis(),
+        Err(TrustBaseError::Invalid(_))
+    ));
+    assert!(matches!(
+        g.verify_successor(&g),
+        Err(TrustBaseError::Chain(_))
+    ));
     // wrong predecessor: epoch 3 does not extend the genesis
-    assert!(matches!(e3.verify_successor(&g), Err(TrustBaseError::Chain(_))));
+    assert!(matches!(
+        e3.verify_successor(&g),
+        Err(TrustBaseError::Chain(_))
+    ));
 }
 
 #[test]
@@ -95,12 +115,19 @@ fn weighted_quorum_counts_weight_not_signers() {
         let name = c["name"].as_str().unwrap();
         // the successor is built on the plain genesis; the committee that signs is the weighted one
         let succ = TrustBaseEntry::from_cbor(&unhex(&c["entry"])).expect(name);
-        assert_eq!(succ.previous_entry_id, committee.entry_id(), "{name}: links to the weighted committee");
+        assert_eq!(
+            succ.previous_entry_id,
+            committee.entry_id(),
+            "{name}: links to the weighted committee"
+        );
         let r = succ.verify_successor(&committee);
         if c["valid"].as_bool().unwrap() {
             r.unwrap_or_else(|e| panic!("{name}: {e}"));
         } else {
-            assert!(matches!(r, Err(TrustBaseError::Signature(_))), "{name}: {r:?}");
+            assert!(
+                matches!(r, Err(TrustBaseError::Signature(_))),
+                "{name}: {r:?}"
+            );
         }
         // it is not a successor of an unrelated entry
         assert!(succ.verify_successor(&genesis).is_err(), "{name}");
@@ -127,7 +154,9 @@ fn each_chain_rule_refuses_alone() {
     });
     chain("epoch gap", &|m| m.epoch = 3);
     chain("epoch repeated", &|m| m.epoch = 1);
-    chain("epoch start does not increase", &|m| m.epoch_start = g.epoch_start);
+    chain("epoch start does not increase", &|m| {
+        m.epoch_start = g.epoch_start
+    });
     chain("wrong predecessor", &|m| m.previous_entry_id = [9; 32]);
 }
 
@@ -138,7 +167,10 @@ fn structure_rules_refuse_alone() {
     let invalid = |name: &str, f: &dyn Fn(&mut TrustBaseEntry)| {
         let mut m = g.clone();
         f(&mut m);
-        assert!(matches!(m.validate(), Err(TrustBaseError::Invalid(_))), "{name}");
+        assert!(
+            matches!(m.validate(), Err(TrustBaseError::Invalid(_))),
+            "{name}"
+        );
     };
     invalid("shared signing key", &|m| {
         m.members[1].signing_key = m.members[0].signing_key.clone();
