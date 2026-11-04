@@ -296,10 +296,11 @@ impl TrustBaseEntry {
         if items[0].uint()? != TRUST_BASE_V2_VERSION {
             return Err(TrustBaseError::Encoding("record version is not 2"));
         }
-        let network_id = NetworkId::new(
-            u16::try_from(items[1].uint()?)
-                .map_err(|_| TrustBaseError::Encoding("network id out of range"))?,
-        )?;
+        let network = u16::try_from(items[1].uint()?)
+            .map_err(|_| TrustBaseError::Encoding("network id out of range"))?;
+        // network ids are 1..=0xffff; 0 is a well-formed number but not an entry (Go and JS refuse it too)
+        let network_id =
+            NetworkId::new(network).map_err(|_| TrustBaseError::Invalid("network id is zero"))?;
         let epoch = items[2].uint()?;
         let epoch_start = items[3].uint()?;
         let member_items = items[4].array(None)?;
