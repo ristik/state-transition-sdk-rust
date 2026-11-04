@@ -106,3 +106,45 @@ fn weighted_quorum_counts_weight_not_signers() {
         assert!(succ.verify_successor(&genesis).is_err(), "{name}");
     }
 }
+
+/// Each chain rule alone: the entry is the vectors' epoch 2 with one field changed, so only that rule can refuse it.
+/// (Chain rules are checked before signatures, so a mutated field never reaches the signature check.)
+#[test]
+fn each_chain_rule_refuses_alone() {
+    let v = vectors();
+    let (g, _) = entry(&v, "genesis");
+    let (e2, _) = entry(&v, "epoch2-signed-abc");
+    let chain = |name: &str, f: &dyn Fn(&mut TrustBaseEntry)| {
+        let mut m = e2.clone();
+        f(&mut m);
+        match m.verify_successor(&g) {
+            Err(TrustBaseError::Chain(_)) => {}
+            other => panic!("{name}: expected a chain error, got {other:?}"),
+        }
+    };
+    chain("other network", &|m| {
+        m.network_id = unicity_token::api::NetworkId::new(6).unwrap();
+    });
+    chain("epoch gap", &|m| m.epoch = 3);
+    chain("epoch repeated", &|m| m.epoch = 1);
+    chain("epoch start does not increase", &|m| m.epoch_start = g.epoch_start);
+    chain("wrong predecessor", &|m| m.previous_entry_id = [9; 32]);
+}
+
+#[test]
+fn structure_rules_refuse_alone() {
+    let v = vectors();
+    let (g, _) = entry(&v, "genesis");
+    let invalid = |name: &str, f: &dyn Fn(&mut TrustBaseEntry)| {
+        let mut m = g.clone();
+        f(&mut m);
+        assert!(matches!(m.validate(), Err(TrustBaseError::Invalid(_))), "{name}");
+    };
+    invalid("shared signing key", &|m| {
+        m.members[1].signing_key = m.members[0].signing_key.clone();
+    });
+    invalid("unsorted members", &|m| m.members.swap(0, 1));
+    invalid("zero weight", &|m| m.members[0].weight = 0);
+    invalid("no members", &|m| m.members.clear());
+    invalid("wrong threshold", &|m| m.quorum_threshold = 2);
+}
