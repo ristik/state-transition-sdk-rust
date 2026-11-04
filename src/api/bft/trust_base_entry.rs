@@ -453,15 +453,9 @@ impl TrustBaseEntry {
     /// lengths, and genesis (zero predecessor, null signatures) versus non-genesis
     /// (non-empty signature map).
     pub fn validate(&self) -> Result<(), TrustBaseError> {
-        self.validate_inner(false)
-    }
 
-    /// [`validate`](Self::validate), optionally admitting epoch 0. A real network's epochs
-    /// start at 1; epoch 0 appears only in test environments and conformance fixtures, which
-    /// can only enter a history through [`TrustBaseHistory::from_trusted_chain`].
-    pub(crate) fn validate_inner(&self, allow_epoch_zero: bool) -> Result<(), TrustBaseError> {
         let bad = TrustBaseError::Invalid;
-        if self.epoch == 0 && !allow_epoch_zero {
+        if self.epoch == 0 {
             return Err(bad("epoch is zero"));
         }
         let n = self.members.len();
