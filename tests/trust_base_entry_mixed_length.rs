@@ -72,3 +72,18 @@ fn a_non_canonical_wire_order_of_the_signatures_is_still_refused() {
     swapped[k2..k2 + 6].copy_from_slice(b"\x65node1");
     assert!(TrustBaseEntry::from_cbor(&swapped).is_err());
 }
+
+#[test]
+fn mixed_length_signer_ids_through_append_and_the_bundle_round_trip() {
+    use unicity_token::api::bft::TrustBaseHistory;
+    let (g, e) = pair();
+    let mut h = TrustBaseHistory::from_genesis(g.clone(), Some(g.entry_id())).unwrap();
+    h.append(e.clone()).unwrap();
+    let bundle = h.to_bundle();
+    let back = TrustBaseHistory::from_bundle(&bundle, Some(g.entry_id())).unwrap();
+    assert_eq!(back.latest().entry_id(), e.entry_id());
+    assert_eq!(back.to_bundle(), bundle);
+    let mut fresh = TrustBaseHistory::from_genesis(g.clone(), Some(g.entry_id())).unwrap();
+    fresh.install_bundle(&bundle).unwrap();
+    assert_eq!(fresh.latest().entry_id(), e.entry_id());
+}
