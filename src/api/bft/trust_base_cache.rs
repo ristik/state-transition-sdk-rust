@@ -533,10 +533,18 @@ impl<S: TrustBaseStore> Session<S> {
                             // entries past the embedded tip are appended, so the embedded
                             // witnesses (the first held) stay and an older SDK never truncates
                             // the cache
+                            let embedded = session.history.clone();
                             for e in cache.entries().iter().filter(|e| e.epoch > embedded_tip) {
                                 // verified in the cache's own chain, which agrees with the
-                                // checkpoint; the append only extends
-                                let _ = session.history.append(e.clone());
+                                // checkpoint, so the append only extends; should it ever not,
+                                // the embedded history stands and the cache is reported
+                                if session.history.append(e.clone()).is_err() {
+                                    session.history = embedded;
+                                    session.repair = true;
+                                    diagnostics
+                                        .push(Diagnostic::CacheRejected(CacheReject::Malformed));
+                                    break;
+                                }
                             }
                         } else {
                             // a shorter prefix is extended from the embedded bundle
