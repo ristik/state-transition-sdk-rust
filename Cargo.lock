@@ -732,6 +732,7 @@ dependencies = [
  "num-bigint",
  "serde_json",
  "sha2",
+ "unicity-token",
  "ureq",
  "url",
  "zeroize",
