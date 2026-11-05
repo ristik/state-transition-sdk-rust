@@ -2226,3 +2226,52 @@ fn different_witnesses_of_one_entry_are_not_a_conflict_and_the_first_is_kept() {
     assert_eq!(s.history().unwrap().get(3).unwrap().to_cbor(), held);
     assert!(!s.is_dirty());
 }
+
+#[test]
+fn a_local_network_opens_from_its_own_bundle_alone() {
+    let f = Fix::new();
+    let bundle = f.pin(3).bundle;
+    let expected = f.pin(3);
+    // everything else is derived from the bundle
+    let spec = PinSpec::from_bundle(&bundle).unwrap();
+    assert_eq!(spec, expected);
+    let (s, d) = block_on(Session::open_in(
+        &[],
+        net(7),
+        Authority::local(&bundle).unwrap(),
+        MemoryStore::new(),
+        SessionOptions::default(),
+    ))
+    .unwrap();
+    assert!(d.is_empty());
+    assert_eq!(
+        s.key().0,
+        format!("utb/v1/7/{}/local", hx(&expected.genesis_entry_id))
+    );
+    // opening it for another network is refused
+    assert!(matches!(
+        block_on(Session::open_in(
+            &[],
+            net(8),
+            Authority::local(&bundle).unwrap(),
+            MemoryStore::new(),
+            SessionOptions::default(),
+        )),
+        Err(CacheError::PinMismatch)
+    ));
+    // a bundle with a continuation, a status other than OK, or no bundle at all is no pin
+    let mut cursor = bundle.clone();
+    *cursor.last_mut().unwrap() = 0x01; // the continuation field (null) becomes 1
+    let mut status = bundle.clone();
+    status[6] = 0x01; // tag (3 bytes), array header, version, network, then the status
+    for bad in [cursor, status, vec![], bundle[..bundle.len() - 1].to_vec()] {
+        assert!(matches!(
+            PinSpec::from_bundle(&bad),
+            Err(CacheError::ReleasePinInvalid(_))
+        ));
+        assert!(matches!(
+            Authority::local(&bad),
+            Err(CacheError::ReleasePinInvalid(_))
+        ));
+    }
+}
