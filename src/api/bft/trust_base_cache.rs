@@ -10,6 +10,13 @@
 //! * **Pins.** A [`PinSpec`] holds the complete history from genesis to the release tip and
 //!   both identities. A cache diverging at or before the checkpoint is rejected
 //!   ([`CacheReject::PinMismatch`]), never an alternative authority.
+//! * **Local network.** To test against your own deployment, fetch its complete trust base
+//!   bundle (`GET /api/v1/trustbases`, genesis to tip) and pass it to [`Authority::local`]
+//!   with the network id the bundle declares. The history is stored under the fixed namespace
+//!   `local`, never shared with `public`; it is verified link by link from the bundle's own
+//!   genesis. [`PinSpec::from_bundle`] derives the same pin for [`Authority::Custom`] with a
+//!   namespace of your choice. A bundle with a continuation or a status other than OK is
+//!   [`CacheError::ReleasePinInvalid`].
 //! * **Conflicts.** An authenticated fork after the checkpoint latches the session
 //!   ([`SessionError::Conflict`], then [`SessionError::HistoryConflicted`] on every later
 //!   use); the latch is process-local, not a persistent guarantee.
@@ -33,6 +40,8 @@ use crate::crypto::hash::sha256;
 pub const STORE_KEY_VERSION: &str = "v1";
 /// The trust namespace of the built-in release table.
 pub const PUBLIC_NAMESPACE: &str = "public";
+/// The namespace of [`Authority::local`].
+pub const LOCAL_NAMESPACE: &str = "local";
 /// Compare-and-swap writes per flush: the first plus three retries after a changed revision.
 pub const MAX_CAS_ATTEMPTS: usize = 4;
 /// Longest custom namespace.
@@ -97,6 +106,34 @@ pub struct PinSpec {
 }
 
 impl PinSpec {
+    /// A pin derived from a complete tag-39015 bundle (genesis to tip) alone: the network, both
+    /// epochs and both identities are read from the bundle and the digest is computed. For a
+    /// local or private network whose own deployment is the source of trust; the bundle is
+    /// still verified strictly, link by link, when a session opens. A bundle that is not
+    /// complete (a continuation, a status other than OK), is empty, over the default budget or
+    /// malformed is `ReleasePinInvalid`.
+    pub fn from_bundle(bundle: &[u8]) -> Result<PinSpec, CacheError> {
+        let parsed =
+            TrustBaseHistory::parse_bundle(bundle, &BundleLimits::default()).map_err(|_| {
+                CacheError::ReleasePinInvalid("bundle is not a complete GetTrustBase response")
+            })?;
+        let (first, last) = match (parsed.entries.first(), parsed.entries.last()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Err(CacheError::ReleasePinInvalid("bundle has no entries")),
+        };
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(sha256(bundle).data());
+        Ok(PinSpec {
+            network_id: parsed.network,
+            genesis_epoch: first.epoch,
+            genesis_entry_id: first.entry_id(),
+            pinned_epoch: last.epoch,
+            pinned_entry_id: last.entry_id(),
+            bundle: bundle.to_vec(),
+            bundle_sha256: digest,
+        })
+    }
+
     /// Verify the pin and return its history: digest, structure, every predecessor signature,
     /// both identities and both epochs. Anything wrong is the fatal `ReleasePinInvalid`.
     pub fn verify(&self, limits: &BundleLimits) -> Result<TrustBaseHistory, CacheError> {
@@ -138,6 +175,19 @@ pub enum Authority {
         /// The authenticated pin.
         pin: PinSpec,
     },
+}
+
+impl Authority {
+    /// The authority of a local test network: the deployment's own complete bundle, in the
+    /// fixed namespace `local` (never shared with `public`), with no release lineage. Open it
+    /// with the network id the bundle declares. Strict verification, flush and conflict rules
+    /// are those of [`Authority::Custom`].
+    pub fn local(bundle: &[u8]) -> Result<Authority, CacheError> {
+        Ok(Authority::Custom {
+            namespace: String::from(LOCAL_NAMESPACE),
+            pin: PinSpec::from_bundle(bundle)?,
+        })
+    }
 }
 
 /// The key of one cached history: layout version, network, genesis identity, trust
