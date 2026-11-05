@@ -110,7 +110,7 @@ impl PinSpec {
     /// epochs and both identities are read from the bundle and the digest is computed. For a
     /// local or private network whose own deployment is the source of trust; the bundle is
     /// still verified strictly, link by link, when a session opens. A bundle that is not
-    /// complete (a continuation, a status other than OK), is empty, over the default budget or
+    /// complete (a continuation, a status other than OK), does not start at a genesis entry, is empty, over the default budget or
     /// malformed is `ReleasePinInvalid`.
     pub fn from_bundle(bundle: &[u8]) -> Result<PinSpec, CacheError> {
         let parsed =
@@ -121,6 +121,9 @@ impl PinSpec {
             (Some(a), Some(b)) => (a, b),
             _ => return Err(CacheError::ReleasePinInvalid("bundle has no entries")),
         };
+        first.verify_genesis().map_err(|_| {
+            CacheError::ReleasePinInvalid("bundle does not start at a genesis entry")
+        })?;
         let mut digest = [0u8; 32];
         digest.copy_from_slice(sha256(bundle).data());
         Ok(PinSpec {
