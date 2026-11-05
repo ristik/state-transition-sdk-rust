@@ -65,10 +65,17 @@ fn a_non_canonical_wire_order_of_the_signatures_is_still_refused() {
     let (_, e) = pair();
     let bytes = e.to_cbor();
     // exchange the keys node1 and node2 on the wire: the map is then out of canonical order
-    let k1 = bytes.windows(6).position(|w| w == b"\x65node1").unwrap();
-    let k2 = bytes.windows(6).position(|w| w == b"\x65node2").unwrap();
+    let k1 = bytes.windows(6).rposition(|w| w == b"\x65node1").unwrap();
+    let k2 = bytes.windows(6).rposition(|w| w == b"\x65node2").unwrap();
+    // the last occurrences are the signature map's; the first are the member list's
+    let first = bytes.windows(6).position(|w| w == b"\x65node1").unwrap();
+    assert!(k1 > first);
     let mut swapped = bytes.clone();
     swapped[k1..k1 + 6].copy_from_slice(b"\x65node2");
     swapped[k2..k2 + 6].copy_from_slice(b"\x65node1");
-    assert!(TrustBaseEntry::from_cbor(&swapped).is_err());
+    let err = TrustBaseEntry::from_cbor(&swapped).unwrap_err();
+    assert!(matches!(
+        err,
+        unicity_token::api::bft::TrustBaseError::Encoding(_)
+    ));
 }
