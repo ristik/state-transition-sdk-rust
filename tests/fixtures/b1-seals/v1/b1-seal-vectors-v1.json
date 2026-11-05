@@ -3,7 +3,7 @@
   "source": {
     "file": "bft-core b1ref/testdata/b1-vectors-anyage.json",
     "format": "b1-vectors/any-age-v1",
-    "sha256": "00918ee3bf01f9bf585a13098114bd2f68444fb0598be86da29e864e40ecaead"
+    "sha256": "5f9c378624060832b56b11ccb89bb75b85670deb443d6b6a3227de2c6c57f5d2"
   },
   "notes": [
     "Each case: verify the unicity certificate `uc` for `expectedPartition` on `network` against the committees in `epochs` (the trust-base history); the verdict must equal B1's.",
@@ -3373,6 +3373,47 @@
       "network": 3,
       "expectedPartition": 1,
       "uc": "d998598701d9985a8a010501582043e8bb1780bea5ef1422adbc859ddeea45ae373c0a34889a8fd52dbc709baa39582084bef6a504bab261d1552e5c779883992da84690bf4adfd838cebd94e5f60f134854862feb834d8c5b1a6440db745820a334d50edac34bad807ebab4adb52d653efca0aea7917b0b0729deeb78f3924f0c5820d2ca3d8e5dc9d64e3bd5fc88a61da5d446ce88c731af6a63f80cafc6a677f92b58206c3dcbcced5af7ee0810b2efaca5666c6f310cdfe76f41552db035bdeb613b38582051441c18ee4a5f0c5c270d385ade9561edbdd56ded1847428137cf566f083e25d9985b8301418080d9985c8301018382015820141cf02dd4129a9c3a6d4f39f09b5023e327a5c566be0d8f47a87c7df68e85d1820258208ba9fa85496d8700ae13fef6b2be06857f616a3a211883c5d53d4315d79419658204582000dfdf0b89abdfba195af5268cc40f4b0c83b12a297a751737530c9a88a29653d9985d8801031903de071a6440eef258201e97f307a2610583200a542f567ef414ff4db8882e006132a1f64a60094240b75820d242530069ac9dd7908e0d414db6b661d09585761516bada553af053e9c90abda4666e6f646530305841657493a4ff1281488b9901eb452d705ffc2763c4d7ee4f33ca94a8ec2456e09472dcbb3a1cedeecea4bfeb88f78e39cb10da8f2f6dda8ce1c2860aa2252eaff000666e6f646530315841cf19bc85d019b8735d95f704e1ae270527b00e93b7968d1d5bb06ccd952d389f3b379b2db329674253cacb10d5c6817c843f959108ed8d82e020a4f64a59d05b01666e6f646530325841e041a6bc1f028af546dda93b5396d11519c8f6a70f8c23fa6f824ba1d5b351a11aa4671d5f92dbe383d15d29eb8915d73ddd90f611dcbe5135c654560eae7f9d01676d616c6c6f727940",
+      "epochs": [
+        {
+          "epoch": 7,
+          "start": 900,
+          "end": null,
+          "threshold": 3,
+          "members": [
+            {
+              "nodeId": "node00",
+              "key": "03da42190ee3be228d4ddf5827b0e450035c7fe48cc10d855def132c69ee7fa719",
+              "weight": 1
+            },
+            {
+              "nodeId": "node01",
+              "key": "026d640351376dbcac0c4a09f2e24054050bb11f14b96518c53d212c149a3f53f0",
+              "weight": 1
+            },
+            {
+              "nodeId": "node02",
+              "key": "024104aacb86c4bbd24af1211626260fe5805fff1b9b1da9f2e0cf4b22685df3f8",
+              "weight": 1
+            },
+            {
+              "nodeId": "node03",
+              "key": "02386ee142dc40f1a3ec3453d1fcc665b7517e1075f6e02e3e2bafefe6b998d7dc",
+              "weight": 1
+            }
+          ]
+        }
+      ],
+      "verdict": "invalid",
+      "b1Sentinel": "ErrNativeInvalid"
+    },
+    {
+      "id": "quorum.empty-id.extra",
+      "source": "quorum.empty-id.extra",
+      "family": "Quorum",
+      "description": "honest quorum plus a real signature under an empty signer ID: refused by the native seal validation",
+      "network": 3,
+      "expectedPartition": 1,
+      "uc": "d998598701d9985a8a010501582043e8bb1780bea5ef1422adbc859ddeea45ae373c0a34889a8fd52dbc709baa39582084bef6a504bab261d1552e5c779883992da84690bf4adfd838cebd94e5f60f134854862feb834d8c5b1a6440db745820a334d50edac34bad807ebab4adb52d653efca0aea7917b0b0729deeb78f3924f0c5820d2ca3d8e5dc9d64e3bd5fc88a61da5d446ce88c731af6a63f80cafc6a677f92b58206c3dcbcced5af7ee0810b2efaca5666c6f310cdfe76f41552db035bdeb613b38582051441c18ee4a5f0c5c270d385ade9561edbdd56ded1847428137cf566f083e25d9985b8301418080d9985c8301018382015820141cf02dd4129a9c3a6d4f39f09b5023e327a5c566be0d8f47a87c7df68e85d1820258208ba9fa85496d8700ae13fef6b2be06857f616a3a211883c5d53d4315d79419658204582000dfdf0b89abdfba195af5268cc40f4b0c83b12a297a751737530c9a88a29653d9985d8801031903de071a6440eef258201e97f307a2610583200a542f567ef414ff4db8882e006132a1f64a60094240b75820d242530069ac9dd7908e0d414db6b661d09585761516bada553af053e9c90abda4605841657493a4ff1281488b9901eb452d705ffc2763c4d7ee4f33ca94a8ec2456e09472dcbb3a1cedeecea4bfeb88f78e39cb10da8f2f6dda8ce1c2860aa2252eaff000666e6f646530305841657493a4ff1281488b9901eb452d705ffc2763c4d7ee4f33ca94a8ec2456e09472dcbb3a1cedeecea4bfeb88f78e39cb10da8f2f6dda8ce1c2860aa2252eaff000666e6f646530315841cf19bc85d019b8735d95f704e1ae270527b00e93b7968d1d5bb06ccd952d389f3b379b2db329674253cacb10d5c6817c843f959108ed8d82e020a4f64a59d05b01666e6f646530325841e041a6bc1f028af546dda93b5396d11519c8f6a70f8c23fa6f824ba1d5b351a11aa4671d5f92dbe383d15d29eb8915d73ddd90f611dcbe5135c654560eae7f9d01",
       "epochs": [
         {
           "epoch": 7,
