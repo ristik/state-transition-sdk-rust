@@ -22,6 +22,9 @@ alloc = []
 # std enables std error integration, host RNG conveniences, JSON trust-base
 # parsing, and pulls std in deps.
 std = ["alloc", "k256/std", "sha2/std", "dep:getrandom", "dep:serde_json"]
+# test-fixtures exposes signature-skipping test constructors (`TrustBaseHistory::from_trusted_chain`)
+# to this crate's integration tests. Never enable it in an application.
+test-fixtures = ["alloc"]
 # client adds transaction construction, signing, and the mint/transfer flow
 # over a caller-supplied AggregatorClient transport.
 client = ["alloc"]
@@ -43,6 +46,8 @@ url = { version = "2", optional = true }
 zeroize = { version = "1", optional = true }
 
 [dev-dependencies]
+# the integration tests use the test-only constructors
+unicity-token = { path = ".", features = ["test-fixtures"] }
 hex-literal = "0.4"
 # Loads e2e/.env for the live examples.
 dotenvy = "0.15"
