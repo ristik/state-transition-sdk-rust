@@ -7,12 +7,14 @@
 //! shares a seal (for example after proof consolidation), or whose nested proofs repeat one,
 //! pay for the signature work once per session.
 //!
-//! The seal rule is the native one (bridge verifier, bft-core `b1ref`): the epoch's entry
-//! must exist and contain the seal's root round (`start <= r`, and `r < next start` when the
-//! successor is held; the newest epoch is open-ended until its successor is known), every
-//! supplied signature is checked with no early exit, an unknown signer or any bad signature
-//! fails the seal, a signature is 64 bytes or 65 with recovery byte 0/1, and the signed
-//! weights have to reach the entry's threshold (`floor(2W/3)+1`).
+//! The seal rule is upstream's, in the bridge verifier and bft-core `b1ref` as well: the epoch's
+//! entry must exist and contain the seal's root round (`start <= r`, and `r < next start` when
+//! the successor is held; the newest epoch is open-ended until its successor is known). Each
+//! supplied signature is judged alone: a signer that is not a member of the entry, and a
+//! signature that is not exactly 65 canonical bytes `r || s || v` (low s, `v` in 0..=3) that
+//! recovers to the member's key, contribute zero and never fail the seal; the weights of the
+//! valid signatures have to reach the entry's threshold (`floor(2W/3)+1`). A trust-base ENTRY's
+//! witnesses are a different object and stay strict (`TrustBaseEntry::verify_successor`).
 //!
 //! The memo only ever skips the quorum signature check of a seal whose complete encoding
 //! (signatures included) has already passed under the same entry (its identity is part of the
@@ -27,7 +29,7 @@ use crate::api::bft::trust_base_entry::TrustBaseEntry;
 use crate::api::bft::{TrustBaseHistory, UnicityCertificate, UnicitySeal};
 use crate::api::NetworkId;
 use crate::crypto::hash::{DataHasher, HashAlgorithm};
-use crate::crypto::signature::verify_seal_signature;
+use crate::crypto::signature::Signature;
 use crate::fifo_index::FifoIndex;
 
 use super::VerificationError;
@@ -309,27 +311,31 @@ pub(crate) fn check_seal_shape(seal: &UnicitySeal) -> Result<(), VerificationErr
     Ok(())
 }
 
-/// The native quorum rule over `seal` under `entry`: every supplied signature is checked
-/// (no early exit); a signer that is not a member of the entry, a repeated signer or any
-/// signature that is malformed or does not verify fails the seal; the signed weights, summed
-/// with checked arithmetic, have to reach the entry's threshold.
+/// The seal quorum rule over `seal` under `entry` (upstream's): every supplied signature is
+/// judged alone and counts its member's weight only if it is valid; an unknown signer, a
+/// repeated signer's later copy, and any signature that is malformed or does not recover to the
+/// member's key count zero. The weights, summed with checked arithmetic, have to reach the
+/// entry's threshold. A repeated signer ID cannot occur in a canonical seal (a duplicate map
+/// key); it is refused as structure.
 fn quorum_met(entry: &TrustBaseEntry, seal: &UnicitySeal) -> Result<(), VerificationError> {
     let seal_hash = seal.calculate_hash();
     let mut weight = 0u64;
     let mut seen: Vec<&str> = Vec::with_capacity(seal.signatures.len());
     for (node_id, signature) in &seal.signatures {
         if seen.contains(&node_id.as_str()) {
-            return Err(VerificationError::SealSignerInvalid);
+            return Err(VerificationError::SealMalformed);
         }
         seen.push(node_id.as_str());
-        let member = entry
-            .member(node_id)
-            .ok_or(VerificationError::SealSignerInvalid)?;
-        verify_seal_signature(signature, seal_hash.data(), &member.signing_key)
-            .map_err(|_| VerificationError::SealSignerInvalid)?;
-        weight = weight
-            .checked_add(member.weight)
-            .ok_or(VerificationError::SealSignerInvalid)?;
+        let Some(member) = entry.member(node_id) else {
+            continue;
+        };
+        let valid = Signature::decode(signature)
+            .is_ok_and(|sig| sig.verify(seal_hash.data(), &member.signing_key));
+        if valid {
+            weight = weight
+                .checked_add(member.weight)
+                .ok_or(VerificationError::QuorumNotMet)?;
+        }
     }
     if weight < entry.quorum_threshold {
         return Err(VerificationError::QuorumNotMet);
@@ -412,53 +418,92 @@ mod tests {
     }
 
     #[test]
-    fn the_native_seal_rule_is_strict_and_has_no_early_exit() {
+    fn the_seal_rule_counts_valid_signatures_and_ignores_the_rest() {
         let s = signers(4);
         let h = history(&s, &[1, 1, 1, 1]); // threshold 3
         let good = signed_by(&s, &[0, 1, 2]);
         assert_eq!(SealSession::new(&h).verify_quorum(&good), Ok(()));
 
-        // a bad signature after the quorum was reached still fails the seal
+        // a bad signature beside a quorum counts zero and does not fail the seal
         let mut bad_extra = signed_by(&s, &[0, 1, 2, 3]);
         bad_extra.signatures[3].1[5] ^= 1;
+        assert_eq!(SealSession::new(&h).verify_quorum(&bad_extra), Ok(()));
+        // ... and makes up for nothing: two valid plus a bad one is a signer short
+        let mut short = signed_by(&s, &[0, 1, 3]);
+        short.signatures[2].1[5] ^= 1;
         assert_eq!(
-            SealSession::new(&h).verify_quorum(&bad_extra),
-            Err(VerificationError::SealSignerInvalid)
+            SealSession::new(&h).verify_quorum(&short),
+            Err(VerificationError::QuorumNotMet)
         );
-        // an unknown signer fails it too
+        // an unknown signer beside a quorum counts zero
         let mut unknown = good.clone();
         unknown
             .signatures
             .push(("zz".into(), unknown.signatures[0].1.clone()));
-        assert_eq!(
-            SealSession::new(&h).verify_quorum(&unknown),
-            Err(VerificationError::SealSignerInvalid)
-        );
-        // a repeated signer
+        assert_eq!(SealSession::new(&h).verify_quorum(&unknown), Ok(()));
+        // a repeated signer ID is structure (a duplicate map key), not a vote
         let mut twice = good.clone();
         twice.signatures.push(twice.signatures[0].clone());
         assert_eq!(
             SealSession::new(&h).verify_quorum(&twice),
-            Err(VerificationError::SealSignerInvalid)
+            Err(VerificationError::SealMalformed)
         );
-        // 64 bytes, or 65 with the recovery byte 0/1 ignored, are signatures; others are not
-        let mut compact = good.clone();
-        compact.signatures[0].1.truncate(64);
-        assert_eq!(SealSession::new(&h).verify_quorum(&compact), Ok(()));
-        let mut ignored = good.clone();
-        ignored.signatures[0].1[64] ^= 1;
-        assert_eq!(SealSession::new(&h).verify_quorum(&ignored), Ok(()));
-        let mut v2 = good.clone();
-        v2.signatures[0].1[64] = 2;
-        assert_eq!(
-            SealSession::new(&h).verify_quorum(&v2),
-            Err(VerificationError::SealSignerInvalid)
-        );
+        // every witness that is not an exact canonical recoverable signature counts zero, as an extra
+        let extra = |sig: Vec<u8>| {
+            let mut x = good.clone();
+            x.signatures.push((s_id(&h, 3), sig));
+            x
+        };
+        let valid3 = signed_by(&s, &[3]).signatures[0].1.clone();
+        let mut compact = valid3.clone();
+        compact.truncate(64);
+        let mut flipped = valid3.clone();
+        flipped[64] ^= 1;
+        let mut v2 = valid3.clone();
+        v2[64] = 2;
+        let mut v27 = valid3.clone();
+        v27[64] = 27;
+        let mut long = valid3.clone();
+        long.push(0);
+        for (name, sig) in [
+            ("compact", compact.clone()),
+            ("recovery byte flipped", flipped.clone()),
+            ("recovery id 2 that does not recover the key", v2.clone()),
+            ("recovery byte 27", v27.clone()),
+            ("66 bytes", long.clone()),
+            ("63 bytes", valid3[..63].to_vec()),
+        ] {
+            assert_eq!(
+                SealSession::new(&h).verify_quorum(&extra(sig)),
+                Ok(()),
+                "{name} as an extra"
+            );
+        }
+        // ... and as a needed signature none of them has weight
+        for (name, sig) in [
+            ("compact", compact),
+            ("recovery byte flipped", flipped),
+            ("recovery id 2", v2),
+            ("recovery byte 27", v27),
+            ("66 bytes", long),
+        ] {
+            let mut two_and = signed_by(&s, &[0, 1]);
+            two_and.signatures.push((s_id(&h, 2), sig));
+            assert_eq!(
+                SealSession::new(&h).verify_quorum(&two_and),
+                Err(VerificationError::QuorumNotMet),
+                "{name} as a needed signature"
+            );
+        }
         // below the threshold
         assert_eq!(
             SealSession::new(&h).verify_quorum(&signed_by(&s, &[0, 1])),
             Err(VerificationError::QuorumNotMet)
         );
+    }
+
+    fn s_id(h: &TrustBaseHistory, i: usize) -> alloc::string::String {
+        h.latest().members[i].node_id.clone()
     }
 
     #[test]
@@ -483,9 +528,9 @@ mod tests {
         let st = session.stats();
         assert_eq!((st.quorum_checks, st.memo_hits), (1, 1));
 
-        // another valid witness of the same unsigned seal (the 64-byte form) is another key
+        // another witness of the same unsigned seal (an extra of an unknown signer, zero weight) is another key
         let mut twin = seal.clone();
-        twin.signatures[0].1.truncate(64);
+        twin.signatures.push(("zz".into(), alloc::vec![1, 2, 3]));
         session.verify_quorum(&twin).unwrap();
         assert_eq!(session.stats().quorum_checks, 2);
 

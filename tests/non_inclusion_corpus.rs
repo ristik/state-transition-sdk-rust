@@ -119,7 +119,6 @@ fn class_of(error: &VerificationError, name: &str) -> &'static str {
         }
         VerificationError::UnknownTrustEpoch { .. }
         | VerificationError::EpochBeforeGenesis
-        | VerificationError::SealSignerInvalid
         | VerificationError::SealNetworkMismatch
         | VerificationError::SealBeforeEpochStart
         | VerificationError::SealAfterAuthorityEnd

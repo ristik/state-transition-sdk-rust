@@ -636,7 +636,7 @@ fn integrity_failures_are_never_unavailability() {
         Err(ConsolidationError::Integrity(IntegrityError::View(_)))
     ));
 
-    // invalid signature witness in the master's certificate
+    // invalid signature witness in the master's certificate: it counts zero and the quorum is short
     let mut m = master.clone();
     let proofs: Vec<Value> = m["proofs"]
         .as_array()
@@ -652,7 +652,7 @@ fn integrity_failures_are_never_unavailability() {
     assert!(matches!(
         consolidate_with(m, peer.clone()),
         Err(ConsolidationError::Integrity(IntegrityError::View(
-            PartitionViewError::Seal(VerificationError::SealSignerInvalid)
+            PartitionViewError::Seal(VerificationError::QuorumNotMet)
         )))
     ));
 

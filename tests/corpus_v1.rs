@@ -237,7 +237,7 @@ fn other_authorities_do_not_authenticate_the_master_seal() {
     for (name, want) in [
         (
             "trust-base-other-authority",
-            VerificationError::SealSignerInvalid,
+            VerificationError::QuorumNotMet,
         ),
         (
             // the history holds an entry of another epoch only: older or newer than the seal's

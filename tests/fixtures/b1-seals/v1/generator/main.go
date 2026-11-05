@@ -58,7 +58,7 @@ type regEpoch struct {
 // verdicts that depend on the certificate or its seal (B1 sentinel -> kept). Everything else is excluded with its reason.
 var ucLevel = map[string]bool{
 	// seal signatures and quorum
-	"ErrUnknownSigner": true, "ErrSigInvalid": true, "ErrSigFormat": true, "ErrSigRange": true, "ErrQuorum": true, "ErrDuplicateMapKey": true,
+	"ErrQuorum": true, "ErrDuplicateMapKey": true,
 	"ErrTooManySigs": true,
 	// seal context: network, epoch interval
 	"ErrNetwork": true, "ErrBeforeStart": true, "ErrAfterEnd": true, "ErrEpochBeforeGenesis": true,
@@ -223,7 +223,7 @@ func main() {
 		Notes: []string{
 			"Each case: verify the unicity certificate `uc` for `expectedPartition` on `network` against the committees in `epochs` (the trust-base history); the verdict must equal B1's.",
 			"Committee of a seal = the epoch with epoch == seal.epoch; the seal root round must be >= start and, when `end` is set, < end. No entry for the seal epoch below the first epoch is invalid.",
-			"Seal signatures (B1 rule): every supplied signature checked, no early exit; an unknown signer or any bad signature fails the seal; 64 bytes, or 65 with v in {0,1} and v otherwise ignored; 1 <= r < n, 1 <= s <= n/2; ECDSA against the listed key; weighted sum >= threshold.",
+			"Seal signatures (the upstream rule): each distinct signer ID is judged alone; an unknown signer, and a signature that is not exactly 65 bytes r||s||v (1 <= r < n, 1 <= s <= n/2, v in 0..3) recovering over SHA-256 of the seal bytes to the member's listed key, contribute zero and never fail the seal; the weighted sum of the valid ones must reach the threshold. An empty value is the one structural exception (upstream's seal validation refuses it).",
 			"verdict 'malformed' is B1 status=error (the input is refused before evaluation); 'invalid' is a well-formed certificate B1 judges false.",
 			"Only cases whose verdict depends on the certificate or its seal are kept; `excluded` lists the rest with the reason. Every claim of an all-valid multi-claim batch is a separate valid case.",
 		},
