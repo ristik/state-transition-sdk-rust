@@ -99,7 +99,10 @@ fn controls_another_networks_bundle_or_a_damaged_signature_do_not_verify() {
     let (state_id, p) = proof("testnet2");
     let shard = p.unicity_certificate().shard_tree_certificate.shard.clone();
     let ctx = NonInclusionContext::new().with_shard(shard);
-    assert!(p.verify_for_at_snapshot(&state_id, &h, &ctx).is_err());
+    assert_eq!(
+        p.verify_for_at_snapshot(&state_id, &h, &ctx).map(|_| ()),
+        Err(VerificationError::SealNetworkMismatch)
+    );
 
     // damaged signatures: the proof still decodes, but once fewer than a quorum verify the seal no longer authenticates
     let raw = hex_of("testnet2.non-inclusion.hex");
@@ -130,11 +133,11 @@ fn controls_another_networks_bundle_or_a_damaged_signature_do_not_verify() {
             .with_shard(q.unicity_certificate().shard_tree_certificate.shard.clone());
         q.verify_for_at_snapshot(&state_id, &h4, &ctx).map(|_| ())
     };
-    assert!(sigs.len() >= 4);
+    assert_eq!(sigs.len(), 4);
     assert_eq!(damaged(0), Ok(()));
-    assert!(damaged(sigs.len()).is_err(), "no valid signature");
-    assert!(
-        damaged(sigs.len() - 1).is_err(),
-        "one valid signature of four is below the quorum"
-    );
+    // 3 of 4 valid still meets the quorum (the genesis threshold is floor(2*4/3)+1 = 3)
+    assert_eq!(damaged(1), Ok(()));
+    assert_eq!(damaged(2), Err(VerificationError::QuorumNotMet));
+    assert_eq!(damaged(3), Err(VerificationError::QuorumNotMet));
+    assert_eq!(damaged(4), Err(VerificationError::QuorumNotMet));
 }
