@@ -666,7 +666,9 @@ fn generate() -> Value {
     );
 
     // budgets: a valid longer history over the budget is oversize, not malformed
-    let lim = |entries: Option<usize>, bytes: Option<usize>| json!({"maxEntries": entries, "maxBundleBytes": bytes});
+    let lim = |entries: Option<usize>, bytes: Option<usize>| json!({"maxEntries": entries, "maxBundleBytes": bytes, "maxEntryBytes": Option::<usize>::None});
+    let max_entry = a1_3.iter().map(|e| e.to_cbor().len()).max().unwrap();
+    let elim = |n: usize| json!({"maxEntries": Option::<usize>::None, "maxBundleBytes": Option::<usize>::None, "maxEntryBytes": n});
     let ig = || json!("ignoresBudget");
     oc_full(
         "over-entry-budget",
@@ -708,6 +710,29 @@ fn generate() -> Value {
         &[],
         false,
     );
+    // per-entry budget: the genesis-only pin fits (a genesis carries no signatures), the cache's
+    // successors do not
+    assert!(a[0].to_cbor().len() < max_entry);
+    oc_full(
+        "over-entry-bytes-budget",
+        "A1",
+        cb("A1-3"),
+        none.clone(),
+        elim(max_entry - 1),
+        tip(&[&a[0]]),
+        &["CacheRejected:oversize"],
+        false,
+    );
+    oc_full(
+        "at-the-entry-bytes-budget",
+        "A1",
+        cb("A1-3"),
+        none.clone(),
+        elim(max_entry),
+        tip(&a1_3),
+        &[],
+        false,
+    );
     let open = open_cell.into_inner();
 
     // flush cases: open, offer each entry, flush once, compare the stored bytes
@@ -727,6 +752,7 @@ fn generate() -> Value {
         }));
     };
     let nl = json!({"maxEntries": null, "maxBundleBytes": null});
+    let el = elim(max_entry - 1);
     let l4 = json!({"maxEntries": 4, "maxBundleBytes": null});
     let lb = json!({"maxEntries": null, "maxBundleBytes": a15_len - 1});
     let ig = json!("ignoresBudget");
@@ -758,6 +784,16 @@ fn generate() -> Value {
         lb,
         ig,
         &["A4"],
+        "pending:Oversize",
+        "unchanged",
+    );
+    fc(
+        "oversize-entry-bytes-is-not-rewritten",
+        "A1",
+        cb("A1-3"),
+        el,
+        none.clone(),
+        &[],
         "pending:Oversize",
         "unchanged",
     );
@@ -1127,6 +1163,9 @@ fn options_of(c: &Value) -> SessionOptions {
     let mut o = SessionOptions::default();
     if let Some(n) = c["limits"]["maxEntries"].as_u64() {
         o.limits.max_entries = n as usize;
+    }
+    if let Some(n) = c["limits"]["maxEntryBytes"].as_u64() {
+        o.limits.max_entry_bytes = n as usize;
     }
     if let Some(n) = c["limits"]["maxBundleBytes"].as_u64() {
         o.limits.max_bytes = n as usize;

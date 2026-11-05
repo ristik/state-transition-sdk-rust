@@ -384,6 +384,24 @@
     },
     {
       "cache": {
+        "bundle": "A1-3"
+      },
+      "expect": {
+        "result": "pending:Oversize",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null,
+        "maxEntryBytes": 443
+      },
+      "name": "oversize-entry-bytes-is-not-rewritten",
+      "offers": [],
+      "pin": "A1",
+      "store": null
+    },
+    {
+      "cache": {
         "bundle": "F1-3"
       },
       "expect": {
@@ -1430,7 +1448,8 @@
       },
       "limits": {
         "maxBundleBytes": null,
-        "maxEntries": 4
+        "maxEntries": 4,
+        "maxEntryBytes": null
       },
       "name": "over-entry-budget",
       "pin": "A1-3",
@@ -1450,7 +1469,8 @@
       },
       "limits": {
         "maxBundleBytes": 2025,
-        "maxEntries": null
+        "maxEntries": null,
+        "maxEntryBytes": null
       },
       "name": "over-byte-budget-store-does-not-enforce",
       "pin": "A1-3",
@@ -1468,7 +1488,8 @@
       },
       "limits": {
         "maxBundleBytes": null,
-        "maxEntries": 5
+        "maxEntries": 5,
+        "maxEntryBytes": null
       },
       "name": "at-the-entry-budget",
       "pin": "A1-3",
@@ -1486,11 +1507,52 @@
       },
       "limits": {
         "maxBundleBytes": 2026,
-        "maxEntries": null
+        "maxEntries": null,
+        "maxEntryBytes": null
       },
       "name": "at-the-byte-budget",
       "pin": "A1-3",
       "store": "ignoresBudget"
+    },
+    {
+      "cache": {
+        "bundle": "A1-3"
+      },
+      "expect": {
+        "diagnostics": [
+          "CacheRejected:oversize"
+        ],
+        "flushNeeded": false,
+        "tipEntryId": "ab88deef39698e7a83f8109e7d2809136c2aa92a1751a268bf689cc3a7481484",
+        "tipEpoch": "1"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null,
+        "maxEntryBytes": 443
+      },
+      "name": "over-entry-bytes-budget",
+      "pin": "A1",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-3"
+      },
+      "expect": {
+        "diagnostics": [],
+        "flushNeeded": false,
+        "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
+        "tipEpoch": "3"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null,
+        "maxEntryBytes": 444
+      },
+      "name": "at-the-entry-bytes-budget",
+      "pin": "A1",
+      "store": null
     }
   ],
   "pins": [
