@@ -2264,7 +2264,15 @@ fn a_local_network_opens_from_its_own_bundle_alone() {
     *cursor.last_mut().unwrap() = 0x01; // the continuation field (null) becomes 1
     let mut status = bundle.clone();
     status[6] = 0x01; // tag (3 bytes), array header, version, network, then the status
-    for bad in [cursor, status, vec![], bundle[..bundle.len() - 1].to_vec()] {
+                      // a bundle that does not start at the genesis entry is no pin either
+    let later = pin_of(&f.a(1, 3)).bundle;
+    for bad in [
+        cursor,
+        status,
+        later,
+        vec![],
+        bundle[..bundle.len() - 1].to_vec(),
+    ] {
         assert!(matches!(
             PinSpec::from_bundle(&bad),
             Err(CacheError::ReleasePinInvalid(_))
