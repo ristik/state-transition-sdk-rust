@@ -2275,3 +2275,24 @@ fn a_local_network_opens_from_its_own_bundle_alone() {
         ));
     }
 }
+
+#[test]
+fn a_local_bundle_with_a_forged_signature_is_refused_at_open() {
+    let f = Fix::new();
+    let mut bundle = f.pin(3).bundle;
+    // the last bytes are the tip's signature map and the null continuation: corrupt a signature
+    let at = bundle.len() - 10;
+    bundle[at] ^= 0x01;
+    // structurally a bundle, so a pin is derived; the signature check happens at open
+    let auth = Authority::local(&bundle).unwrap();
+    assert!(matches!(
+        block_on(Session::open_in(
+            &[],
+            net(7),
+            auth,
+            MemoryStore::new(),
+            SessionOptions::default(),
+        )),
+        Err(CacheError::ReleasePinInvalid(_))
+    ));
+}
