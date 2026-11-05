@@ -1107,7 +1107,7 @@ mod tests {
         // ... but only after the certificate is authenticated: an untrusted one never yields it
         assert_eq!(
             ni_at(&trust_base(&signer(0x12)), &proof, &state_id(terminal)),
-            Err(VerificationError::SealSignerInvalid)
+            Err(VerificationError::QuorumNotMet)
         );
     }
 
@@ -1134,7 +1134,7 @@ mod tests {
         let proof = singleton_non_inclusion_proof(&rogue, [0x22; 32], [0x33; 32]);
         assert_eq!(
             ni_absent(&trust_base(&trusted), &proof, &state_id([0x44; 32])),
-            Err(VerificationError::SealSignerInvalid)
+            Err(VerificationError::QuorumNotMet)
         );
     }
 
@@ -1551,7 +1551,7 @@ mod tests {
         let proof = valid_proof(&transfer, &owner, &rogue);
         assert_eq!(
             verify_inclusion_proof(&tb, &proof, &transfer, REFERENCE_TIME),
-            Err(VerificationError::SealSignerInvalid)
+            Err(VerificationError::QuorumNotMet)
         );
     }
 
@@ -2009,7 +2009,7 @@ mod tests {
         let forged = ni_proof(&rogue, |_| {});
         assert_eq!(
             verify_ni_ctx(&tb, &forged, &NonInclusionContext::new()),
-            Err(VerificationError::SealSignerInvalid)
+            Err(VerificationError::QuorumNotMet)
         );
     }
 
@@ -2136,9 +2136,12 @@ mod tests {
             "another context re-checks the body"
         );
         // a different witness for the same unsigned seal is another certificate
-        // (the 64-byte form of the same signature is valid under the native rule)
+        // (an extra witness of an unknown signer counts zero under the seal rule)
         let mut other = good.unicity_certificate().clone();
-        other.unicity_seal.signatures[0].1.truncate(64);
+        other
+            .unicity_seal
+            .signatures
+            .push(("zz".into(), vec![1, 2, 3]));
         let twin = NonInclusionProof::new(good.certificate().clone(), other);
         assert!(verify_non_inclusion_in(&mut session, &twin, &target, &ctx).is_ok());
         assert_eq!(session.stats().body_checks, 3);

@@ -727,9 +727,7 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     });
     assert_eq!(
         assemble(&c.uc, &tb),
-        Err(PartitionViewError::Seal(
-            VerificationError::SealSignerInvalid
-        ))
+        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
     );
 
     // tampered / missing / empty signatures
@@ -737,9 +735,7 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     bad.unicity_seal.signatures[0].1[10] ^= 1;
     assert_eq!(
         assemble(&bad, &c.trust_base),
-        Err(PartitionViewError::Seal(
-            VerificationError::SealSignerInvalid
-        ))
+        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
     );
     let mut none = c.uc.clone();
     none.unicity_seal.signatures.clear();
@@ -760,7 +756,7 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     s.authenticate_seal(&c.uc.unicity_seal).unwrap();
     assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (1, 1));
     let mut other_witness = c.uc.unicity_seal.clone();
-    other_witness.signatures[0].1.truncate(64); // the 64-byte form of the same signature
+    other_witness.signatures.push(("zz".into(), vec![1, 2, 3])); // a zero-weight extra witness
     s.authenticate_seal(&other_witness).unwrap(); // still a quorum, but a different witness
     assert_eq!((s.stats().quorum_checks, s.stats().memo_hits), (2, 1));
     let mut tampered = c.uc.unicity_seal.clone();
@@ -786,7 +782,7 @@ fn memo_is_bounded_and_can_be_disabled() {
     let mut s = SealSession::with_capacity(&c.trust_base, 1);
     let a = c.uc.unicity_seal.clone();
     let mut b = a.clone();
-    b.signatures[0].1.truncate(64); // another witness: the 64-byte form of the same signature
+    b.signatures.push(("zz".into(), vec![1, 2, 3])); // another witness: a zero-weight extra
     s.authenticate_seal(&a).unwrap();
     s.authenticate_seal(&b).unwrap(); // evicts a
     s.authenticate_seal(&b).unwrap();
@@ -932,7 +928,10 @@ fn view_identity_binds_authority_partition_pins_and_seal() {
 
     // a different valid witness of the same unsigned seal is a different identity
     let mut witness = c.uc.clone();
-    witness.unicity_seal.signatures[0].1.truncate(64);
+    witness
+        .unicity_seal
+        .signatures
+        .push(("zz".into(), vec![1, 2, 3]));
     assert_ne!(base, id(&c.trust_base, &witness, None));
 
     // pins on different shards differ
@@ -987,9 +986,7 @@ fn candidate_data_is_never_authority() {
     let (r, checks) = go(&c.view, &bad);
     assert_eq!(
         r,
-        Err(PartitionViewError::Seal(
-            VerificationError::SealSignerInvalid
-        ))
+        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
     );
     assert_eq!(checks, 1);
 }
@@ -1047,9 +1044,7 @@ fn pinned_assembly_api_is_preserved() {
     let mut s = SealSession::new(&c.trust_base);
     assert_eq!(
         c.view.assemble_certificates(&bad, &c.topology, &mut s),
-        Err(PartitionViewError::Seal(
-            VerificationError::SealSignerInvalid
-        ))
+        Err(PartitionViewError::Seal(VerificationError::QuorumNotMet))
     );
 }
 

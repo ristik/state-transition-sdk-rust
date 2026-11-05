@@ -85,9 +85,6 @@ pub enum VerificationError {
     },
     /// The seal's epoch is older than the first entry of the history.
     EpochBeforeGenesis,
-    /// A signature on the seal is from an unknown signer, malformed or not valid. The native
-    /// rule is strict: one such signature fails the seal even when the others reach the quorum.
-    SealSignerInvalid,
     /// The unicity seal predates the start of its epoch.
     SealBeforeEpochStart,
     /// The unicity seal is structurally unusable (no signatures, zero round, ...).
@@ -255,12 +252,6 @@ impl fmt::Display for VerificationError {
             }
             VerificationError::EpochBeforeGenesis => {
                 write!(f, "unicity seal epoch is older than the trust base history")
-            }
-            VerificationError::SealSignerInvalid => {
-                write!(
-                    f,
-                    "a unicity seal signature is from an unknown signer or invalid"
-                )
             }
             VerificationError::SealBeforeEpochStart => {
                 write!(f, "unicity seal predates its epoch")

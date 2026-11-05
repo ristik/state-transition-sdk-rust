@@ -229,7 +229,6 @@ fn seal_class(e: &VerificationError) -> String {
         | SealNetworkMismatch
         // the fork's native seal rule refuses a seal carrying any unknown or invalid signature
         // (the other-authority case) instead of counting the valid ones towards a quorum
-        | SealSignerInvalid
         | EpochBeforeGenesis
         | UnknownTrustEpoch { .. }
         | SealAfterAuthorityEnd
