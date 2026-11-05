@@ -10,8 +10,10 @@ pub struct NetworkId(u16);
 impl NetworkId {
     /// Production network (id 1).
     pub const MAINNET: NetworkId = NetworkId(1);
-    /// Test network (id 2).
-    pub const TESTNET: NetworkId = NetworkId(2);
+    /// The public test network, testnet2 (id 4). There is deliberately no constant for network 2, the
+    /// old testnet that unicity-ids no longer lists: a name that looks like "the test network" must not
+    /// be a different network. Use [`new`](Self::new) for any other id.
+    pub const TESTNET2: NetworkId = NetworkId(4);
     /// Local/dev network (id 3).
     pub const LOCAL: NetworkId = NetworkId(3);
 
@@ -26,5 +28,21 @@ impl NetworkId {
     /// The numeric id.
     pub fn id(self) -> u16 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_named_networks_and_any_valid_id() {
+        assert_eq!(NetworkId::MAINNET.id(), 1);
+        assert_eq!(NetworkId::TESTNET2.id(), 4);
+        assert_eq!(NetworkId::LOCAL.id(), 3);
+        // any valid id is still accepted (network 2 included), only 0 is not
+        assert_eq!(NetworkId::new(2).unwrap().id(), 2);
+        assert_eq!(NetworkId::new(0xffff).unwrap().id(), 0xffff);
+        assert!(NetworkId::new(0).is_err());
     }
 }
