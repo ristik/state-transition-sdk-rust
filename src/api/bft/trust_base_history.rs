@@ -103,6 +103,9 @@ pub enum HistoryError {
     BeforeGenesis,
     /// The bundle or genesis is malformed.
     Bundle(&'static str),
+    /// A resource budget (bytes, entries, entry bytes) is exceeded. Not a defect of the data: a
+    /// valid larger history is never judged malformed, rewritten or pruned for it.
+    Budget(&'static str),
     /// The genesis identity differs from the pin.
     PinMismatch,
 }
@@ -122,6 +125,7 @@ impl fmt::Display for HistoryError {
             HistoryError::WrongNetwork => write!(f, "trust base history: another network"),
             HistoryError::BeforeGenesis => write!(f, "trust base history: epoch before the genesis"),
             HistoryError::Bundle(m) => write!(f, "trust base history: invalid bundle: {m}"),
+            HistoryError::Budget(m) => write!(f, "trust base history: over the budget: {m}"),
             HistoryError::PinMismatch => write!(f, "trust base history: genesis differs from the pin"),
         }
     }
@@ -197,7 +201,7 @@ impl TrustBaseHistory {
     /// before decoding and the entry count before any signature work.
     pub fn parse_bundle(bytes: &[u8], limits: &BundleLimits) -> Result<ParsedBundle, HistoryError> {
         if bytes.len() > limits.max_bytes {
-            return Err(HistoryError::Bundle("bundle exceeds the size bound"));
+            return Err(HistoryError::Budget("bundle exceeds the size bound"));
         }
         let b = |m: &'static str| HistoryError::Bundle(m);
         let top = Decoder::new(bytes);
@@ -233,13 +237,16 @@ impl TrustBaseHistory {
         let items = f[6]
             .array(None)
             .map_err(|_| b("entries are not an array"))?;
-        if items.is_empty() || items.len() > limits.max_entries {
-            return Err(b("entry count outside the bound"));
+        if items.is_empty() {
+            return Err(b("no entries"));
+        }
+        if items.len() > limits.max_entries {
+            return Err(HistoryError::Budget("entry count exceeds the bound"));
         }
         let mut entries = Vec::with_capacity(items.len());
         for item in &items {
             if item.bytes().len() > limits.max_entry_bytes {
-                return Err(b("entry exceeds the size bound"));
+                return Err(HistoryError::Budget("entry exceeds the size bound"));
             }
             let entry = TrustBaseEntry::from_cbor(item.bytes())?;
             if entry.network_id != network {

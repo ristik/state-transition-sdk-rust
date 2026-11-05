@@ -447,20 +447,30 @@ fn generate() -> Value {
         let e = h[h.len() - 1];
         (e.epoch.to_string(), hx(&e.entry_id()))
     };
-    let mut open = Vec::new();
+    let open_cell = std::cell::RefCell::new(Vec::<Value>::new());
     #[allow(clippy::too_many_arguments)]
-    let mut oc = |name: &str,
-                  pin: &str,
-                  cache: Value,
-                  store: Value,
-                  t: (String, String),
-                  diag: &[&str],
-                  flush: bool| {
-        open.push(json!({
-            "name": name, "pin": pin, "cache": cache, "store": store,
+    let oc_full = |name: &str,
+                   pin: &str,
+                   cache: Value,
+                   store: Value,
+                   limits: Value,
+                   t: (String, String),
+                   diag: &[&str],
+                   flush: bool| {
+        open_cell.borrow_mut().push(json!({
+            "name": name, "pin": pin, "cache": cache, "store": store, "limits": limits,
             "expect": {"tipEpoch": t.0, "tipEntryId": t.1, "diagnostics": diag, "flushNeeded": flush}
         }));
     };
+    let oc =
+        |name: &str,
+         pin: &str,
+         cache: Value,
+         store: Value,
+         t: (String, String),
+         diag: &[&str],
+         flush: bool| { oc_full(name, pin, cache, store, Value::Null, t, diag, flush) };
+    let a15_len = bundle_of(&a1_5).len();
     let cb = |n: &str| json!({"bundle": n});
     let none = Value::Null;
     oc(
@@ -655,6 +665,267 @@ fn generate() -> Value {
         false,
     );
 
+    // budgets: a valid longer history over the budget is oversize, not malformed
+    let lim = |entries: Option<usize>, bytes: Option<usize>| json!({"maxEntries": entries, "maxBundleBytes": bytes});
+    let ig = || json!("ignoresBudget");
+    oc_full(
+        "over-entry-budget",
+        "A1-3",
+        cb("A1-5"),
+        none.clone(),
+        lim(Some(4), None),
+        tip(&a1_3),
+        &["CacheRejected:oversize"],
+        false,
+    );
+    oc_full(
+        "over-byte-budget-store-does-not-enforce",
+        "A1-3",
+        cb("A1-5"),
+        ig(),
+        lim(None, Some(a15_len - 1)),
+        tip(&a1_3),
+        &["CacheRejected:oversize"],
+        false,
+    );
+    oc_full(
+        "at-the-entry-budget",
+        "A1-3",
+        cb("A1-5"),
+        none.clone(),
+        lim(Some(5), None),
+        tip(&a1_5),
+        &[],
+        false,
+    );
+    oc_full(
+        "at-the-byte-budget",
+        "A1-3",
+        cb("A1-5"),
+        ig(),
+        lim(None, Some(a15_len)),
+        tip(&a1_5),
+        &[],
+        false,
+    );
+    let open = open_cell.into_inner();
+
+    // flush cases: open, offer each entry, flush once, compare the stored bytes
+    let mut flush = Vec::new();
+    #[allow(clippy::too_many_arguments)]
+    let mut fc = |name: &str,
+                  pin: &str,
+                  cache: Value,
+                  limits: Value,
+                  store: Value,
+                  offers: &[&str],
+                  result: &str,
+                  stored: &str| {
+        flush.push(json!({
+            "name": name, "pin": pin, "cache": cache, "limits": limits, "store": store, "offers": offers,
+            "expect": {"result": result, "stored": stored}
+        }));
+    };
+    let nl = json!({"maxEntries": null, "maxBundleBytes": null});
+    let l4 = json!({"maxEntries": 4, "maxBundleBytes": null});
+    let lb = json!({"maxEntries": null, "maxBundleBytes": a15_len - 1});
+    let ig = json!("ignoresBudget");
+    // blocker 1: a valid history over the budget is never rewritten shorter
+    fc(
+        "oversize-entries-is-not-rewritten",
+        "A1-3",
+        cb("A1-5"),
+        l4.clone(),
+        none.clone(),
+        &[],
+        "pending:Oversize",
+        "unchanged",
+    );
+    fc(
+        "oversize-entries-is-not-rewritten-when-dirty",
+        "A1-3",
+        cb("A1-5"),
+        l4,
+        none.clone(),
+        &["A4"],
+        "pending:Oversize",
+        "unchanged",
+    );
+    fc(
+        "oversize-bytes-is-not-rewritten",
+        "A1-3",
+        cb("A1-5"),
+        lb,
+        ig,
+        &["A4"],
+        "pending:Oversize",
+        "unchanged",
+    );
+    // blocker 2: an authenticated chain diverging before or at the checkpoint is not overwritten
+    fc(
+        "fork-before-the-pin-is-not-overwritten",
+        "A1-3",
+        cb("F1-3"),
+        nl.clone(),
+        none.clone(),
+        &[],
+        "pending:PinMismatch",
+        "unchanged",
+    );
+    fc(
+        "fork-before-the-pin-is-not-overwritten-when-dirty",
+        "A1-3",
+        cb("F1-3"),
+        nl.clone(),
+        none.clone(),
+        &["A4"],
+        "pending:PinMismatch",
+        "unchanged",
+    );
+    fc(
+        "fork-below-a-newer-pin-is-not-overwritten",
+        "A1-5",
+        cb("F1-4"),
+        nl.clone(),
+        none.clone(),
+        &[],
+        "pending:PinMismatch",
+        "unchanged",
+    );
+    // damaged or foreign caches are replaced at the observed revision
+    fc(
+        "malformed-is-replaced",
+        "A1-3",
+        cb("corrupt"),
+        nl.clone(),
+        none.clone(),
+        &["A4"],
+        "saved:wrote",
+        "A1-4",
+    );
+    fc(
+        "malformed-is-replaced-even-when-clean",
+        "A1-3",
+        cb("truncated"),
+        nl.clone(),
+        none.clone(),
+        &[],
+        "saved:wrote",
+        "A1-3",
+    );
+    fc(
+        "other-genesis-is-replaced",
+        "A1-3",
+        cb("G1-3"),
+        nl.clone(),
+        none.clone(),
+        &["A4"],
+        "saved:wrote",
+        "A1-4",
+    );
+    fc(
+        "other-network-is-replaced",
+        "A1-3",
+        cb("N8-1-3"),
+        nl.clone(),
+        none.clone(),
+        &["A4"],
+        "saved:wrote",
+        "A1-4",
+    );
+    // ordinary saves
+    fc(
+        "shorter-cache-is-upgraded",
+        "A1-3",
+        cb("A1-2"),
+        nl.clone(),
+        none.clone(),
+        &[],
+        "saved:wrote",
+        "A1-3",
+    );
+    fc(
+        "longer-cache-is-kept",
+        "A1-3",
+        cb("A1-5"),
+        nl.clone(),
+        none.clone(),
+        &[],
+        "saved:noop",
+        "unchanged",
+    );
+    fc(
+        "equal-cache-other-witness-is-not-rewritten",
+        "A1-3",
+        cb("A1-3-witness-abd"),
+        nl.clone(),
+        none.clone(),
+        &[],
+        "saved:noop",
+        "unchanged",
+    );
+    fc(
+        "absent-and-clean-writes-nothing",
+        "A1-3",
+        none.clone(),
+        nl.clone(),
+        none.clone(),
+        &[],
+        "saved:noop",
+        "absent",
+    );
+    fc(
+        "absent-then-append-writes-the-bundle",
+        "A1-3",
+        none.clone(),
+        nl.clone(),
+        none.clone(),
+        &["A4", "A5"],
+        "saved:wrote",
+        "A1-5",
+    );
+    fc(
+        "store-suffix-is-imported-not-lost",
+        "A1-3",
+        cb("A1-4"),
+        nl.clone(),
+        none.clone(),
+        &["A4"],
+        "saved:noop",
+        "unchanged",
+    );
+    // a conflicted session never writes, whatever the store holds
+    fc(
+        "conflicted-session-never-flushes-empty-store",
+        "A1-3",
+        none.clone(),
+        nl.clone(),
+        none.clone(),
+        &["A4", "F4"],
+        "pending:HistoryConflicted",
+        "absent",
+    );
+    fc(
+        "conflicted-session-never-flushes-over-a-cache",
+        "A1-3",
+        cb("A1-3"),
+        nl.clone(),
+        none.clone(),
+        &["A4", "F4"],
+        "pending:HistoryConflicted",
+        "unchanged",
+    );
+    fc(
+        "stored-fork-after-the-pin-latches-and-stays",
+        "A1-3",
+        cb("A1-4"),
+        nl,
+        none.clone(),
+        &["F4"],
+        "pending:HistoryConflicted",
+        "unchanged",
+    );
+
     // offer cases
     let mut offer = Vec::new();
     let mut of = |name: &str,
@@ -797,13 +1068,15 @@ fn generate() -> Value {
             "A1..A6 is one chain (epoch 4 rotates d out and e in); A3-witness-abd is A3 with another valid witness (same EntryID); F3 forks A2, F4 forks A3, both validly signed.",
             "pins: valid pins verify; the invalid ones are ReleasePinInvalid. open: a session is opened over the pin and the cache (store: null, 'unreadable' = I/O error on read, 'oversize' = value over the budget); the expectation holds after open, nothing is written on open; flushNeeded means the merged history differs from the cache.",
             "offer: entries by name, in order, offered to the session; '@verify' asks for the history view. results: appended | noop | (a same-EntryID entry with a bad witness is refused:signature) | refused:<signature|chain|invalid|encoding|gap|network|beforeGenesis> | PinMismatch | Conflict (authenticated fork after the checkpoint; latches) | HistoryConflicted | ok.",
+            "flush: open, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes. casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
             "key: 'utb/v1/<network decimal>/<genesisEntryId hex>/<namespace>'. revision: lowercase hex SHA-256 of the stored bytes."
         ],
-        "limits": {"maxBundleBytes": 16777216, "maxEntries": 4096, "maxEntryBytes": 65536},
+        "limits": {"maxBundleBytes": 16777216, "maxEntries": 4096, "maxEntryBytes": 65536, "casAttempts": 4},
         "entries": entries_json,
         "bundles": bundles_json,
         "pins": pins,
         "open": open,
+        "flush": flush,
         "offer": offer,
         "key": keys,
         "revision": revisions,
@@ -832,6 +1105,33 @@ fn vectors_are_current() {
 enum Fault {
     Unreadable,
     Oversize,
+}
+
+struct IgnoreBudget<'a>(&'a MemoryStore);
+
+impl TrustBaseStore for IgnoreBudget<'_> {
+    async fn read(&self, k: &StoreKey, _: usize) -> Result<StoreRead, StoreError> {
+        self.0.read(k, usize::MAX).await
+    }
+    async fn compare_and_swap(
+        &self,
+        k: &StoreKey,
+        e: Option<&Revision>,
+        b: &[u8],
+    ) -> Result<StoreCas, StoreError> {
+        self.0.compare_and_swap(k, e, b).await
+    }
+}
+
+fn options_of(c: &Value) -> SessionOptions {
+    let mut o = SessionOptions::default();
+    if let Some(n) = c["limits"]["maxEntries"].as_u64() {
+        o.limits.max_entries = n as usize;
+    }
+    if let Some(n) = c["limits"]["maxBundleBytes"].as_u64() {
+        o.limits.max_bytes = n as usize;
+    }
+    o
 }
 
 struct FaultStore<'a>(&'a MemoryStore, Fault);
@@ -910,6 +1210,19 @@ fn diag_name(d: &Diagnostic) -> String {
             }
         ),
         Diagnostic::CacheUnavailable(_) => "CacheUnavailable".into(),
+    }
+}
+
+fn flush_name(f: Flush) -> String {
+    match f {
+        Flush::Saved { wrote: true, .. } => "saved:wrote".into(),
+        Flush::Saved { wrote: false, .. } => "saved:noop".into(),
+        Flush::Pending(CacheError::Rejected(CacheReject::PinMismatch)) => {
+            "pending:PinMismatch".into()
+        }
+        Flush::Pending(CacheError::Rejected(CacheReject::Oversize)) => "pending:Oversize".into(),
+        Flush::Pending(CacheError::HistoryConflicted) => "pending:HistoryConflicted".into(),
+        Flush::Pending(e) => format!("pending:other:{e}"),
     }
 }
 
@@ -1007,28 +1320,31 @@ fn the_shared_vectors_hold() {
             store.put(&key, &b);
         }
         let before = store.get(&key);
+        let o = options_of(c);
         let opened = match c["store"].as_str() {
             Some("unreadable") => block_on(Session::open(
                 pin.network_id,
                 authority(&pin),
                 FaultStore(&store, Fault::Unreadable),
-                SessionOptions::default(),
+                o,
             ))
             .map(|(s, d)| (s.history().unwrap().clone(), s.is_dirty(), d)),
             Some("oversize") => block_on(Session::open(
                 pin.network_id,
                 authority(&pin),
                 FaultStore(&store, Fault::Oversize),
-                SessionOptions::default(),
+                o,
             ))
             .map(|(s, d)| (s.history().unwrap().clone(), s.is_dirty(), d)),
-            _ => block_on(Session::open(
+            Some("ignoresBudget") => block_on(Session::open(
                 pin.network_id,
                 authority(&pin),
-                &store,
-                SessionOptions::default(),
+                IgnoreBudget(&store),
+                o,
             ))
             .map(|(s, d)| (s.history().unwrap().clone(), s.is_dirty(), d)),
+            _ => block_on(Session::open(pin.network_id, authority(&pin), &store, o))
+                .map(|(s, d)| (s.history().unwrap().clone(), s.is_dirty(), d)),
         };
         let (h, dirty, diags) = opened.unwrap_or_else(|e| panic!("{name}: {e}"));
         let e = &c["expect"];
@@ -1052,6 +1368,42 @@ fn the_shared_vectors_hold() {
         assert_eq!(got, want, "{name}");
         assert_eq!(dirty, e["flushNeeded"].as_bool().unwrap(), "{name}");
         assert_eq!(store.get(&key), before, "{name}: open writes nothing");
+    }
+    // flush
+    for c in fx.v["flush"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let pin = fx.pin(c["pin"].as_str().unwrap());
+        let store = MemoryStore::new();
+        let key = StoreKey::new(pin.network_id, &pin.genesis_entry_id, "test");
+        if let Some(b) = fx.cache_bytes(&c["cache"]) {
+            store.put(&key, &b);
+        }
+        let before = store.get(&key);
+        let o = options_of(c);
+        let ib = IgnoreBudget(&store);
+        let (result, history_conflicted_ok) = if c["store"].as_str() == Some("ignoresBudget") {
+            let (mut s, _) =
+                block_on(Session::open(pin.network_id, authority(&pin), &ib, o)).unwrap();
+            for n in c["offers"].as_array().unwrap() {
+                let _ = s.append(fx.entry(n.as_str().unwrap()));
+            }
+            (flush_name(block_on(s.flush())), s.conflict().is_some())
+        } else {
+            let (mut s, _) =
+                block_on(Session::open(pin.network_id, authority(&pin), &store, o)).unwrap();
+            for n in c["offers"].as_array().unwrap() {
+                let _ = s.append(fx.entry(n.as_str().unwrap()));
+            }
+            (flush_name(block_on(s.flush())), s.conflict().is_some())
+        };
+        let _ = history_conflicted_ok;
+        assert_eq!(result, c["expect"]["result"].as_str().unwrap(), "{name}");
+        let after = store.get(&key);
+        match c["expect"]["stored"].as_str().unwrap() {
+            "unchanged" => assert_eq!(after, before, "{name}"),
+            "absent" => assert_eq!(after, None, "{name}"),
+            b => assert_eq!(after, Some(fx.bundle(b)), "{name}"),
+        }
     }
     // offer
     for c in fx.v["offer"].as_array().unwrap() {
@@ -1355,7 +1707,7 @@ fn contention_is_retried_three_times_then_pending_and_the_session_stays_dirty() 
     s.append(f.w.a[3].clone()).unwrap();
     *script.mode.borrow_mut() = CasMode::AlwaysChanged;
     assert_eq!(block_on(s.flush()), Flush::Pending(CacheError::Contended));
-    assert_eq!((script.reads.get(), script.cas.get()), (3, 3));
+    assert_eq!((script.reads.get(), script.cas.get()), (4, 4));
     assert!(s.is_dirty());
     assert_eq!(
         s.history().unwrap().latest().epoch,
@@ -1437,6 +1789,29 @@ fn a_damaged_cache_is_reported_then_replaced_only_against_its_exact_revision() {
 }
 
 #[test]
+fn a_rejection_is_reported_once_across_retries() {
+    let f = Fix::new();
+    let pin = f.pin(3);
+    let store = MemoryStore::new();
+    let key = f.key(&pin);
+    store.put(&key, b"garbage");
+    let script = Script::new(&store, key.clone());
+    let (mut s, _) = open_on(&pin, &script);
+    s.append(f.w.a[3].clone()).unwrap();
+    // another damaged value lands before our swap: the retry rejects again
+    *script.mode.borrow_mut() = CasMode::RaceOnce(Some(b"more garbage".to_vec()));
+    assert_eq!(
+        block_on(s.flush()),
+        Flush::Saved {
+            wrote: true,
+            diagnostics: vec![Diagnostic::CacheRejected(CacheReject::Malformed)]
+        }
+    );
+    assert_eq!(script.cas.get(), 2);
+    assert_eq!(store.get(&key).unwrap(), f.bytes(4));
+}
+
+#[test]
 fn a_read_failure_cannot_authorize_a_replacement() {
     let f = Fix::new();
     let pin = f.pin(3);
@@ -1489,7 +1864,7 @@ fn limits_are_checked_before_decoding_and_before_signature_work() {
         ..SessionOptions::default()
     };
     let (s, d) = block_on(Session::open(pin.network_id, authority(&pin), &store, few)).unwrap();
-    assert_eq!(d, vec![Diagnostic::CacheRejected(CacheReject::Malformed)]);
+    assert_eq!(d, vec![Diagnostic::CacheRejected(CacheReject::Oversize)]);
     assert_eq!(s.history().unwrap().latest().epoch, 3);
     // the embedded asset has to fit the budget too: fatal, no cache rescues it
     let tiny = SessionOptions {

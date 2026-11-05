@@ -14,7 +14,7 @@
 //!   ([`SessionError::Conflict`], then [`SessionError::HistoryConflicted`] on every later
 //!   use); the latch is process-local, not a persistent guarantee.
 //! * **CAS saves.** One complete bundle per flush, written by compare-and-swap against the
-//!   revision just read and validated; a changed revision is retried at most three times.
+//!   revision just read and validated; a changed revision is retried at most three times (four writes in all).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -33,8 +33,8 @@ use crate::crypto::hash::sha256;
 pub const STORE_KEY_VERSION: &str = "v1";
 /// The trust namespace of the built-in release table.
 pub const PUBLIC_NAMESPACE: &str = "public";
-/// Writes retried after a changed revision, per flush.
-pub const MAX_CAS_ATTEMPTS: usize = 3;
+/// Compare-and-swap writes per flush: the first plus three retries after a changed revision.
+pub const MAX_CAS_ATTEMPTS: usize = 4;
 /// Longest custom namespace.
 pub const MAX_NAMESPACE_BYTES: usize = 64;
 
@@ -106,7 +106,10 @@ impl PinSpec {
         }
         let h =
             TrustBaseHistory::from_bundle_with(&self.bundle, Some(self.genesis_entry_id), limits)
-                .map_err(|_| bad("embedded bundle does not verify"))?;
+                .map_err(|e| match e {
+                HistoryError::Budget(_) => bad("embedded bundle exceeds the configured budget"),
+                _ => bad("embedded bundle does not verify"),
+            })?;
         if h.network_id() != self.network_id {
             return Err(bad("embedded bundle is of another network"));
         }
@@ -337,6 +340,10 @@ pub enum CacheError {
     /// The session is conflicted (or the store holds an authenticated fork): nothing is
     /// written.
     HistoryConflicted,
+    /// The stored cache is a valid history that must not be overwritten (over the budget, or
+    /// an authenticated chain diverging at or before the checkpoint): nothing is written; the
+    /// app decides.
+    Rejected(CacheReject),
 }
 
 impl fmt::Display for CacheError {
@@ -348,6 +355,7 @@ impl fmt::Display for CacheError {
             CacheError::Unavailable(e) => write!(f, "CacheUnavailable: {e:?}"),
             CacheError::Contended => write!(f, "CacheContended"),
             CacheError::HistoryConflicted => write!(f, "HistoryConflicted"),
+            CacheError::Rejected(r) => write!(f, "CacheRejected: {r:?}"),
         }
     }
 }
@@ -467,6 +475,7 @@ fn classify(e: &HistoryError) -> CacheReject {
     match e {
         HistoryError::WrongNetwork => CacheReject::WrongNetwork,
         HistoryError::PinMismatch => CacheReject::WrongGenesis,
+        HistoryError::Budget(_) => CacheReject::Oversize,
         _ => CacheReject::Malformed,
     }
 }
@@ -706,9 +715,11 @@ impl<S: TrustBaseStore> Session<S> {
     /// Save one complete bundle. Rereads and fully validates the stored bytes under the pin,
     /// imports compatible new entries, keeps the longer suffix, and writes by compare-and-swap
     /// against the revision just read; a changed revision is retried at most
-    /// [`MAX_CAS_ATTEMPTS`] times in total. A damaged cache is replaced only against its exact
-    /// observed revision and after being reported. An authenticated fork in the store is never
-    /// overwritten: the session latches.
+    /// [`MAX_CAS_ATTEMPTS`] writes in all. A damaged cache (or another network/genesis) is
+    /// replaced only against its exact observed revision and is reported in the result. A valid
+    /// history over the budget, or an authenticated chain diverging at or before the
+    /// checkpoint, is never overwritten ([`CacheError::Rejected`]); an authenticated fork after
+    /// the checkpoint latches the session.
     pub async fn flush(&mut self) -> Flush {
         if self.conflict.is_some() {
             return Flush::Pending(CacheError::HistoryConflicted);
@@ -740,8 +751,18 @@ impl<S: TrustBaseStore> Session<S> {
                         }
                         (Some(revision), Some(h.latest().entry_id()))
                     }
+                    // a valid history over the budget, or an authenticated chain that diverges
+                    // from the checkpoint, is evidence or a newer cache: never overwritten
+                    Loaded::Reject(r @ (CacheReject::Oversize | CacheReject::PinMismatch)) => {
+                        return Flush::Pending(CacheError::Rejected(r));
+                    }
+                    // damaged, or another network/genesis (refused before any signature work):
+                    // replaced against exactly this revision, and reported in the result
                     Loaded::Reject(r) => {
-                        diagnostics.push(Diagnostic::CacheRejected(r));
+                        let d = Diagnostic::CacheRejected(r);
+                        if !diagnostics.contains(&d) {
+                            diagnostics.push(d);
+                        }
                         (Some(revision), None)
                     }
                 },

@@ -326,6 +326,350 @@
       "network": 8
     }
   ],
+  "flush": [
+    {
+      "cache": {
+        "bundle": "A1-5"
+      },
+      "expect": {
+        "result": "pending:Oversize",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": 4
+      },
+      "name": "oversize-entries-is-not-rewritten",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-5"
+      },
+      "expect": {
+        "result": "pending:Oversize",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": 4
+      },
+      "name": "oversize-entries-is-not-rewritten-when-dirty",
+      "offers": [
+        "A4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-5"
+      },
+      "expect": {
+        "result": "pending:Oversize",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": 2025,
+        "maxEntries": null
+      },
+      "name": "oversize-bytes-is-not-rewritten",
+      "offers": [
+        "A4"
+      ],
+      "pin": "A1-3",
+      "store": "ignoresBudget"
+    },
+    {
+      "cache": {
+        "bundle": "F1-3"
+      },
+      "expect": {
+        "result": "pending:PinMismatch",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "fork-before-the-pin-is-not-overwritten",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "F1-3"
+      },
+      "expect": {
+        "result": "pending:PinMismatch",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "fork-before-the-pin-is-not-overwritten-when-dirty",
+      "offers": [
+        "A4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "F1-4"
+      },
+      "expect": {
+        "result": "pending:PinMismatch",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "fork-below-a-newer-pin-is-not-overwritten",
+      "offers": [],
+      "pin": "A1-5",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "corrupt"
+      },
+      "expect": {
+        "result": "saved:wrote",
+        "stored": "A1-4"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "malformed-is-replaced",
+      "offers": [
+        "A4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "truncated"
+      },
+      "expect": {
+        "result": "saved:wrote",
+        "stored": "A1-3"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "malformed-is-replaced-even-when-clean",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "G1-3"
+      },
+      "expect": {
+        "result": "saved:wrote",
+        "stored": "A1-4"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "other-genesis-is-replaced",
+      "offers": [
+        "A4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "N8-1-3"
+      },
+      "expect": {
+        "result": "saved:wrote",
+        "stored": "A1-4"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "other-network-is-replaced",
+      "offers": [
+        "A4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-2"
+      },
+      "expect": {
+        "result": "saved:wrote",
+        "stored": "A1-3"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "shorter-cache-is-upgraded",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-5"
+      },
+      "expect": {
+        "result": "saved:noop",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "longer-cache-is-kept",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-3-witness-abd"
+      },
+      "expect": {
+        "result": "saved:noop",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "equal-cache-other-witness-is-not-rewritten",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": null,
+      "expect": {
+        "result": "saved:noop",
+        "stored": "absent"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "absent-and-clean-writes-nothing",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": null,
+      "expect": {
+        "result": "saved:wrote",
+        "stored": "A1-5"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "absent-then-append-writes-the-bundle",
+      "offers": [
+        "A4",
+        "A5"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-4"
+      },
+      "expect": {
+        "result": "saved:noop",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "store-suffix-is-imported-not-lost",
+      "offers": [
+        "A4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": null,
+      "expect": {
+        "result": "pending:HistoryConflicted",
+        "stored": "absent"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "conflicted-session-never-flushes-empty-store",
+      "offers": [
+        "A4",
+        "F4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-3"
+      },
+      "expect": {
+        "result": "pending:HistoryConflicted",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "conflicted-session-never-flushes-over-a-cache",
+      "offers": [
+        "A4",
+        "F4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-4"
+      },
+      "expect": {
+        "result": "pending:HistoryConflicted",
+        "stored": "unchanged"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "stored-fork-after-the-pin-latches-and-stays",
+      "offers": [
+        "F4"
+      ],
+      "pin": "A1-3",
+      "store": null
+    }
+  ],
   "key": [
     {
       "genesisEntryId": "ab88deef39698e7a83f8109e7d2809136c2aa92a1751a268bf689cc3a7481484",
@@ -353,6 +697,7 @@
     }
   ],
   "limits": {
+    "casAttempts": 4,
     "maxBundleBytes": 16777216,
     "maxEntries": 4096,
     "maxEntryBytes": 65536
@@ -563,6 +908,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "absent",
       "pin": "A1-3",
       "store": null
@@ -577,6 +923,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "equal",
       "pin": "A1-3",
       "store": null
@@ -591,6 +938,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "shorter",
       "pin": "A1-3",
       "store": null
@@ -605,6 +953,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "genesis-only",
       "pin": "A1-3",
       "store": null
@@ -619,6 +968,7 @@
         "tipEntryId": "18cc8b7fc6adf0ad92ede87c9fc1a5c7595982cf28cdd9e12bdcc5aac5137243",
         "tipEpoch": "5"
       },
+      "limits": null,
       "name": "older-sdk-longer-kept",
       "pin": "A1-3",
       "store": null
@@ -633,6 +983,7 @@
         "tipEntryId": "b64c362e628fbe5c8238fd0d7730cc2ac1518e17a4edf3ed5bd3f8436825b193",
         "tipEpoch": "6"
       },
+      "limits": null,
       "name": "older-sdk-longest-kept",
       "pin": "A1-3",
       "store": null
@@ -647,6 +998,7 @@
         "tipEntryId": "18cc8b7fc6adf0ad92ede87c9fc1a5c7595982cf28cdd9e12bdcc5aac5137243",
         "tipEpoch": "5"
       },
+      "limits": null,
       "name": "pin-bump-extends-cache",
       "pin": "A1-5",
       "store": null
@@ -661,6 +1013,7 @@
         "tipEntryId": "18cc8b7fc6adf0ad92ede87c9fc1a5c7595982cf28cdd9e12bdcc5aac5137243",
         "tipEpoch": "5"
       },
+      "limits": null,
       "name": "pin-bump-equal",
       "pin": "A1-5",
       "store": null
@@ -675,6 +1028,7 @@
         "tipEntryId": "b64c362e628fbe5c8238fd0d7730cc2ac1518e17a4edf3ed5bd3f8436825b193",
         "tipEpoch": "6"
       },
+      "limits": null,
       "name": "pin-bump-longer-cache",
       "pin": "A1-5",
       "store": null
@@ -691,6 +1045,7 @@
         "tipEntryId": "18cc8b7fc6adf0ad92ede87c9fc1a5c7595982cf28cdd9e12bdcc5aac5137243",
         "tipEpoch": "5"
       },
+      "limits": null,
       "name": "divergent-cache-loses-to-newer-pin",
       "pin": "A1-5",
       "store": null
@@ -707,6 +1062,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "divergent-before-pin",
       "pin": "A1-3",
       "store": null
@@ -721,6 +1077,7 @@
         "tipEntryId": "82c2e483397f58e37f94a6e79db2584eebec1a1969917c79e146f63ee46aff7e",
         "tipEpoch": "4"
       },
+      "limits": null,
       "name": "longer-cache-on-another-post-pin-branch-is-held",
       "pin": "A1-3",
       "store": null
@@ -735,6 +1092,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "same-id-other-witness",
       "pin": "A1-3",
       "store": null
@@ -751,6 +1109,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "other-genesis",
       "pin": "A1-3",
       "store": null
@@ -767,6 +1126,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "other-network",
       "pin": "A1-3",
       "store": null
@@ -783,6 +1143,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "truncated",
       "pin": "A1-3",
       "store": null
@@ -799,6 +1160,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "corrupt",
       "pin": "A1-3",
       "store": null
@@ -815,6 +1177,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "wrong-tag",
       "pin": "A1-3",
       "store": null
@@ -831,6 +1194,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "wrong-from-epoch",
       "pin": "A1-3",
       "store": null
@@ -847,6 +1211,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "wrong-end-epoch",
       "pin": "A1-3",
       "store": null
@@ -863,6 +1228,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "null-tip",
       "pin": "A1-3",
       "store": null
@@ -879,6 +1245,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "wrong-tip-id",
       "pin": "A1-3",
       "store": null
@@ -895,6 +1262,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "duplicate",
       "pin": "A1-3",
       "store": null
@@ -911,6 +1279,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "gap",
       "pin": "A1-3",
       "store": null
@@ -927,6 +1296,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "noncanonical-entry",
       "pin": "A1-3",
       "store": null
@@ -943,6 +1313,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "bad-extra-signature",
       "pin": "A1-3",
       "store": null
@@ -959,6 +1330,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "bad-extra-signature-epoch2",
       "pin": "A1-3",
       "store": null
@@ -975,6 +1347,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "high-s",
       "pin": "A1-3",
       "store": null
@@ -991,6 +1364,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "empty-bytes",
       "pin": "A1-3",
       "store": null
@@ -1007,6 +1381,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "wrong-network-header",
       "pin": "A1-3",
       "store": null
@@ -1021,6 +1396,7 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "store-unreadable",
       "pin": "A1-3",
       "store": "unreadable"
@@ -1035,9 +1411,86 @@
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
       },
+      "limits": null,
       "name": "store-oversize",
       "pin": "A1-3",
       "store": "oversize"
+    },
+    {
+      "cache": {
+        "bundle": "A1-5"
+      },
+      "expect": {
+        "diagnostics": [
+          "CacheRejected:oversize"
+        ],
+        "flushNeeded": false,
+        "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
+        "tipEpoch": "3"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": 4
+      },
+      "name": "over-entry-budget",
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-5"
+      },
+      "expect": {
+        "diagnostics": [
+          "CacheRejected:oversize"
+        ],
+        "flushNeeded": false,
+        "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
+        "tipEpoch": "3"
+      },
+      "limits": {
+        "maxBundleBytes": 2025,
+        "maxEntries": null
+      },
+      "name": "over-byte-budget-store-does-not-enforce",
+      "pin": "A1-3",
+      "store": "ignoresBudget"
+    },
+    {
+      "cache": {
+        "bundle": "A1-5"
+      },
+      "expect": {
+        "diagnostics": [],
+        "flushNeeded": false,
+        "tipEntryId": "18cc8b7fc6adf0ad92ede87c9fc1a5c7595982cf28cdd9e12bdcc5aac5137243",
+        "tipEpoch": "5"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": 5
+      },
+      "name": "at-the-entry-budget",
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-5"
+      },
+      "expect": {
+        "diagnostics": [],
+        "flushNeeded": false,
+        "tipEntryId": "18cc8b7fc6adf0ad92ede87c9fc1a5c7595982cf28cdd9e12bdcc5aac5137243",
+        "tipEpoch": "5"
+      },
+      "limits": {
+        "maxBundleBytes": 2026,
+        "maxEntries": null
+      },
+      "name": "at-the-byte-budget",
+      "pin": "A1-3",
+      "store": "ignoresBudget"
     }
   ],
   "pins": [
@@ -1234,6 +1687,7 @@
     "A1..A6 is one chain (epoch 4 rotates d out and e in); A3-witness-abd is A3 with another valid witness (same EntryID); F3 forks A2, F4 forks A3, both validly signed.",
     "pins: valid pins verify; the invalid ones are ReleasePinInvalid. open: a session is opened over the pin and the cache (store: null, 'unreadable' = I/O error on read, 'oversize' = value over the budget); the expectation holds after open, nothing is written on open; flushNeeded means the merged history differs from the cache.",
     "offer: entries by name, in order, offered to the session; '@verify' asks for the history view. results: appended | noop | (a same-EntryID entry with a bad witness is refused:signature) | refused:<signature|chain|invalid|encoding|gap|network|beforeGenesis> | PinMismatch | Conflict (authenticated fork after the checkpoint; latches) | HistoryConflicted | ok.",
+    "flush: open, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes. casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
     "key: 'utb/v1/<network decimal>/<genesisEntryId hex>/<namespace>'. revision: lowercase hex SHA-256 of the stored bytes."
   ]
 }
