@@ -955,13 +955,25 @@ fn generate() -> Value {
         "stored-fork-after-the-pin-latches-and-stays",
         "A1-3",
         cb("A1-4"),
-        nl,
+        nl.clone(),
         none.clone(),
         &["F4"],
         "pending:HistoryConflicted",
         "unchanged",
     );
 
+    // a clean flush does not read the store: a longer suffix that appeared after open is neither
+    // imported nor written over
+    flush.push(json!({
+        "name": "clean-flush-does-not-read", "pin": "A1-3", "cache": cb("A1-3"), "limits": nl.clone(),
+        "store": none, "storeAfterOpen": cb("A1-5"), "offers": Vec::<&str>::new(),
+        "expect": {"result": "saved:noop", "stored": "unchanged", "tipEpoch": "3"}
+    }));
+    flush.push(json!({
+        "name": "clean-flush-does-not-detect-a-stored-fork", "pin": "A1-3", "cache": cb("A1-4"), "limits": nl.clone(),
+        "store": none, "storeAfterOpen": cb("F1-4"), "offers": Vec::<&str>::new(),
+        "expect": {"result": "saved:noop", "stored": "unchanged", "tipEpoch": "4"}
+    }));
     // offer cases
     let mut offer = Vec::new();
     let mut of = |name: &str,
@@ -1104,7 +1116,7 @@ fn generate() -> Value {
             "A1..A6 is one chain (epoch 4 rotates d out and e in); A3-witness-abd is A3 with another valid witness (same EntryID); F3 forks A2, F4 forks A3, both validly signed.",
             "pins: valid pins verify; the invalid ones are ReleasePinInvalid. open: a session is opened over the pin and the cache (store: null, 'unreadable' = I/O error on read, 'oversize' = value over the budget); the expectation holds after open, nothing is written on open; flushNeeded means the merged history differs from the cache.",
             "offer: entries by name, in order, offered to the session; '@verify' asks for the history view. results: appended | noop | (a same-EntryID entry with a bad witness is refused:signature) | refused:<signature|chain|invalid|encoding|gap|network|beforeGenesis> | PinMismatch | Conflict (authenticated fork after the checkpoint; latches) | HistoryConflicted | ok.",
-            "flush: open, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes. casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
+            "flush: open, optionally replace the store content with storeAfterOpen, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes; a clean session (nothing dirty, no damaged cache to replace, no blocked cache) flushes without reading the store, so it neither imports nor detects what changed after open (optional expect.tipEpoch). casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
             "key: 'utb/v1/<network decimal>/<genesisEntryId hex>/<namespace>'. revision: lowercase hex SHA-256 of the stored bytes."
         ],
         "limits": {"maxBundleBytes": 16777216, "maxEntries": 4096, "maxEntryBytes": 65536, "casAttempts": 4},
@@ -1417,26 +1429,36 @@ fn the_shared_vectors_hold() {
         if let Some(b) = fx.cache_bytes(&c["cache"]) {
             store.put(&key, &b);
         }
-        let before = store.get(&key);
         let o = options_of(c);
         let ib = IgnoreBudget(&store);
-        let (result, history_conflicted_ok) = if c["store"].as_str() == Some("ignoresBudget") {
-            let (mut s, _) =
-                block_on(Session::open(pin.network_id, authority(&pin), &ib, o)).unwrap();
-            for n in c["offers"].as_array().unwrap() {
-                let _ = s.append(fx.entry(n.as_str().unwrap()));
-            }
-            (flush_name(block_on(s.flush())), s.conflict().is_some())
+        macro_rules! run {
+            ($st:expr) => {{
+                let (mut s, _) =
+                    block_on(Session::open(pin.network_id, authority(&pin), $st, o)).unwrap();
+                if let Some(b) = fx.cache_bytes(&c["storeAfterOpen"]) {
+                    store.put(&key, &b);
+                }
+                for n in c["offers"].as_array().unwrap() {
+                    let _ = s.append(fx.entry(n.as_str().unwrap()));
+                }
+                let before = store.get(&key);
+                let r = flush_name(block_on(s.flush()));
+                let tip = TrustBaseHistory::from_bundle(&s.export_bundle(), None)
+                    .unwrap()
+                    .latest()
+                    .epoch;
+                (r, before, tip)
+            }};
+        }
+        let (result, before, tip) = if c["store"].as_str() == Some("ignoresBudget") {
+            run!(&ib)
         } else {
-            let (mut s, _) =
-                block_on(Session::open(pin.network_id, authority(&pin), &store, o)).unwrap();
-            for n in c["offers"].as_array().unwrap() {
-                let _ = s.append(fx.entry(n.as_str().unwrap()));
-            }
-            (flush_name(block_on(s.flush())), s.conflict().is_some())
+            run!(&store)
         };
-        let _ = history_conflicted_ok;
         assert_eq!(result, c["expect"]["result"].as_str().unwrap(), "{name}");
+        if let Some(t) = c["expect"]["tipEpoch"].as_str() {
+            assert_eq!(tip.to_string(), t, "{name}");
+        }
         let after = store.get(&key);
         match c["expect"]["stored"].as_str().unwrap() {
             "unchanged" => assert_eq!(after, before, "{name}"),
@@ -1674,8 +1696,15 @@ fn two_writers_with_compatible_histories_lose_no_suffix() {
         block_on(s2.flush()),
         Flush::Saved { wrote: true, .. }
     ));
-    // the shorter writer imports the longer stored history and writes nothing
-    s1.append(f.w.a[3].clone()).unwrap();
+    // a clean session does not reread the store: it writes nothing and imports nothing
+    assert!(matches!(
+        block_on(s1.flush()),
+        Flush::Saved { wrote: false, .. }
+    ));
+    assert_eq!(s1.history().unwrap().latest().epoch, 4);
+    // the shorter writer learns an entry of its own, rereads, imports the longer stored
+    // history and writes nothing
+    s1.append(f.w.a[4].clone()).unwrap();
     assert!(matches!(
         block_on(s1.flush()),
         Flush::Saved { wrote: false, .. }

@@ -462,6 +462,11 @@ pub struct Session<S: TrustBaseStore> {
     pinned_epoch: u64,
     history: TrustBaseHistory,
     dirty: bool,
+    /// A damaged or foreign cache is to be replaced at the next flush.
+    repair: bool,
+    /// The stored history must not be overwritten (over the budget, or diverging at or before the
+    /// checkpoint); a flush rereads and reports it.
+    blocked: Option<CacheReject>,
     conflict: Option<ConflictEvidence>,
     options: SessionOptions,
 }
@@ -512,6 +517,8 @@ impl<S: TrustBaseStore> Session<S> {
             pinned_epoch: pin.pinned_epoch,
             history: embedded,
             dirty: false,
+            repair: false,
+            blocked: None,
             conflict: None,
             options,
         };
@@ -531,11 +538,18 @@ impl<S: TrustBaseStore> Session<S> {
                     }
                     Loaded::Reject(r) => {
                         diagnostics.push(Diagnostic::CacheRejected(r));
+                        match r {
+                            CacheReject::Oversize | CacheReject::PinMismatch => {
+                                session.blocked = Some(r)
+                            }
+                            _ => session.repair = true,
+                        }
                     }
                 }
             }
             Err(StoreError::TooLarge) => {
-                diagnostics.push(Diagnostic::CacheRejected(CacheReject::Oversize))
+                diagnostics.push(Diagnostic::CacheRejected(CacheReject::Oversize));
+                session.blocked = Some(CacheReject::Oversize);
             }
             Err(e) => diagnostics.push(Diagnostic::CacheUnavailable(e)),
         }
@@ -724,6 +738,16 @@ impl<S: TrustBaseStore> Session<S> {
         if self.conflict.is_some() {
             return Flush::Pending(CacheError::HistoryConflicted);
         }
+        if !self.dirty && !self.repair && self.blocked.is_none() {
+            // Nothing of ours to save, nothing to repair, nothing blocked: a clean flush does not
+            // touch the store (a reread is a full strict re-verification). Imports and fork
+            // detection happen on open and on every dirty, repair or blocked flush; the app
+            // reopens to rescan.
+            return Flush::Saved {
+                wrote: false,
+                diagnostics: Vec::new(),
+            };
+        }
         let mut diagnostics = Vec::new();
         for _ in 0..MAX_CAS_ATTEMPTS {
             let read = match self
@@ -735,7 +759,10 @@ impl<S: TrustBaseStore> Session<S> {
                 Err(e) => return Flush::Pending(CacheError::Unavailable(e)),
             };
             let (expected, disk_tip) = match read {
-                StoreRead::Absent => (None, None),
+                StoreRead::Absent => {
+                    self.blocked = None;
+                    (None, None)
+                }
                 StoreRead::Present { revision, bytes } => match self.load_cache(&bytes).await {
                     Loaded::Ok(h) => {
                         // import what the store holds past the checkpoint; a fork latches
@@ -749,16 +776,20 @@ impl<S: TrustBaseStore> Session<S> {
                                 Err(_) => return Flush::Pending(CacheError::HistoryConflicted),
                             }
                         }
+                        self.blocked = None;
                         (Some(revision), Some(h.latest().entry_id()))
                     }
                     // a valid history over the budget, or an authenticated chain that diverges
                     // from the checkpoint, is evidence or a newer cache: never overwritten
                     Loaded::Reject(r @ (CacheReject::Oversize | CacheReject::PinMismatch)) => {
+                        self.blocked = Some(r);
                         return Flush::Pending(CacheError::Rejected(r));
                     }
                     // damaged, or another network/genesis (refused before any signature work):
                     // replaced against exactly this revision, and reported in the result
                     Loaded::Reject(r) => {
+                        self.blocked = None;
+                        self.repair = true;
                         let d = Diagnostic::CacheRejected(r);
                         if !diagnostics.contains(&d) {
                             diagnostics.push(d);
@@ -769,6 +800,7 @@ impl<S: TrustBaseStore> Session<S> {
             };
             let ours = self.history.latest().entry_id();
             if disk_tip == Some(ours) || (expected.is_none() && !self.dirty) {
+                self.repair = false;
                 // the store holds this history (other valid witnesses are not worth a
                 // rewrite), or there is nothing of ours to save
                 self.dirty = false;
@@ -785,6 +817,7 @@ impl<S: TrustBaseStore> Session<S> {
             {
                 Ok(StoreCas::Written(_)) => {
                     self.dirty = false;
+                    self.repair = false;
                     return Flush::Saved {
                         wrote: true,
                         diagnostics,
