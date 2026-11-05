@@ -71,6 +71,16 @@
         "ab88deef39698e7a83f8109e7d2809136c2aa92a1751a268bf689cc3a7481484",
         "d821add0f07105f779840ff6fc6b3cf80b92b12593080d94654a1044c58bec0b",
         "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
+        "5631c2711507e836756978a9011677b2939bc9667e1de9bf4f871ced26b94f5c"
+      ],
+      "hex": "d9986788010700010458205631c2711507e836756978a9011677b2939bc9667e1de9bf4f871ced26b94f5c84d998588a02070101848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33701836164582103462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0103f6f658200000000000000000000000000000000000000000000000000000000000000000f6d998588a0207021865848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33701836164582103462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010358200202020202020202020202020202020202020202020202020202020202020202f65820ab88deef39698e7a83f8109e7d2809136c2aa92a1751a268bf689cc3a7481484a3616158412ab8b93184d98944745eb3fd3dabcfac09e5036ef01357ea99ea9b138cc9aff462021928e290a40ccf913c83ac3598887751222eae907e733e466395a46fa967006162584165308cb9a2ae6e4caeef5538aa8c6f6c97c9f8ff6ffab0019ef4829b91420986328e5401ba9aa0dbd28457d38d95b7660772625fd3d4d55a42ce116b24f566d80161635841863c9040a8b45a7c2efd5a31a0ebcb20c2674a0305750bcd524cbeca5a9b7141244b50527807cb63bd6be115093d1bdc94a1da394ea61a3447cccb51a8afa05b01d998588a02070318c9848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33701836164582103462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010358200303030303030303030303030303030303030303030303030303030303030303f65820d821add0f07105f779840ff6fc6b3cf80b92b12593080d94654a1044c58bec0ba3616158414dd7ccf4e5a965c8b8bb81c5e690adba4c126c58265dddc2333a2b85290abcde7b1d6a197b9c22a9d8b923f2d4e69a41db9b71e7337843b2a0c0dc7a200245f40161625841929d742a231c5213a91262cc171a214b8d87e21c537b448eedb669d66ac56f0c480a61cd0342b1e8ff5449a53dfede00eac8c13cd9c8f9dc8545def4b6ab7fa7016164584106c11364fa2aba581aff4a26f344a6bb87d90bccacb4668b758dcb9ecf12050d1bb15c6ebcc6f3dc75e761472db052d9a1b086a410293711947076680e87286401d998588a02070419012d848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3370183616558210362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7010358200404040404040404040404040404040404040404040404040404040404040404f658203e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7fa361615841cdfea1f72ca4201f7a15f0baa415fe375899a6bd7688b7fad4d3660353abce1d4a20c9a8fe6b72f75d288800e328ef7b6f564b1c8b58819d225d8e7390a2ee1a016162584167e28128d585135e825f0847b06e047236b81a76d15e8e5f32e6da071abc770f67d1fd11e94866add824471bff5b4789b29290ab45bf67c58d189fe28a075cb20061635841d2512c605ca73119a6a93d20cc205b013da25364140ec8122bb5cd9ca3bcea7c6b2d5938fc33b7704bb1bd90eea54b0dda307f5df9ba1e20c7f9460fd974de5401f6",
+      "name": "A1-4-witness-abd"
+    },
+    {
+      "entryIds": [
+        "ab88deef39698e7a83f8109e7d2809136c2aa92a1751a268bf689cc3a7481484",
+        "d821add0f07105f779840ff6fc6b3cf80b92b12593080d94654a1044c58bec0b",
+        "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "82c2e483397f58e37f94a6e79db2584eebec1a1969917c79e146f63ee46aff7e"
       ],
       "hex": "d99867880107000104582082c2e483397f58e37f94a6e79db2584eebec1a1969917c79e146f63ee46aff7e84d998588a02070101848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33701836164582103462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0103f6f658200000000000000000000000000000000000000000000000000000000000000000f6d998588a0207021865848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33701836164582103462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010358200202020202020202020202020202020202020202020202020202020202020202f65820ab88deef39698e7a83f8109e7d2809136c2aa92a1751a268bf689cc3a7481484a3616158412ab8b93184d98944745eb3fd3dabcfac09e5036ef01357ea99ea9b138cc9aff462021928e290a40ccf913c83ac3598887751222eae907e733e466395a46fa967006162584165308cb9a2ae6e4caeef5538aa8c6f6c97c9f8ff6ffab0019ef4829b91420986328e5401ba9aa0dbd28457d38d95b7660772625fd3d4d55a42ce116b24f566d80161635841863c9040a8b45a7c2efd5a31a0ebcb20c2674a0305750bcd524cbeca5a9b7141244b50527807cb63bd6be115093d1bdc94a1da394ea61a3447cccb51a8afa05b01d998588a02070318c9848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33701836164582103462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010358200303030303030303030303030303030303030303030303030303030303030303f65820d821add0f07105f779840ff6fc6b3cf80b92b12593080d94654a1044c58bec0ba3616158414dd7ccf4e5a965c8b8bb81c5e690adba4c126c58265dddc2333a2b85290abcde7b1d6a197b9c22a9d8b923f2d4e69a41db9b71e7337843b2a0c0dc7a200245f40161625841929d742a231c5213a91262cc171a214b8d87e21c537b448eedb669d66ac56f0c480a61cd0342b1e8ff5449a53dfede00eac8c13cd9c8f9dc8545def4b6ab7fa701616358416d420fa1c6b42d591cf946462ec48657d9bc84e7fafad8c29a45ad4c17a23e1373f52dc1add38fed8397d09c3a2229027d086b5d56ae92e5465509b8c02678aa00d998588a02070419012e848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3370183616558210362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7010358202c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2cf658203e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7fa361615841dd9a0dc382e5de5f4c11fa4954bc7f89f6f17b273a08f07a9067e51b4568eb276cf83392b1a226767a938dbb827d5ac1724223e75d685c1e1d6861327b58f2240161625841278d11a2fe36163bd775a61db643beb62271bdba4a181eb9c32e3fc840df25e11a47d579dc5794c81ca8dc4bf0ad3b1cdba936b14b309ceb281ae8b5ed1158990061635841481e75734b6a10b7a5a493c8ec3793c53b0465c9d60e51aca7487c6729212b381dc714501ae0499e680035183d9b6e1ed07da1ec6ce1b60bbbd9376bddafa8cf01f6",
@@ -284,6 +294,13 @@
       "network": 7
     },
     {
+      "entryId": "f514bde4861fb437b8f8d8a3cf9f25da74f48483b803eb20b5d33ef40848e313",
+      "epoch": "3",
+      "hex": "d998588a02070318ca848361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33701836164582103462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010358202121212121212121212121212121212121212121212121212121212121212121f65820d821add0f07105f779840ff6fc6b3cf80b92b12593080d94654a1044c58bec0ba461615841b75355323dbf0bb9a9b1d5446affaabf3c6ff42546935081edf27469b9fd5dc42a41cd160f81646e6e59033acfd9a2c60ee764c23c74d022e853c8d26cc0f48c00616258410e3c0fbab7c61fd1d3be158bb62279f21551fdf7dd98ee9f7eb808b0454a70bd1688f790795a58338aa50cb31381c9a99e85466cee5ac9dbf24f4cf43bd0b6e301616358416cb3993a78f572c891289800bcb4ba7af46b2f1405a579367e9ccb4663cd1e6a43d54c56eb7b1aa6c12c0a2977d1d0b815420943b205cd86364d970fef11192201616458412405936263e52721b7dd1d58c3ab1f7eee4dbda87c26b553e8749ec3a44645867bfb22e07a502a39beef03145eada8299c59925d688099808401a6ce254f78d401",
+      "name": "F3-bad-extra-signature",
+      "network": 7
+    },
+    {
       "entryId": "f1c57c313c098731b34afd31a96fbb1faa66ce5fffbc9f3b3ca4700080d9b235",
       "epoch": "1",
       "hex": "d998588a02070101838361615821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f018361625821024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076601836163582102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3370103f6f658200000000000000000000000000000000000000000000000000000000000000000f6",
@@ -332,6 +349,7 @@
         "bundle": "A1-5"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:Oversize",
         "stored": "unchanged"
       },
@@ -349,6 +367,7 @@
         "bundle": "A1-5"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:Oversize",
         "stored": "unchanged"
       },
@@ -368,6 +387,7 @@
         "bundle": "A1-5"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:Oversize",
         "stored": "unchanged"
       },
@@ -387,6 +407,7 @@
         "bundle": "A1-3"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:Oversize",
         "stored": "unchanged"
       },
@@ -405,6 +426,7 @@
         "bundle": "F1-3"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:PinMismatch",
         "stored": "unchanged"
       },
@@ -422,6 +444,7 @@
         "bundle": "F1-3"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:PinMismatch",
         "stored": "unchanged"
       },
@@ -441,6 +464,7 @@
         "bundle": "F1-4"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:PinMismatch",
         "stored": "unchanged"
       },
@@ -458,6 +482,9 @@
         "bundle": "corrupt"
       },
       "expect": {
+        "diagnostics": [
+          "CacheRejected:malformed"
+        ],
         "result": "saved:wrote",
         "stored": "A1-4"
       },
@@ -477,6 +504,9 @@
         "bundle": "truncated"
       },
       "expect": {
+        "diagnostics": [
+          "CacheRejected:malformed"
+        ],
         "result": "saved:wrote",
         "stored": "A1-3"
       },
@@ -494,6 +524,9 @@
         "bundle": "G1-3"
       },
       "expect": {
+        "diagnostics": [
+          "CacheRejected:wrongGenesis"
+        ],
         "result": "saved:wrote",
         "stored": "A1-4"
       },
@@ -513,6 +546,9 @@
         "bundle": "N8-1-3"
       },
       "expect": {
+        "diagnostics": [
+          "CacheRejected:wrongNetwork"
+        ],
         "result": "saved:wrote",
         "stored": "A1-4"
       },
@@ -532,6 +568,7 @@
         "bundle": "A1-2"
       },
       "expect": {
+        "diagnostics": [],
         "result": "saved:wrote",
         "stored": "A1-3"
       },
@@ -549,6 +586,7 @@
         "bundle": "A1-5"
       },
       "expect": {
+        "diagnostics": [],
         "result": "saved:noop",
         "stored": "unchanged"
       },
@@ -566,6 +604,7 @@
         "bundle": "A1-3-witness-abd"
       },
       "expect": {
+        "diagnostics": [],
         "result": "saved:noop",
         "stored": "unchanged"
       },
@@ -581,6 +620,7 @@
     {
       "cache": null,
       "expect": {
+        "diagnostics": [],
         "result": "saved:noop",
         "stored": "absent"
       },
@@ -596,6 +636,7 @@
     {
       "cache": null,
       "expect": {
+        "diagnostics": [],
         "result": "saved:wrote",
         "stored": "A1-5"
       },
@@ -616,6 +657,7 @@
         "bundle": "A1-4"
       },
       "expect": {
+        "diagnostics": [],
         "result": "saved:noop",
         "stored": "unchanged"
       },
@@ -633,6 +675,7 @@
     {
       "cache": null,
       "expect": {
+        "diagnostics": [],
         "result": "pending:HistoryConflicted",
         "stored": "absent"
       },
@@ -653,6 +696,7 @@
         "bundle": "A1-3"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:HistoryConflicted",
         "stored": "unchanged"
       },
@@ -673,6 +717,7 @@
         "bundle": "A1-4"
       },
       "expect": {
+        "diagnostics": [],
         "result": "pending:HistoryConflicted",
         "stored": "unchanged"
       },
@@ -692,6 +737,7 @@
         "bundle": "A1-3"
       },
       "expect": {
+        "diagnostics": [],
         "result": "saved:noop",
         "stored": "unchanged",
         "tipEpoch": "3"
@@ -713,6 +759,7 @@
         "bundle": "A1-4"
       },
       "expect": {
+        "diagnostics": [],
         "result": "saved:noop",
         "stored": "unchanged",
         "tipEpoch": "4"
@@ -727,6 +774,31 @@
       "store": null,
       "storeAfterOpen": {
         "bundle": "F1-4"
+      }
+    },
+    {
+      "cache": {
+        "bundle": "A1-3"
+      },
+      "expect": {
+        "diagnostics": [
+          "CacheRejected:malformed"
+        ],
+        "result": "saved:wrote",
+        "stored": "A1-4"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "damage-between-open-and-flush-is-reported",
+      "offers": [
+        "A4"
+      ],
+      "pin": "A1-3",
+      "store": null,
+      "storeAfterOpen": {
+        "bundle": "corrupt"
       }
     }
   ],
@@ -948,6 +1020,25 @@
       "expect": {
         "conflicted": false,
         "results": [
+          "refused:signature",
+          "ok",
+          "appended"
+        ],
+        "tipEpoch": "4"
+      },
+      "name": "pinned-prefix-fork-with-a-bad-witness-is-a-signature-refusal",
+      "offers": [
+        "F3-bad-extra-signature",
+        "@verify",
+        "A4"
+      ],
+      "pin": "A1-3"
+    },
+    {
+      "cache": null,
+      "expect": {
+        "conflicted": false,
+        "results": [
           "refused:signature"
         ],
         "tipEpoch": "3"
@@ -1024,6 +1115,7 @@
       },
       "expect": {
         "diagnostics": [],
+        "exportBundle": "A1-5",
         "flushNeeded": false,
         "tipEntryId": "18cc8b7fc6adf0ad92ede87c9fc1a5c7595982cf28cdd9e12bdcc5aac5137243",
         "tipEpoch": "5"
@@ -1148,6 +1240,7 @@
       },
       "expect": {
         "diagnostics": [],
+        "exportBundle": "A1-3",
         "flushNeeded": false,
         "tipEntryId": "3e9c1999496e316f06234c46688073a045ebe85d8d2726d833b78303d5b0dd7f",
         "tipEpoch": "3"
@@ -1595,6 +1688,38 @@
       "name": "at-the-entry-bytes-budget",
       "pin": "A1",
       "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-4-witness-abd"
+      },
+      "expect": {
+        "diagnostics": [],
+        "exportBundle": "A1-4",
+        "flushNeeded": false,
+        "tipEntryId": "5631c2711507e836756978a9011677b2939bc9667e1de9bf4f871ced26b94f5c",
+        "tipEpoch": "4"
+      },
+      "limits": null,
+      "name": "longer-cache-keeps-the-embedded-witnesses",
+      "pin": "A1-3",
+      "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-4"
+      },
+      "expect": {
+        "diagnostics": [],
+        "exportBundle": "A1-4",
+        "flushNeeded": false,
+        "tipEntryId": "5631c2711507e836756978a9011677b2939bc9667e1de9bf4f871ced26b94f5c",
+        "tipEpoch": "4"
+      },
+      "limits": null,
+      "name": "longer-cache-other-witness-on-the-last-pinned-entry-only",
+      "pin": "A1-3",
+      "store": null
     }
   ],
   "pins": [
@@ -1791,7 +1916,7 @@
     "A1..A6 is one chain (epoch 4 rotates d out and e in); A3-witness-abd is A3 with another valid witness (same EntryID); F3 forks A2, F4 forks A3, both validly signed.",
     "pins: valid pins verify; the invalid ones are ReleasePinInvalid. open: a session is opened over the pin and the cache (store: null, 'unreadable' = I/O error on read, 'oversize' = value over the budget); the expectation holds after open, nothing is written on open; flushNeeded means the merged history differs from the cache.",
     "offer: entries by name, in order, offered to the session; '@verify' asks for the history view. results: appended | noop | (a same-EntryID entry with a bad witness is refused:signature) | refused:<signature|chain|invalid|encoding|gap|network|beforeGenesis> | PinMismatch | Conflict (authenticated fork after the checkpoint; latches) | HistoryConflicted | ok.",
-    "flush: open, optionally replace the store content with storeAfterOpen, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes; a clean session (nothing dirty, no damaged cache to replace, no blocked cache) flushes without reading the store, so it neither imports nor detects what changed after open (optional expect.tipEpoch). casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
+    "flush: open, optionally replace the store content with storeAfterOpen, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes; a clean session (nothing dirty, no damaged cache to replace, no blocked cache) flushes without reading the store, so it neither imports nor detects what changed after open (optional expect.tipEpoch). expect.diagnostics: what the flush result reports (a cache found damaged, foreign or of another network at flush is replaced and reported once, whether it was damaged at open or after it). open expect.exportBundle (optional): the session's exported bundle is that named bundle byte for byte: a longer cache extends the embedded history, so the embedded witnesses stay (the first held). casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
     "key: 'utb/v1/<network decimal>/<genesisEntryId hex>/<namespace>'. revision: lowercase hex SHA-256 of the stored bytes."
   ]
 }

@@ -207,6 +207,7 @@ struct World {
     f3: TrustBaseEntry,
     f4: TrustBaseEntry,
     f4bad: TrustBaseEntry,
+    f3bad: TrustBaseEntry,
     g: Vec<TrustBaseEntry>,
     n8: Vec<TrustBaseEntry>,
 }
@@ -237,6 +238,11 @@ fn world() -> World {
         "d",
         |s| s[5] ^= 1,
     );
+    let f3bad = mutate_sig(
+        &succ(&a2, &abcd, 101, 33, &["a", "b", "c", "d"]),
+        "d",
+        |s| s[5] ^= 1,
+    );
     let g1 = genesis(7, &["a", "b", "c"]);
     let g2 = succ(&g1, &["a", "b", "c"], 100, 2, &["a", "b", "c"]);
     let g3 = succ(&g2, &["a", "b", "c"], 100, 3, &["a", "b", "c"]);
@@ -252,6 +258,7 @@ fn world() -> World {
         f3,
         f4,
         f4bad,
+        f3bad,
         g: vec![g1, g2, g3],
         n8: vec![m1, m2, m3],
     }
@@ -274,6 +281,7 @@ fn generate() -> Value {
         ("F3", &w.f3),
         ("F4", &w.f4),
         ("F4-bad-extra-signature", &w.f4bad),
+        ("F3-bad-extra-signature", &w.f3bad),
         ("G1", &w.g[0]),
         ("G2", &w.g[1]),
         ("G3", &w.g[2]),
@@ -309,6 +317,8 @@ fn generate() -> Value {
     add("A1-6", bundle_of(&a1_6), ids(&a1_6));
     let a1_3w = [&a[0], &a[1], &w.a3w];
     add("A1-3-witness-abd", bundle_of(&a1_3w), ids(&a1_3w));
+    let a1_4w = [&a[0], &a[1], &w.a3w, &a[3]];
+    add("A1-4-witness-abd", bundle_of(&a1_4w), ids(&a1_4w));
     let f_4 = [&a[0], &a[1], &a[2], &w.f4];
     add("F1-4", bundle_of(&f_4), ids(&f_4));
     let f_3 = [&a[0], &a[1], &w.f3];
@@ -733,7 +743,37 @@ fn generate() -> Value {
         &[],
         false,
     );
-    let open = open_cell.into_inner();
+    oc(
+        "longer-cache-keeps-the-embedded-witnesses",
+        "A1-3",
+        cb("A1-4-witness-abd"),
+        none.clone(),
+        tip(&a1_4),
+        &[],
+        false,
+    );
+    oc(
+        "longer-cache-other-witness-on-the-last-pinned-entry-only",
+        "A1-3",
+        cb("A1-4"),
+        none.clone(),
+        tip(&a1_4),
+        &[],
+        false,
+    );
+    let mut open = open_cell.into_inner();
+    // the session exports the embedded witnesses followed by the cache's later entries
+    for o in open.iter_mut() {
+        let name = o["name"].as_str().unwrap().to_string();
+        let export = match name.as_str() {
+            "longer-cache-keeps-the-embedded-witnesses" => "A1-4",
+            "longer-cache-other-witness-on-the-last-pinned-entry-only" => "A1-4",
+            "older-sdk-longer-kept" => "A1-5",
+            "same-id-other-witness" => "A1-3",
+            _ => continue,
+        };
+        o["expect"]["exportBundle"] = json!(export);
+    }
 
     // flush cases: open, offer each entry, flush once, compare the stored bytes
     let mut flush = Vec::new();
@@ -974,6 +1014,23 @@ fn generate() -> Value {
         "store": none, "storeAfterOpen": cb("F1-4"), "offers": Vec::<&str>::new(),
         "expect": {"result": "saved:noop", "stored": "unchanged", "tipEpoch": "4"}
     }));
+    flush.push(json!({
+        "name": "damage-between-open-and-flush-is-reported", "pin": "A1-3", "cache": cb("A1-3"),
+        "limits": nl.clone(), "store": none, "storeAfterOpen": cb("corrupt"), "offers": ["A4"],
+        "expect": {"result": "saved:wrote", "stored": "A1-4"}
+    }));
+    for f in flush.iter_mut() {
+        let diags: &[&str] = match f["name"].as_str().unwrap() {
+            "malformed-is-replaced"
+            | "malformed-is-replaced-even-when-clean"
+            | "damage-between-open-and-flush-is-reported" => &["CacheRejected:malformed"],
+            "other-genesis-is-replaced" => &["CacheRejected:wrongGenesis"],
+            "other-network-is-replaced" => &["CacheRejected:wrongNetwork"],
+            _ => &[],
+        };
+        f["expect"]["diagnostics"] = json!(diags);
+    }
+
     // offer cases
     let mut offer = Vec::new();
     let mut of = |name: &str,
@@ -1084,6 +1141,15 @@ fn generate() -> Value {
         "4",
     );
     of(
+        "pinned-prefix-fork-with-a-bad-witness-is-a-signature-refusal",
+        "A1-3",
+        none.clone(),
+        &["F3-bad-extra-signature", "@verify", "A4"],
+        &["refused:signature", "ok", "appended"],
+        false,
+        "4",
+    );
+    of(
         "high-s-witness-is-refused",
         "A1-3",
         none.clone(),
@@ -1116,7 +1182,7 @@ fn generate() -> Value {
             "A1..A6 is one chain (epoch 4 rotates d out and e in); A3-witness-abd is A3 with another valid witness (same EntryID); F3 forks A2, F4 forks A3, both validly signed.",
             "pins: valid pins verify; the invalid ones are ReleasePinInvalid. open: a session is opened over the pin and the cache (store: null, 'unreadable' = I/O error on read, 'oversize' = value over the budget); the expectation holds after open, nothing is written on open; flushNeeded means the merged history differs from the cache.",
             "offer: entries by name, in order, offered to the session; '@verify' asks for the history view. results: appended | noop | (a same-EntryID entry with a bad witness is refused:signature) | refused:<signature|chain|invalid|encoding|gap|network|beforeGenesis> | PinMismatch | Conflict (authenticated fork after the checkpoint; latches) | HistoryConflicted | ok.",
-            "flush: open, optionally replace the store content with storeAfterOpen, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes; a clean session (nothing dirty, no damaged cache to replace, no blocked cache) flushes without reading the store, so it neither imports nor detects what changed after open (optional expect.tipEpoch). casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
+            "flush: open, optionally replace the store content with storeAfterOpen, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes; a clean session (nothing dirty, no damaged cache to replace, no blocked cache) flushes without reading the store, so it neither imports nor detects what changed after open (optional expect.tipEpoch). expect.diagnostics: what the flush result reports (a cache found damaged, foreign or of another network at flush is replaced and reported once, whether it was damaged at open or after it). open expect.exportBundle (optional): the session's exported bundle is that named bundle byte for byte: a longer cache extends the embedded history, so the embedded witnesses stay (the first held). casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
             "key: 'utb/v1/<network decimal>/<genesisEntryId hex>/<namespace>'. revision: lowercase hex SHA-256 of the stored bytes."
         ],
         "limits": {"maxBundleBytes": 16777216, "maxEntries": 4096, "maxEntryBytes": 65536, "casAttempts": 4},
@@ -1261,6 +1327,13 @@ fn diag_name(d: &Diagnostic) -> String {
             }
         ),
         Diagnostic::CacheUnavailable(_) => "CacheUnavailable".into(),
+    }
+}
+
+fn flush_diags(f: &Flush) -> Vec<String> {
+    match f {
+        Flush::Saved { diagnostics, .. } => diagnostics.iter().map(diag_name).collect(),
+        Flush::Pending(_) => vec![],
     }
 }
 
@@ -1418,6 +1491,9 @@ fn the_shared_vectors_hold() {
             .collect();
         assert_eq!(got, want, "{name}");
         assert_eq!(dirty, e["flushNeeded"].as_bool().unwrap(), "{name}");
+        if let Some(b) = e["exportBundle"].as_str() {
+            assert_eq!(h.to_bundle(), fx.bundle(b), "{name}: exported bytes");
+        }
         assert_eq!(store.get(&key), before, "{name}: open writes nothing");
     }
     // flush
@@ -1442,20 +1518,29 @@ fn the_shared_vectors_hold() {
                     let _ = s.append(fx.entry(n.as_str().unwrap()));
                 }
                 let before = store.get(&key);
-                let r = flush_name(block_on(s.flush()));
+                let fl = block_on(s.flush());
+                let diags = flush_diags(&fl);
+                let r = flush_name(fl);
                 let tip = TrustBaseHistory::from_bundle(&s.export_bundle(), None)
                     .unwrap()
                     .latest()
                     .epoch;
-                (r, before, tip)
+                (r, before, tip, diags)
             }};
         }
-        let (result, before, tip) = if c["store"].as_str() == Some("ignoresBudget") {
+        let (result, before, tip, diags) = if c["store"].as_str() == Some("ignoresBudget") {
             run!(&ib)
         } else {
             run!(&store)
         };
         assert_eq!(result, c["expect"]["result"].as_str().unwrap(), "{name}");
+        let want: Vec<String> = c["expect"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().into())
+            .collect();
+        assert_eq!(diags, want, "{name}: flush diagnostics");
         if let Some(t) = c["expect"]["tipEpoch"].as_str() {
             assert_eq!(tip.to_string(), t, "{name}");
         }
