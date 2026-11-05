@@ -686,6 +686,48 @@
       ],
       "pin": "A1-3",
       "store": null
+    },
+    {
+      "cache": {
+        "bundle": "A1-3"
+      },
+      "expect": {
+        "result": "saved:noop",
+        "stored": "unchanged",
+        "tipEpoch": "3"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "clean-flush-does-not-read",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null,
+      "storeAfterOpen": {
+        "bundle": "A1-5"
+      }
+    },
+    {
+      "cache": {
+        "bundle": "A1-4"
+      },
+      "expect": {
+        "result": "saved:noop",
+        "stored": "unchanged",
+        "tipEpoch": "4"
+      },
+      "limits": {
+        "maxBundleBytes": null,
+        "maxEntries": null
+      },
+      "name": "clean-flush-does-not-detect-a-stored-fork",
+      "offers": [],
+      "pin": "A1-3",
+      "store": null,
+      "storeAfterOpen": {
+        "bundle": "F1-4"
+      }
     }
   ],
   "key": [
@@ -1749,7 +1791,7 @@
     "A1..A6 is one chain (epoch 4 rotates d out and e in); A3-witness-abd is A3 with another valid witness (same EntryID); F3 forks A2, F4 forks A3, both validly signed.",
     "pins: valid pins verify; the invalid ones are ReleasePinInvalid. open: a session is opened over the pin and the cache (store: null, 'unreadable' = I/O error on read, 'oversize' = value over the budget); the expectation holds after open, nothing is written on open; flushNeeded means the merged history differs from the cache.",
     "offer: entries by name, in order, offered to the session; '@verify' asks for the history view. results: appended | noop | (a same-EntryID entry with a bad witness is refused:signature) | refused:<signature|chain|invalid|encoding|gap|network|beforeGenesis> | PinMismatch | Conflict (authenticated fork after the checkpoint; latches) | HistoryConflicted | ok.",
-    "flush: open, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes. casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
+    "flush: open, optionally replace the store content with storeAfterOpen, offer each entry in order, flush once, then compare the stored bytes ('unchanged' = as before, 'absent' = nothing stored, else a bundle name). result: saved:wrote | saved:noop | pending:<PinMismatch|Oversize|HistoryConflicted>. A valid history over the budget (oversize) and an authenticated chain diverging at or before the checkpoint (pinMismatch) are never overwritten; a malformed cache, another network or another genesis is replaced at its observed revision; a conflicted session never writes; a clean session (nothing dirty, no damaged cache to replace, no blocked cache) flushes without reading the store, so it neither imports nor detects what changed after open (optional expect.tipEpoch). casAttempts: compare-and-swap writes per flush (the first plus three retries). Optional limits {maxEntries, maxBundleBytes} (null = default) apply to the session; store 'ignoresBudget' serves the bytes without enforcing the byte budget.",
     "key: 'utb/v1/<network decimal>/<genesisEntryId hex>/<namespace>'. revision: lowercase hex SHA-256 of the stored bytes."
   ]
 }
