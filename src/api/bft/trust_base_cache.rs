@@ -527,10 +527,17 @@ impl<S: TrustBaseStore> Session<S> {
             Ok(StoreRead::Present { bytes, .. }) => {
                 match session.load_cache(&bytes).await {
                     Loaded::Ok(cache) => {
-                        if cache.latest().epoch > session.history.latest().epoch {
-                            // a longer compatible cache is the held history (first held
-                            // witnesses are kept; an older SDK never truncates it)
-                            session.history = cache;
+                        let embedded_tip = session.history.latest().epoch;
+                        if cache.latest().epoch > embedded_tip {
+                            // a longer compatible cache extends the embedded history: its
+                            // entries past the embedded tip are appended, so the embedded
+                            // witnesses (the first held) stay and an older SDK never truncates
+                            // the cache
+                            for e in cache.entries().iter().filter(|e| e.epoch > embedded_tip) {
+                                // verified in the cache's own chain, which agrees with the
+                                // checkpoint; the append only extends
+                                let _ = session.history.append(e.clone());
+                            }
                         } else {
                             // a shorter prefix is extended from the embedded bundle
                             session.dirty = cache.latest().epoch < session.history.latest().epoch;
@@ -726,7 +733,11 @@ impl<S: TrustBaseStore> Session<S> {
         Ok(added)
     }
 
-    /// Save one complete bundle. Rereads and fully validates the stored bytes under the pin,
+    /// Save one complete bundle. **A clean session does not touch the store**: with nothing
+    /// dirty, no damaged cache to replace and nothing blocked, `Saved { wrote: false }` means
+    /// that nothing of ours is unsaved, not that the store matches the session; imports and
+    /// fork detection happen on open and on every dirty, repair or blocked flush, and a rescan
+    /// means reopening. Otherwise it rereads and fully validates the stored bytes under the pin,
     /// imports compatible new entries, keeps the longer suffix, and writes by compare-and-swap
     /// against the revision just read; a changed revision is retried at most
     /// [`MAX_CAS_ATTEMPTS`] writes in all. A damaged cache (or another network/genesis) is
