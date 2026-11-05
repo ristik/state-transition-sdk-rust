@@ -39,11 +39,35 @@ impl Drop for LockGuard {
     }
 }
 
+/// Out-of-space and quota error codes of the platform (ENOSPC, EDQUOT; ERROR_DISK_FULL and
+/// ERROR_HANDLE_DISK_FULL on Windows). `ErrorKind::StorageFull` needs a newer MSRV.
+#[cfg(target_os = "linux")]
+const QUOTA_ERRNOS: &[i32] = &[28, 122];
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+const QUOTA_ERRNOS: &[i32] = &[28, 69];
+#[cfg(windows)]
+const QUOTA_ERRNOS: &[i32] = &[112, 39];
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    windows
+)))]
+const QUOTA_ERRNOS: &[i32] = &[28];
+
 fn map_err(e: io::Error) -> StoreError {
     match e.kind() {
         io::ErrorKind::PermissionDenied => StoreError::Permission,
-        _ if e.raw_os_error() == Some(28) => StoreError::Quota, // ENOSPC
-        _ if e.raw_os_error() == Some(122) => StoreError::Quota, // EDQUOT
+        _ if e.raw_os_error().is_some_and(|c| QUOTA_ERRNOS.contains(&c)) => StoreError::Quota,
         _ => StoreError::Io(e.to_string()),
     }
 }
@@ -99,7 +123,21 @@ impl FileStore {
         }
     }
 
+    /// Remove this key's temporary files left by a crashed writer. Only under the exclusive
+    /// lock, where no other writer of the key can own one.
+    fn remove_stale_temps(&self, key: &StoreKey) {
+        let prefix = format!("{}.tmp-", Self::stem(key));
+        if let Ok(rd) = fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
     fn write_atomic(&self, key: &StoreKey, bytes: &[u8]) -> Result<(), StoreError> {
+        self.remove_stale_temps(key);
         let target = self.file_path(key);
         let tmp = self.dir.join(format!(
             "{}.tmp-{}-{}",
@@ -113,15 +151,20 @@ impl FileStore {
             f.sync_all()?;
             drop(f);
             fs::rename(&tmp, &target)?;
-            // make the rename durable where the platform allows a directory flush
-            #[cfg(unix)]
-            File::open(&self.dir)?.sync_all()?;
             Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_file(&tmp);
+            return result.map_err(map_err);
         }
-        result.map_err(map_err)
+        // Make the rename durable where the platform allows a directory flush. The bytes are
+        // already replaced, so a failure here is not reported as a failed write: the next
+        // flush finds the same tip and writes nothing.
+        #[cfg(unix)]
+        if let Ok(d) = File::open(&self.dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
 }
 

@@ -171,10 +171,18 @@ fn an_orphan_temporary_file_is_ignored_and_the_old_bytes_stand() {
             bytes: b"old".to_vec()
         })
     );
+    // an orphan with the very name the next writer would pick (same pid, fresh counter) must
+    // not fail the write, and the orphans are cleaned up under the lock
+    fs::write(
+        d.0.join(format!("{stem}.tmp-{}-0", std::process::id())),
+        b"half",
+    )
+    .unwrap();
     assert!(matches!(
         block_on(s.compare_and_swap(&key(), Some(&Revision::of(b"old")), b"new")),
         Ok(StoreCas::Written(_))
     ));
+    assert_eq!(names(&d).len(), 1, "{:?}", names(&d));
 }
 
 #[cfg(unix)]
