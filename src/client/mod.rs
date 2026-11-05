@@ -17,6 +17,7 @@ pub(crate) use http::conflict_error;
 pub use http::{
     HttpAggregatorClient, HttpError, SubmitOutcome, WaitOptions, WaitOutcome, WaitStats,
     WaitedLookup, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT, DEFAULT_UNKNOWN_GRACE,
+    MAX_TRUST_BASE_RESPONSE_BYTES,
 };
 
 pub use batch::{
