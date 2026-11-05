@@ -342,6 +342,9 @@ impl TrustBaseEntry {
             for (k, v) in items[9].map()? {
                 out.push((String::from(k.text()?), v.bytes_value()?.to_vec()));
             }
+            // the wire order is canonical CBOR (shorter key first); the in-memory form is raw
+            // byte order, as for members. The re-encoding check below still pins the wire order.
+            out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             Some(out)
         };
         let entry = TrustBaseEntry {
