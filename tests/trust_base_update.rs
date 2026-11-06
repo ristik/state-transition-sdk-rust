@@ -483,6 +483,31 @@ fn an_honest_source_refusing_a_fake_snapshot_is_asked_again_without_it() {
     assert_eq!((seen[2].from_epoch, seen[2].snapshot), (3, None));
     drop(seen);
 
+    // the refusal is recorded even though the source is asked again: if the retry then fails, it is among the causes
+    let mut h = genesis_only();
+    let p1 = page(2, 4, [8; 32], &["epoch2-signed-abc"], Some(3));
+    let mismatch = case("status 4 (HistoryMismatch), nothing else");
+    let s = Script::new(move |i, r| match i {
+        0 => Ok(p1.clone()),
+        _ if r.snapshot.is_some() => Ok(mismatch.clone()),
+        _ => Err(SourceError("gone".into())),
+    });
+    let e = update(&mut h, &[src(&s)], &one_round).unwrap_err();
+    assert_eq!(e.appended, 1);
+    assert_eq!(
+        e.causes,
+        vec![
+            UpdateCause::Status {
+                source: 0,
+                status: TrustBaseStatus::HistoryMismatch
+            },
+            UpdateCause::Source {
+                source: 0,
+                error: SourceError("gone".into())
+            },
+        ]
+    );
+
     // control: a mismatch without a snapshot is still final (one request, then no more)
     let mut h = genesis_only();
     let s = fixed(case("status 4 (HistoryMismatch), nothing else"));
