@@ -220,7 +220,7 @@ pub fn update(
     let mut finally_refused = alloc::vec![false; sources.len()];
     // The cursor and the frozen snapshot belong to the whole call, not to a source: the next source continues where the last stopped, and
     // a source that only knows the older tip cannot end the call as "current" once any source announced a higher end. Both reset when an
-    // entry is refused.
+    // entry is refused. (The history cannot move on by other means while this holds it mutably, so unlike JS there is no re-sync here.)
     let mut from = next_from(history);
     let mut snapshot: Option<Snapshot> = None;
 
@@ -238,11 +238,6 @@ pub fn update(
             loop {
                 if options.cancelled.is_some_and(|c| c()) {
                     return Err(fail(UpdateFailure::Cancelled, causes, appended));
-                }
-                if next_from(history) > from {
-                    // The history moved on by other means: the frozen range no longer applies.
-                    from = next_from(history);
-                    snapshot = None;
                 }
                 let request = TrustBaseRequest {
                     from_epoch: from,

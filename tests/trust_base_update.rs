@@ -274,10 +274,14 @@ fn a_page_that_does_not_continue_the_range_is_skipped() {
 
 /// A hand-built OK page (the shared vectors have no pair of pages whose announced ends differ).
 fn page(from: u64, end: u64, end_id: [u8; 32], entries: &[&str], next: Option<u64>) -> Vec<u8> {
+    let raw: Vec<Vec<u8>> = entries.iter().map(|n| entry(n).to_cbor()).collect();
+    page_raw(from, end, end_id, &raw, next)
+}
+
+fn page_raw(from: u64, end: u64, end_id: [u8; 32], raw: &[Vec<u8>], next: Option<u64>) -> Vec<u8> {
     use unicity_token::cbor::{
         encode_array, encode_byte_string, encode_null, encode_tag, encode_uint,
     };
-    let raw: Vec<Vec<u8>> = entries.iter().map(|n| entry(n).to_cbor()).collect();
     let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
     encode_tag(
         39015,
@@ -292,6 +296,44 @@ fn page(from: u64, end: u64, end_id: [u8; 32], entries: &[&str], next: Option<u6
             &next.map_or_else(encode_null, encode_uint),
         ]),
     )
+}
+
+/// The entry `name` with a bit flipped in its first signature: it decodes, it does not verify.
+fn damaged_entry(name: &str) -> Vec<u8> {
+    let e = entry(name);
+    let bytes = e.to_cbor();
+    let sig = e.signatures.as_ref().unwrap()[0].1.clone();
+    let at = bytes
+        .windows(sig.len())
+        .position(|w| w == sig.as_slice())
+        .unwrap();
+    let mut bad = bytes;
+    bad[at + 10] ^= 1;
+    bad
+}
+
+#[test]
+fn a_refused_entry_in_the_middle_of_a_paged_range_drops_the_snapshot_for_the_next_source() {
+    let mut h = genesis_only();
+    // source 0: page 1 is good and announces end 4; page 2 (from 3) carries a damaged entry
+    let p1 = page(2, 4, [8; 32], &["epoch2-signed-abc"], Some(3));
+    let p2 = page_raw(
+        3,
+        4,
+        [8; 32],
+        &[damaged_entry("epoch3-signed-abc")],
+        Some(4),
+    );
+    let a = Script::new(move |i, _| Ok(if i == 0 { p1.clone() } else { p2.clone() }));
+    let b = fixed(case("range of the tip entry only"));
+    assert_eq!(
+        update(&mut h, &[src(&a), src(&b)], &UpdateOptions::default()),
+        Ok(2)
+    );
+    assert_eq!(h.latest().epoch, 3);
+    // source 1 is asked from the epoch after the held prefix and with no snapshot of source 0's announcement
+    let first = b.seen.borrow()[0].clone();
+    assert_eq!((first.from_epoch, first.snapshot), (3, None));
 }
 
 #[test]
