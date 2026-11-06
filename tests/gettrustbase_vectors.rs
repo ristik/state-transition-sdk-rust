@@ -93,3 +93,24 @@ fn a_response_for_another_network_is_refused() {
         Err(RangeError::Response(_))
     ));
 }
+
+#[test]
+fn the_budgets_are_exact() {
+    use unicity_token::api::bft::trust_base_range::RangeLimits;
+    let v = vectors();
+    let network = NetworkId::new(v["network"].as_u64().unwrap() as u16).unwrap();
+    let bytes = hx(&v["cases"][0]["hex"]); // the complete history: three entries
+    let at = |max_bytes, max_entries| RangeLimits {
+        max_bytes,
+        max_entries,
+    };
+    assert!(TrustBaseRange::decode(&bytes, &at(bytes.len(), 3), network).is_ok());
+    assert!(matches!(
+        TrustBaseRange::decode(&bytes, &at(bytes.len() - 1, 3), network),
+        Err(RangeError::Encoding(_))
+    ));
+    assert!(matches!(
+        TrustBaseRange::decode(&bytes, &at(bytes.len(), 2), network),
+        Err(RangeError::Response(_))
+    ));
+}
