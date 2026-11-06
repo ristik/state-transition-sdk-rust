@@ -275,6 +275,14 @@ pub fn update(
                     current += 1;
                     break;
                 }
+                // A source that refuses the echoed snapshot as another history may be the honest one: the snapshot came from whichever source
+                // answered the first page, and a hostile first page can announce a fake end. Drop it, start again from the tip and ask the same
+                // source once more without it; a mismatch without a snapshot is final, so this terminates.
+                if page.status == TrustBaseStatus::HistoryMismatch && snapshot.is_some() {
+                    snapshot = None;
+                    from = next_from(history);
+                    continue;
+                }
                 if page.status != TrustBaseStatus::Ok {
                     causes.push(UpdateCause::Status {
                         source: index,

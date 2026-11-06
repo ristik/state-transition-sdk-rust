@@ -456,6 +456,42 @@ fn unavailable_is_asked_again_like_busy() {
 }
 
 #[test]
+fn an_honest_source_refusing_a_fake_snapshot_is_asked_again_without_it() {
+    // page 1 (from some hostile source or a stale one) announces end 4 with a fake id; the echo is refused as another history; the same source
+    // then serves from the tip without a snapshot
+    let mut h = genesis_only();
+    let p1 = page(2, 4, [8; 32], &["epoch2-signed-abc"], Some(3));
+    let mismatch = case("status 4 (HistoryMismatch), nothing else");
+    let tip = case("range of the tip entry only");
+    let s = Script::new(move |i, r| {
+        Ok(match i {
+            0 => p1.clone(),
+            _ if r.snapshot.is_some() => mismatch.clone(),
+            _ => tip.clone(),
+        })
+    });
+    let one_round = UpdateOptions {
+        rounds: 1,
+        ..UpdateOptions::default()
+    };
+    assert_eq!(update(&mut h, &[src(&s)], &one_round), Ok(2));
+    assert_eq!(h.latest().epoch, 3);
+    let seen = s.seen.borrow();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[0].snapshot, None);
+    assert!(seen[1].snapshot.is_some());
+    assert_eq!((seen[2].from_epoch, seen[2].snapshot), (3, None));
+    drop(seen);
+
+    // control: a mismatch without a snapshot is still final (one request, then no more)
+    let mut h = genesis_only();
+    let s = fixed(case("status 4 (HistoryMismatch), nothing else"));
+    let e = update(&mut h, &[src(&s)], &UpdateOptions::default()).unwrap_err();
+    assert_eq!(s.count(), 1);
+    assert_eq!(e.failure, UpdateFailure::NoneServed);
+}
+
+#[test]
 fn no_source_and_cancellation() {
     let mut h = genesis_only();
     let e = update(&mut h, &[], &UpdateOptions::default()).unwrap_err();
