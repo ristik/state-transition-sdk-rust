@@ -2200,8 +2200,14 @@ fn authorities_release_override_and_custom() {
         open(Authority::ReleaseOverride(bad), n7, &table),
         Err(CacheError::ReleasePinInvalid(_))
     ));
-    // the shipped release table is empty until the owner approves a public pin
-    assert!(RELEASE_PINS.is_empty());
+    // the shipped release table is the approved mainnet and testnet2 genesis (tests/release_pins.rs pins its bytes)
+    assert_eq!(
+        RELEASE_PINS
+            .iter()
+            .map(|r| r.network_id)
+            .collect::<Vec<_>>(),
+        vec![1, 4]
+    );
 }
 
 #[test]
@@ -2225,6 +2231,22 @@ fn different_witnesses_of_one_entry_are_not_a_conflict_and_the_first_is_kept() {
     assert_eq!(s.append(f.w.a3w.clone()), Ok(Appended::AlreadyHeld));
     assert_eq!(s.history().unwrap().get(3).unwrap().to_cbor(), held);
     assert!(!s.is_dirty());
+}
+
+#[test]
+fn a_new_epoch_changes_the_derived_pin_and_another_witness_subset_changes_only_the_digest() {
+    let f = Fix::new();
+    let p2 = f.pin(2);
+    let p3 = f.pin(3);
+    assert_eq!(p2.genesis_entry_id, p3.genesis_entry_id);
+    assert_ne!(p2.pinned_entry_id, p3.pinned_entry_id);
+    assert_ne!(p2.bundle_sha256, p3.bundle_sha256);
+    assert_eq!((p2.pinned_epoch, p3.pinned_epoch), (2, 3));
+    // the same three entries, the last carrying other valid witnesses: same entry ids, another artifact digest
+    let alt = PinSpec::from_bundle(&bundle_of(&[&f.w.a[0], &f.w.a[1], &f.w.a3w])).unwrap();
+    assert_eq!(alt.pinned_entry_id, p3.pinned_entry_id);
+    assert_eq!(alt.genesis_entry_id, p3.genesis_entry_id);
+    assert_ne!(alt.bundle_sha256, p3.bundle_sha256);
 }
 
 #[test]
