@@ -2,6 +2,7 @@
 //! base that anchors it.
 
 pub mod input_record;
+mod release_pins;
 pub mod root_trust_base;
 pub mod shard_id;
 pub mod shard_tree;
