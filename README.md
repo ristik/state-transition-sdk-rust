@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The trust base identifies the Consensus Layer (BFT Core) instance. Pin a trusted copy in your application for production. Use `trust_base.network_id` when creating tokens so they match your gateway; testnet2 is network ID `4` (`NetworkId::TESTNET` is `2`).
+The trust base identifies the Consensus Layer (BFT Core) instance. Pin a trusted copy in your application for production. Use `trust_base.network_id` when creating tokens so they match your gateway; testnet2 is network ID `4` (`NetworkId::TESTNET2`).
 
 `HttpAggregatorClient` provides a blocking HTTP transport. Applications can implement the `AggregatorClient` trait to supply their own transport.
 

@@ -2,7 +2,9 @@
 //!
 //! * **Append-only.** A held entry is never replaced or removed. An entry of a held epoch
 //!   with the same identity (same unsigned bytes) is a no-op, whatever valid witness it
-//!   carries; one with another identity is [`HistoryError::Conflict`].
+//!   carries; one with another identity that verifies against the held predecessor is an
+//!   authenticated fork ([`HistoryError::Conflict`]); one that does not verify is an
+//!   ordinary refusal.
 //! * **Forward verification.** A new entry is verified from the latest held entry (epoch
 //!   plus one, same network, later start, predecessor identity, the predecessor members'
 //!   strict weighted quorum). A verified entry becomes the anchor of the next. The latest
@@ -33,16 +35,60 @@ pub const MAX_BUNDLE_BYTES: usize = 16 << 20;
 /// Bound on the number of entries in a bundle.
 pub const MAX_BUNDLE_ENTRIES: usize = 4096;
 
+/// Resource bounds of bundle decoding. A resource policy, never a pruning or trust rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleLimits {
+    /// Encoded bundle bytes.
+    pub max_bytes: usize,
+    /// Entries in a bundle.
+    pub max_entries: usize,
+    /// Encoded bytes of one entry.
+    pub max_entry_bytes: usize,
+}
+
+impl Default for BundleLimits {
+    fn default() -> Self {
+        BundleLimits {
+            max_bytes: MAX_BUNDLE_BYTES,
+            max_entries: MAX_BUNDLE_ENTRIES,
+            max_entry_bytes: MAX_ENTRY_BYTES,
+        }
+    }
+}
+
+/// A decoded, structurally checked bundle whose entries are not yet chain-verified.
+#[derive(Debug, Clone)]
+pub struct ParsedBundle {
+    /// The declared network.
+    pub network: NetworkId,
+    /// Declared first epoch.
+    pub from: u64,
+    /// Declared last epoch.
+    pub end: u64,
+    /// Declared identity of the last entry.
+    pub end_id: [u8; ID_LEN],
+    /// The decoded entries (structure only, signatures unchecked).
+    pub entries: Vec<TrustBaseEntry>,
+}
+
 /// Why an entry or bundle was refused by the history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HistoryError {
     /// The entry itself or its link to the latest held entry is invalid.
     Entry(TrustBaseError),
-    /// An entry of this epoch is held with another identity.
+    /// An authenticated fork: a fully valid entry (strict quorum of the held predecessor's
+    /// members) of a held epoch with another identity. An offered entry that does not verify is
+    /// an ordinary refusal ([`HistoryError::Entry`]), never a conflict.
     Conflict {
+        /// The network.
+        network: NetworkId,
         /// The epoch.
         epoch: u64,
+        /// Identity of the held entry.
+        held: [u8; ID_LEN],
+        /// Identity of the offered entry.
+        offered: [u8; ID_LEN],
     },
     /// The entry is not directly after the latest held entry.
     Gap {
@@ -57,6 +103,9 @@ pub enum HistoryError {
     BeforeGenesis,
     /// The bundle or genesis is malformed.
     Bundle(&'static str),
+    /// A resource budget (bytes, entries, entry bytes) is exceeded. Not a defect of the data: a
+    /// valid larger history is never judged malformed, rewritten or pruned for it.
+    Budget(&'static str),
     /// The genesis identity differs from the pin.
     PinMismatch,
 }
@@ -65,9 +114,10 @@ impl fmt::Display for HistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HistoryError::Entry(e) => write!(f, "{e}"),
-            HistoryError::Conflict { epoch } => {
-                write!(f, "trust base history: another entry of epoch {epoch} is held")
-            }
+            HistoryError::Conflict { epoch, .. } => write!(
+                f,
+                "trust base history: an authenticated fork of epoch {epoch} (another valid entry is held)"
+            ),
             HistoryError::Gap { held, offered } => write!(
                 f,
                 "trust base history: epoch {offered} does not directly follow the latest held epoch {held}"
@@ -75,6 +125,7 @@ impl fmt::Display for HistoryError {
             HistoryError::WrongNetwork => write!(f, "trust base history: another network"),
             HistoryError::BeforeGenesis => write!(f, "trust base history: epoch before the genesis"),
             HistoryError::Bundle(m) => write!(f, "trust base history: invalid bundle: {m}"),
+            HistoryError::Budget(m) => write!(f, "trust base history: over the budget: {m}"),
             HistoryError::PinMismatch => write!(f, "trust base history: genesis differs from the pin"),
         }
     }
@@ -124,13 +175,33 @@ impl TrustBaseHistory {
         })
     }
 
-    /// Decode a tagged `GetTrustBase` response used as a release bundle: status OK, entries
-    /// contiguous from a genesis entry to the release tip, no continuation. The chain is
-    /// verified link by link (weighted quorum of each predecessor included); the genesis is
-    /// taken as shipped, or compared with `pin` when given.
+    /// Decode a tagged `GetTrustBase` response used as a release bundle: status OK, a
+    /// non-null end identity, entries contiguous from a genesis entry to the tip, no
+    /// continuation. The chain is verified link by link (weighted quorum of each predecessor
+    /// included); the genesis is taken as shipped, or compared with `pin` when given.
     pub fn from_bundle(bytes: &[u8], pin: Option<[u8; ID_LEN]>) -> Result<Self, HistoryError> {
-        if bytes.len() > MAX_BUNDLE_BYTES {
-            return Err(HistoryError::Bundle("bundle exceeds the size bound"));
+        Self::from_bundle_with(bytes, pin, &BundleLimits::default())
+    }
+
+    /// [`from_bundle`](Self::from_bundle) under explicit limits.
+    pub fn from_bundle_with(
+        bytes: &[u8],
+        pin: Option<[u8; ID_LEN]>,
+        limits: &BundleLimits,
+    ) -> Result<Self, HistoryError> {
+        let parsed = Self::parse_bundle(bytes, limits)?;
+        let mut history: Option<TrustBaseHistory> = None;
+        for entry in parsed.entries.iter().cloned() {
+            history = Some(Self::accept_bundle_entry(history, entry, pin)?);
+        }
+        Self::finish_bundle(history, &parsed)
+    }
+
+    /// Decode a bundle without verifying any chain link or signature. Bytes are checked
+    /// before decoding and the entry count before any signature work.
+    pub fn parse_bundle(bytes: &[u8], limits: &BundleLimits) -> Result<ParsedBundle, HistoryError> {
+        if bytes.len() > limits.max_bytes {
+            return Err(HistoryError::Budget("bundle exceeds the size bound"));
         }
         let b = |m: &'static str| HistoryError::Bundle(m);
         let top = Decoder::new(bytes);
@@ -152,12 +223,13 @@ impl TrustBaseHistory {
             return Err(b("status is not OK"));
         }
         let from = uint(&f[3])?;
-        let effective_end = uint(&f[4])?;
-        let end_id: Option<[u8; ID_LEN]> = f[5]
+        let end = uint(&f[4])?;
+        let end_id: [u8; ID_LEN] = f[5]
             .nullable(|x| x.bytes_value().map(<[u8]>::to_vec).map_err(Into::into))
             .map_err(|_| b("malformed end entry id"))?
-            .map(|v| <[u8; ID_LEN]>::try_from(v.as_slice()))
-            .transpose()
+            .ok_or_else(|| b("a complete bundle has a non-null end entry id"))?
+            .as_slice()
+            .try_into()
             .map_err(|_| b("end entry id is not 32 bytes"))?;
         if !f[7].is_null() {
             return Err(b("a bundle has no continuation"));
@@ -165,38 +237,65 @@ impl TrustBaseHistory {
         let items = f[6]
             .array(None)
             .map_err(|_| b("entries are not an array"))?;
-        if items.is_empty() || items.len() > MAX_BUNDLE_ENTRIES {
-            return Err(b("entry count outside 1..=4096"));
+        if items.is_empty() {
+            return Err(b("no entries"));
         }
-        let mut history: Option<TrustBaseHistory> = None;
+        if items.len() > limits.max_entries {
+            return Err(HistoryError::Budget("entry count exceeds the bound"));
+        }
+        let mut entries = Vec::with_capacity(items.len());
         for item in &items {
-            if item.bytes().len() > MAX_ENTRY_BYTES {
-                return Err(b("entry exceeds the size bound"));
+            if item.bytes().len() > limits.max_entry_bytes {
+                return Err(HistoryError::Budget("entry exceeds the size bound"));
             }
             let entry = TrustBaseEntry::from_cbor(item.bytes())?;
             if entry.network_id != network {
                 return Err(HistoryError::WrongNetwork);
             }
-            match history.as_mut() {
-                None => history = Some(Self::from_genesis(entry, pin)?),
-                Some(h) => {
-                    if h.append(entry)? != Appended::Added {
-                        return Err(b("repeated entry"));
-                    }
+            entries.push(entry);
+        }
+        Ok(ParsedBundle {
+            network,
+            from,
+            end,
+            end_id,
+            entries,
+        })
+    }
+
+    /// One step of loading a parsed bundle: the first entry starts the history (genesis,
+    /// compared with `pin`), later ones are appended strictly and must each be new.
+    pub fn accept_bundle_entry(
+        history: Option<TrustBaseHistory>,
+        entry: TrustBaseEntry,
+        pin: Option<[u8; ID_LEN]>,
+    ) -> Result<TrustBaseHistory, HistoryError> {
+        match history {
+            None => Self::from_genesis(entry, pin),
+            Some(mut h) => {
+                if h.append(entry)? != Appended::Added {
+                    return Err(HistoryError::Bundle("repeated entry"));
                 }
+                Ok(h)
             }
         }
+    }
+
+    /// The final consistency check of a loaded bundle against its declared header.
+    pub fn finish_bundle(
+        history: Option<TrustBaseHistory>,
+        parsed: &ParsedBundle,
+    ) -> Result<TrustBaseHistory, HistoryError> {
+        let b = |m: &'static str| HistoryError::Bundle(m);
         let history = history.ok_or_else(|| b("no entries"))?;
-        if history.genesis().epoch != from {
+        if history.genesis().epoch != parsed.from {
             return Err(b("first entry is not the declared start epoch"));
         }
-        if history.latest().epoch != effective_end {
+        if history.latest().epoch != parsed.end {
             return Err(b("last entry is not the declared end epoch"));
         }
-        if let Some(id) = end_id {
-            if history.latest().entry_id() != id {
-                return Err(b("last entry does not match the declared end identity"));
-            }
+        if history.latest().entry_id() != parsed.end_id {
+            return Err(b("last entry does not match the declared end identity"));
         }
         Ok(history)
     }
@@ -249,14 +348,25 @@ impl TrustBaseHistory {
         }
         if let Some(held) = self.get(entry.epoch) {
             entry.validate()?;
-            if held.entry_id() != entry.entry_id() {
-                return Err(HistoryError::Conflict { epoch: entry.epoch });
-            }
-            // the same entry: a no-op, but only for a valid witness (the first one stays)
+            let (held_id, offered_id) = (held.entry_id(), entry.entry_id());
+            // the witness is checked before anything is said about the identity: an entry that
+            // does not verify against the held predecessor is an ordinary refusal
             if entry.epoch == first {
                 entry.verify_genesis()?;
+                if held_id != offered_id {
+                    // the genesis identity is the trust domain, not a fork of it
+                    return Err(HistoryError::PinMismatch);
+                }
             } else if let Some(prev) = self.get(entry.epoch - 1) {
                 entry.verify_successor(prev)?;
+                if held_id != offered_id {
+                    return Err(HistoryError::Conflict {
+                        network: self.network_id(),
+                        epoch: entry.epoch,
+                        held: held_id,
+                        offered: offered_id,
+                    });
+                }
             }
             return Ok(Appended::AlreadyHeld);
         }
@@ -283,9 +393,7 @@ impl TrustBaseHistory {
             return Err(HistoryError::WrongNetwork);
         }
         if bundle.genesis().entry_id() != self.genesis_id() {
-            return Err(HistoryError::Conflict {
-                epoch: self.genesis().epoch,
-            });
+            return Err(HistoryError::PinMismatch);
         }
         let mut merged = self.clone();
         let mut advanced = false;
