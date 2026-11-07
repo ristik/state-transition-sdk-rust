@@ -37,8 +37,9 @@ use super::VerificationError;
 /// Default number of successful seals remembered by a session.
 pub const DEFAULT_SEAL_MEMO_CAPACITY: usize = 64;
 
-/// The most signatures a seal may carry (the election cap on a committee).
-pub const MAX_SEAL_SIGNATURES: usize = 16;
+/// The most signatures a seal may carry: a resource ceiling equal to the most members an entry may have (256), counting unknown and bad extras too.
+/// It is not the bridge's 16-signature profile, which stays with the B1 verifier.
+pub const MAX_SEAL_SIGNATURES: usize = 256;
 
 /// Earliest plausible seal timestamp (2023-04-20), as in the reference
 /// implementation's seal sanity check.
@@ -228,7 +229,7 @@ impl<'a> SealSession<'a> {
     ///
     /// This is only the signature part; callers check the unicity-tree root and everything
     /// else themselves. It does not run the structural seal checks of `authenticate_seal`, so
-    /// the 16-signature cap applies on the authenticate path only (the seal's size bounds the
+    /// the signature ceiling applies on the authenticate path only (the seal's size bounds the
     /// work here).
     pub fn verify_quorum(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
         self.verify_quorum_under(seal, &[0; 32])
@@ -506,15 +507,47 @@ mod tests {
         h.latest().members[i].node_id.clone()
     }
 
+    /// 256 distinct keys (two-byte seeds; `signers` repeats after 255).
+    fn many_signers(n: usize) -> Vec<Secp256k1Signer> {
+        (0..n)
+            .map(|i| {
+                let mut k = [0u8; 32];
+                k[30] = ((i + 1) >> 8) as u8;
+                k[31] = ((i + 1) & 0xff) as u8;
+                Secp256k1Signer::from_bytes(&k).unwrap()
+            })
+            .collect()
+    }
+
     #[test]
-    fn at_most_sixteen_signatures() {
-        let s = signers(17);
-        let h = history(&s, &[1; 17]);
-        let seal = signed_by(&s, &(0..17).collect::<Vec<_>>());
+    fn at_most_256_signatures() {
+        let s = many_signers(256);
+        let h = history(&s, &[1; 256]);
+        let mut seal = signed_by(&s, &(0..256).collect::<Vec<_>>());
+        // every one of 256 members, 256 signatures: accepted
+        assert_eq!(SealSession::new(&h).authenticate_seal(&seal), Ok(()));
+        // a 257th signature (an unknown extra, which would count zero) is over the resource ceiling: refused before any signature work
+        seal.signatures.push(("zz".into(), alloc::vec![1, 2, 3]));
         assert_eq!(
             SealSession::new(&h).authenticate_seal(&seal),
             Err(VerificationError::SealMalformed)
         );
+    }
+
+    #[test]
+    fn a_128_validator_seal_needs_its_quorum_and_a_full_one_verifies() {
+        let s = many_signers(128);
+        let h = history(&s, &[1; 128]);
+        assert_eq!(h.latest().quorum_threshold, 86);
+        let quorum = signed_by(&s, &(0..86).collect::<Vec<_>>());
+        assert_eq!(SealSession::new(&h).authenticate_seal(&quorum), Ok(()));
+        let short = signed_by(&s, &(0..85).collect::<Vec<_>>());
+        assert_eq!(
+            SealSession::new(&h).authenticate_seal(&short),
+            Err(VerificationError::QuorumNotMet)
+        );
+        let all = signed_by(&s, &(0..128).collect::<Vec<_>>());
+        assert_eq!(SealSession::new(&h).authenticate_seal(&all), Ok(()));
     }
 
     #[test]
