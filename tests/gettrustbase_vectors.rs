@@ -114,3 +114,54 @@ fn the_budgets_are_exact() {
         Err(RangeError::Response(_))
     ));
 }
+
+fn raw_page(network: u16, from: u64, end: u64, end_id: &[u8; 32], items: &[Vec<u8>]) -> Vec<u8> {
+    use unicity_token::cbor::{
+        encode_array, encode_byte_string, encode_null, encode_tag, encode_uint,
+    };
+    let refs: Vec<&[u8]> = items.iter().map(Vec::as_slice).collect();
+    encode_tag(
+        39015,
+        &encode_array(&[
+            &encode_uint(1),
+            &encode_uint(u64::from(network)),
+            &encode_uint(0),
+            &encode_uint(from),
+            &encode_uint(end),
+            &encode_byte_string(end_id),
+            &encode_array(&refs),
+            &encode_null(),
+        ]),
+    )
+}
+
+/// The shared maximum-size entry (bft-go-base 81ee667, `tests/vectors/trust-base-v2-max`) is one page entry well inside the 1 MiB page; an item
+/// over the 128 KiB per-entry cap is refused.
+#[test]
+fn the_largest_entry_is_a_valid_page_and_one_over_the_cap_is_not() {
+    use unicity_token::api::bft::trust_base_entry::MAX_ENTRY_BYTES;
+    let v: Value =
+        serde_json::from_slice(include_bytes!("vectors/trust-base-v2-max/max-entry.json")).unwrap();
+    let entry = hex::decode(v["entry"].as_str().unwrap()).unwrap();
+    let id: [u8; 32] = hex::decode(v["entryId"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let network = v["network"].as_u64().unwrap() as u16;
+    let page = raw_page(network, 2, 2, &id, std::slice::from_ref(&entry));
+    assert!(page.len() > 90_000 && page.len() < PAGE_LIMITS.max_bytes);
+    let r = TrustBaseRange::decode(&page, &PAGE_LIMITS, NetworkId::new(network).unwrap()).unwrap();
+    assert_eq!(
+        (r.entries.len(), r.entries[0].epoch, r.next_epoch),
+        (1, 2, None)
+    );
+
+    // an item above the per-entry cap, whatever it holds, is refused by size
+    let big = unicity_token::cbor::encode_byte_string(&vec![0u8; MAX_ENTRY_BYTES]);
+    assert!(big.len() > MAX_ENTRY_BYTES);
+    let page = raw_page(network, 2, 2, &id, &[big]);
+    assert!(matches!(
+        TrustBaseRange::decode(&page, &PAGE_LIMITS, NetworkId::new(network).unwrap()),
+        Err(RangeError::Response(m)) if m.contains("size bound")
+    ));
+}
