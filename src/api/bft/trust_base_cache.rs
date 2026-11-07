@@ -47,9 +47,11 @@ pub const MAX_CAS_ATTEMPTS: usize = 4;
 /// Longest custom namespace.
 pub const MAX_NAMESPACE_BYTES: usize = 64;
 
-/// The immutable release table. Every row is a vendored, reviewed asset; the table ships
-/// **empty** until the owner approves the public bundles.
-pub const RELEASE_PINS: &[ReleasePinRow] = &[];
+/// The immutable release table: the networks whose genesis the owner approved for shipping, mainnet (1) and testnet2 (4), as the
+/// vendored one-entry bundles of `release-pins/` (byte-identical to unicitynetwork/unicity-ids#11). Generated from
+/// `release-pins/manifest.json` by `tests/release_pins.rs` (which fails on any difference); never edit by hand. A release with a longer
+/// history embeds it from genesis to the new tip and has to extend the previous release's checkpoint.
+pub const RELEASE_PINS: &[ReleasePinRow] = super::release_pins::ROWS;
 
 /// One row of the release table (static assets).
 #[derive(Debug, Clone, Copy)]
