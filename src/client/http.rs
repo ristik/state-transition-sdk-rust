@@ -20,6 +20,7 @@ use std::io::Read;
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
+use crate::api::bft::trust_base_update::{SourceError, TrustBaseRequest, TrustBaseSource};
 use crate::api::bft::RootTrustBase;
 use crate::api::certification_request::CertificationRequest;
 use crate::api::inclusion_proof::InclusionProof;
@@ -741,6 +742,66 @@ impl HttpAggregatorClient {
                 other => other,
             })
         })
+    }
+}
+
+/// Largest GetTrustBase response body read from an aggregator: a full page (1 MiB) plus slack.
+pub const MAX_TRUST_BASE_RESPONSE_BYTES: usize = (1 << 20) + 1024;
+
+/// The aggregator's trust base endpoint, `GET /api/v1/trustbases?from=E&maxEntries=N[&snapshotEnd=E&snapshotEntryId=0x..]` on its origin
+/// (whatever path the JSON-RPC URL has): the only delivery that exists. The body is the tag-39015 response, size-capped; nothing in it is
+/// trusted (see [`TrustBaseSource`]). Same redirect, HTTPS and API-key rules as the JSON-RPC calls.
+impl TrustBaseSource for HttpAggregatorClient {
+    fn get_trust_base_page(&self, request: &TrustBaseRequest) -> Result<Vec<u8>, SourceError> {
+        let mut url = self
+            .validate_endpoint()
+            .map_err(|e| SourceError(e.to_string()))?;
+        url.set_path("/api/v1/trustbases");
+        url.set_fragment(None);
+        {
+            let mut q = url.query_pairs_mut();
+            q.clear();
+            q.append_pair("from", &request.from_epoch.to_string());
+            q.append_pair("maxEntries", &request.max_entries.to_string());
+            if let Some(s) = &request.snapshot {
+                q.append_pair("snapshotEnd", &s.end.to_string());
+                q.append_pair("snapshotEntryId", &format!("0x{}", hex::encode(s.entry_id)));
+            }
+        }
+        let mut call = self
+            .agent
+            .get(url.as_str())
+            .set("Accept", "application/cbor");
+        if let Some(key) = &self.api_key {
+            call = call.set("X-API-Key", key.expose());
+        }
+        match call.call() {
+            Ok(response) => {
+                // redirects are off; a 3xx is a refusal, not a page
+                if !(200..300).contains(&response.status()) {
+                    return Err(SourceError(format!(
+                        "HTTP {} from the trust base endpoint",
+                        response.status()
+                    )));
+                }
+                let mut bytes = Vec::new();
+                response
+                    .into_reader()
+                    .take(MAX_TRUST_BASE_RESPONSE_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| SourceError(format!("reading the trust base response: {e}")))?;
+                if bytes.len() > MAX_TRUST_BASE_RESPONSE_BYTES {
+                    return Err(SourceError(
+                        "the trust base response exceeds the size cap".to_string(),
+                    ));
+                }
+                Ok(bytes)
+            }
+            Err(ureq::Error::Status(status, _)) => Err(SourceError(format!(
+                "HTTP {status} from the trust base endpoint"
+            ))),
+            Err(e) => Err(SourceError(format!("trust base request failed: {e}"))),
+        }
     }
 }
 

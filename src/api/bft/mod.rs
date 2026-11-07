@@ -11,6 +11,8 @@ pub mod trust_base_entry;
 #[cfg(feature = "file-cache")]
 pub mod trust_base_file_store;
 pub mod trust_base_history;
+pub mod trust_base_range;
+pub mod trust_base_update;
 pub mod uc_interner;
 pub mod unicity_certificate;
 pub mod unicity_seal;
