@@ -37,6 +37,10 @@ pub struct UnicitySeal {
     pub signatures: Vec<(String, Vec<u8>)>,
 }
 
+/// The most signatures a seal may carry: a resource ceiling equal to the most members a trust-base entry may have (owner §49), counting unknown and bad
+/// extras too. Signature validity and the quorum rule are unchanged.
+pub const MAX_SEAL_SIGNATURES: usize = 256;
+
 impl UnicitySeal {
     /// Decode from CBOR (tagged).
     pub fn from_cbor(d: Decoder<'_>) -> Result<Self, Error> {
@@ -53,7 +57,13 @@ impl UnicitySeal {
         let hash = items[6].bytes_value()?.to_vec();
         let mut signatures = Vec::new();
         if !items[7].is_null() {
-            for (k, v) in items[7].map()? {
+            let pairs = items[7].map()?;
+            // a resource ceiling checked before the keys and signatures are copied
+            if pairs.len() > MAX_SEAL_SIGNATURES {
+                return Err(Error::OutOfRange("seal signatures"));
+            }
+            signatures.reserve(pairs.len());
+            for (k, v) in pairs {
                 signatures.push((k.text()?.into(), v.bytes_value()?.to_vec()));
             }
         }
