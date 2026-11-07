@@ -25,6 +25,8 @@ std = ["alloc", "k256/std", "sha2/std", "dep:getrandom", "dep:serde_json"]
 # client adds transaction construction, signing, and the mint/transfer flow
 # over a caller-supplied AggregatorClient transport.
 client = ["alloc"]
+# file-cache adds the optional on-disk TrustBaseStore (host only; not part of the core).
+file-cache = ["std"]
 # http adds a blocking JSON-RPC AggregatorClient for talking to a live
 # aggregator/gateway (host only; pulls in a TLS HTTP stack).
 http = ["std", "client", "dep:ureq", "dep:url", "dep:zeroize"]
