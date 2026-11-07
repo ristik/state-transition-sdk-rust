@@ -46,8 +46,9 @@ pub const MAX_NODE_ID_LEN: usize = 128;
 pub const MAX_WEIGHT: u64 = 1 << 40;
 /// Length of an entry identity and of a present state/change hash.
 pub const ID_LEN: usize = 32;
-/// Bound on the encoded size of one entry.
-pub const MAX_ENTRY_BYTES: usize = 64 << 10;
+/// Bound on the encoded size of one entry: 128 KiB. The largest valid entry (256 members with 128-byte node ids and the signatures of 256
+/// predecessors) is 95,365 bytes, 16 members need about 6 KiB.
+pub const MAX_ENTRY_BYTES: usize = 128 << 10;
 
 /// Why an entry was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
