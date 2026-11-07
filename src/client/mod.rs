@@ -15,8 +15,9 @@ mod http;
 pub(crate) use http::conflict_error;
 #[cfg(feature = "http")]
 pub use http::{
-    HttpAggregatorClient, HttpError, SubmitOutcome, WaitOptions, WaitOutcome, WaitStats,
-    WaitedLookup, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT, DEFAULT_UNKNOWN_GRACE,
+    HttpAggregatorClient, HttpError, SdkVersionHeader, SubmitOutcome, WaitOptions, WaitOutcome,
+    WaitStats, WaitedLookup, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT,
+    DEFAULT_UNKNOWN_GRACE, SDK_VERSION,
 };
 
 pub use batch::{
