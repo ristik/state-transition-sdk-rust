@@ -83,8 +83,16 @@ pub enum VerificationError {
     /// The authority uses a configuration this verifier can not judge (stake
     /// weights other than one); not a statement about any signature.
     UnsupportedAuthority,
-    /// The unicity seal's epoch is not the epoch of the authority's trust base.
+    /// The unicity seal's epoch is not the epoch of the authority's trust base (or, for a
+    /// seal checked against a history, the seal's round lies beyond the end of its epoch).
     SealEpochMismatch,
+    /// The history holds no trust base entry for the seal's epoch. Not a statement about
+    /// any signature: a newer entry may exist. Retryable by fetching the missing entries,
+    /// appending them to the history, and verifying again.
+    UnknownTrustEpoch {
+        /// The epoch no held entry covers.
+        epoch: u64,
+    },
     /// The unicity seal predates the start of the trust base's epoch.
     SealBeforeEpochStart,
     /// The unicity seal is structurally unusable (no signatures, zero round, ...).
@@ -236,6 +244,9 @@ impl fmt::Display for VerificationError {
             }
             VerificationError::SealEpochMismatch => {
                 write!(f, "unicity seal epoch does not match trust base")
+            }
+            VerificationError::UnknownTrustEpoch { epoch } => {
+                write!(f, "no trust base entry for unicity seal epoch {epoch}")
             }
             VerificationError::SealBeforeEpochStart => {
                 write!(f, "unicity seal predates the trust base epoch")

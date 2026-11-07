@@ -42,9 +42,11 @@ pub use mint_justification::{
 };
 pub use ni_context::{NonInclusionContext, NonInclusionOutcome, NonInclusionSnapshot};
 pub(crate) use seal::check_seal_shape;
-pub use seal::{SealAuthenticator, SealSession, SealStats, DEFAULT_SEAL_MEMO_CAPACITY};
+pub use seal::{
+    Authority, SealAuthenticator, SealSession, SealStats, TrustAnchor, DEFAULT_SEAL_MEMO_CAPACITY,
+};
 
-use crate::api::bft::{RootTrustBase, UnicityCertificate};
+use crate::api::bft::UnicityCertificate;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::leaf_value::calculate_leaf_value;
 use crate::api::{NonInclusionProof, StateId, AGGREGATION_PARTITION_ID};
@@ -59,14 +61,17 @@ use crate::transaction::{Minter, Token, Transaction};
 /// Any mint justification is rejected as unsupported (fail closed). To accept
 /// justified mints (e.g. token splits), use [`verify_token_with`] with a
 /// [`MintJustificationRegistry`] holding the relevant verifiers.
-pub fn verify_token(token: &Token, trust_base: &RootTrustBase) -> Result<(), VerificationError> {
+pub fn verify_token(
+    token: &Token,
+    trust_base: &(impl TrustAnchor + ?Sized),
+) -> Result<(), VerificationError> {
     verify_token_with(token, trust_base, &MintJustificationRegistry::new())
 }
 
 /// Verify a whole token, dispatching any mint justification through `registry`.
 pub fn verify_token_with(
     token: &Token,
-    trust_base: &RootTrustBase,
+    trust_base: &(impl TrustAnchor + ?Sized),
     registry: &MintJustificationRegistry,
 ) -> Result<(), VerificationError> {
     verify_token_with_policy(token, trust_base, registry, VerificationPolicy::default())
@@ -75,7 +80,7 @@ pub fn verify_token_with(
 /// Verify a token with explicit cumulative limits and payload-validation policy.
 pub fn verify_token_with_policy(
     token: &Token,
-    trust_base: &RootTrustBase,
+    trust_base: &(impl TrustAnchor + ?Sized),
     registry: &MintJustificationRegistry,
     policy: VerificationPolicy,
 ) -> Result<(), VerificationError> {
@@ -88,7 +93,7 @@ pub fn verify_token_with_policy(
 /// authenticated once while they remain in the session's bounded memo.
 pub fn verify_token_with_seal_stats(
     token: &Token,
-    trust_base: &RootTrustBase,
+    trust_base: &(impl TrustAnchor + ?Sized),
     registry: &MintJustificationRegistry,
     policy: VerificationPolicy,
 ) -> (Result<(), VerificationError>, SealStats) {
@@ -105,7 +110,7 @@ pub fn verify_token_with_seal_stats(
 /// reference behavior that repeats every body and quorum check.
 pub(crate) fn verify_token_with_memo_capacity(
     token: &Token,
-    trust_base: &RootTrustBase,
+    trust_base: &(impl TrustAnchor + ?Sized),
     registry: &MintJustificationRegistry,
     policy: VerificationPolicy,
     capacity: usize,
@@ -113,6 +118,7 @@ pub(crate) fn verify_token_with_memo_capacity(
     let mut context =
         VerificationContext::with_memo_capacity(trust_base, registry, policy, capacity);
     let result = trust_base
+        .authority()
         .validate()
         .map_err(VerificationError::InvalidTrustBase)
         .and_then(|()| verify_token_in_context(token, &mut context));
@@ -128,9 +134,9 @@ pub(crate) fn verify_token_in_session<'a>(
     registry: &'a MintJustificationRegistry,
     policy: VerificationPolicy,
 ) -> (Result<(), VerificationError>, SealSession<'a>) {
-    let trust_base = session.trust_base();
+    let authority = session.authority();
     let mut context = VerificationContext::with_session(session, registry, policy);
-    let result = trust_base
+    let result = authority
         .validate()
         .map_err(VerificationError::InvalidTrustBase)
         .and_then(|()| verify_token_in_context(token, &mut context));
@@ -169,10 +175,10 @@ fn verify_genesis(
 ) -> Result<(), VerificationError> {
     let genesis = token.genesis();
     let mint = genesis.transaction();
-    let trust_base = context.trust_base();
+    let authority = context.seals().authority();
 
     // Network must match the trust base.
-    if mint.network_id() != trust_base.network_id {
+    if mint.network_id() != authority.network_id() {
         return Err(VerificationError::NetworkMismatch);
     }
 
@@ -241,7 +247,7 @@ fn verify_inclusion_proof(
 /// This verifies the proof's certification data and witness, but does not claim
 /// that its transaction hash belongs to a caller-supplied transaction object.
 pub fn verify_inclusion_proof_for(
-    trust_base: &RootTrustBase,
+    trust_base: &(impl TrustAnchor + ?Sized),
     proof: &InclusionProof,
     state_id: &StateId,
     reference_time: u64,
@@ -382,7 +388,7 @@ fn verify_unicity_certificate(
         .map_err(|_| VerificationError::CertificateBodyInvalid)?;
     check_seal_shape(seal)?;
 
-    if seal.network_id != seals.trust_base().network_id {
+    if seal.network_id != seals.authority().network_id() {
         return Err(VerificationError::SealNetworkMismatch);
     }
 
@@ -441,7 +447,7 @@ fn verify_unicity_certificate(
 /// # }
 /// ```
 pub fn verify_non_inclusion_at_snapshot(
-    trust_base: &RootTrustBase,
+    trust_base: &(impl TrustAnchor + ?Sized),
     proof: &NonInclusionProof,
     target: &StateId,
     context: &NonInclusionContext,
@@ -628,6 +634,7 @@ fn verify_predicate(
 #[cfg(all(test, feature = "client"))]
 mod tests {
     use super::*;
+    use crate::api::bft::RootTrustBase;
 
     /// Verify with a fresh seal session per call (the pre-session behavior).
     fn verify_inclusion_proof(
