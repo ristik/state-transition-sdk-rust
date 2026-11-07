@@ -26,6 +26,7 @@ use crate::crypto::hash::{DataHasher, HashAlgorithm};
 use crate::crypto::signature::{PublicKey, Signature};
 
 use super::VerificationError;
+pub use crate::api::bft::unicity_seal::MAX_SEAL_SIGNATURES;
 use crate::api::bft::UnicityCertificate;
 use crate::fifo_index::FifoIndex;
 
@@ -279,6 +280,10 @@ impl<'a> SealSession<'a> {
         seal: &UnicitySeal,
         _policy: &[u8; 32],
     ) -> Result<(), VerificationError> {
+        // a resource ceiling, before the seal is hashed or any signature is looked at
+        if seal.signatures.len() > MAX_SEAL_SIGNATURES {
+            return Err(VerificationError::SealMalformed);
+        }
         // an unsafe authority (no validators, zero threshold, ...) never yields
         // or caches a success
         self.ensure_trust_base()?;
@@ -364,6 +369,7 @@ pub(crate) fn check_seal_shape(seal: &UnicitySeal) -> Result<(), VerificationErr
     if seal.root_chain_round_number < 1
         || seal.timestamp < GENESIS_TIME
         || seal.signatures.is_empty()
+        || seal.signatures.len() > MAX_SEAL_SIGNATURES
         || seal
             .signatures
             .iter()
@@ -780,5 +786,95 @@ mod tests {
         seal.signatures
             .push(("n2".into(), sign(&signers[2], &seal)));
         assert!(verdict(&tb, &seal).0);
+    }
+
+    /// 256 distinct keys (`signers` repeats after 255).
+    fn many_signers(n: usize) -> Vec<Secp256k1Signer> {
+        (0..n)
+            .map(|i| {
+                let mut k = [0u8; 32];
+                k[30] = ((i + 1) >> 8) as u8;
+                k[31] = ((i + 1) & 0xff) as u8;
+                Secp256k1Signer::from_bytes(&k).unwrap()
+            })
+            .collect()
+    }
+
+    /// Owner §49: a native seal carries at most 256 signatures, counting unknown and bad extras, checked before any hashing or signature work.
+    #[test]
+    fn at_most_256_seal_signatures_before_any_work() {
+        assert_eq!(MAX_SEAL_SIGNATURES, 256);
+        let signers = many_signers(256);
+        let tb = trust_base(&signers, 171);
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = signers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("n{i}"), sign(s, &seal)))
+            .collect();
+        // all 256 members sign: verifies, on both paths
+        let mut session = SealSession::new(&tb);
+        session.verify_quorum(&seal).unwrap();
+        assert_eq!(check_seal_shape(&seal), Ok(()));
+        // a 257th (an unknown extra, worth zero) is over the ceiling
+        seal.signatures.push(("zz".into(), vec![1, 2, 3]));
+        let mut session = SealSession::new(&tb);
+        assert_eq!(
+            session.verify_quorum(&seal),
+            Err(VerificationError::SealMalformed)
+        );
+        assert_eq!(
+            session.stats().quorum_checks,
+            0,
+            "refused before the memo key and any signature work"
+        );
+        assert_eq!(
+            check_seal_shape(&seal),
+            Err(VerificationError::SealMalformed)
+        );
+    }
+
+    /// 128 operating validators: the quorum is 86 and the valid signatures of a full committee are enough.
+    #[test]
+    fn a_128_validator_committee_reaches_its_quorum() {
+        let signers = many_signers(128);
+        let tb = trust_base(&signers, 86);
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = signers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("n{i}"), sign(s, &seal)))
+            .collect();
+        SealSession::new(&tb).verify_quorum(&seal).unwrap();
+        seal.signatures.truncate(85);
+        assert_eq!(
+            SealSession::new(&tb).verify_quorum(&seal),
+            Err(VerificationError::QuorumNotMet)
+        );
+    }
+
+    /// The decoder refuses a seal over the ceiling before it copies the keys and signatures.
+    #[test]
+    fn a_seal_with_more_than_256_signatures_does_not_decode() {
+        use crate::cbor::Decoder;
+        let sigs = |n: usize| -> Vec<(String, Vec<u8>)> {
+            (0..n)
+                .map(|i| (format!("n{i:04}"), vec![0u8; 65]))
+                .collect()
+        };
+        let ok = seal_with(sigs(256));
+        let bytes = ok.to_cbor();
+        assert_eq!(
+            UnicitySeal::from_cbor(Decoder::new(&bytes))
+                .unwrap()
+                .signatures
+                .len(),
+            256
+        );
+        let over = seal_with(sigs(257)).to_cbor();
+        assert!(matches!(
+            UnicitySeal::from_cbor(Decoder::new(&over)),
+            Err(crate::error::Error::OutOfRange("seal signatures"))
+        ));
     }
 }
