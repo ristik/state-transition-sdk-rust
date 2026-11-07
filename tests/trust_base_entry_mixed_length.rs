@@ -93,6 +93,7 @@ fn mixed_length_signer_ids_through_append_and_the_bundle_round_trip() {
     let mut fresh = TrustBaseHistory::from_genesis(g.clone(), Some(g.entry_id())).unwrap();
     fresh.install_bundle(&bundle).unwrap();
     assert_eq!(fresh.latest().entry_id(), e.entry_id());
+}
 
 /// 256 members with 128-byte ids and 256 predecessor signatures: the largest entry the bounds allow (about 95,400 bytes) round-trips, the
 /// 128 KiB cap is exact.
