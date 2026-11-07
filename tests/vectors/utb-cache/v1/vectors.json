@@ -832,7 +832,7 @@
     "casAttempts": 4,
     "maxBundleBytes": 16777216,
     "maxEntries": 4096,
-    "maxEntryBytes": 65536
+    "maxEntryBytes": 131072
   },
   "offer": [
     {
