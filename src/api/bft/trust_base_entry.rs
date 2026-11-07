@@ -42,6 +42,9 @@ pub const TRUST_BASE_V2_VERSION: u64 = 2;
 pub const MAX_MEMBERS: usize = 256;
 /// Bound on a node identifier in bytes.
 pub const MAX_NODE_ID_LEN: usize = 128;
+/// Bound on the signatures an entry may carry: its predecessor's members, at most [`MAX_MEMBERS`], however small the entry itself is (a 256-member
+/// committee hands over to 4 members with 256 signatures). A resource ceiling checked before the signatures are copied or verified.
+pub const MAX_ENTRY_SIGNATURES: usize = MAX_MEMBERS;
 /// Bound on one member's weight, so that the sum over [`MAX_MEMBERS`] cannot overflow.
 pub const MAX_WEIGHT: u64 = 1 << 40;
 /// Length of an entry identity and of a present state/change hash.
@@ -339,8 +342,12 @@ impl TrustBaseEntry {
         let signatures = if items[9].is_null() {
             None
         } else {
-            let mut out = Vec::new();
-            for (k, v) in items[9].map()? {
+            let pairs = items[9].map()?;
+            if pairs.len() > MAX_ENTRY_SIGNATURES {
+                return Err(TrustBaseError::Encoding("too many signatures"));
+            }
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
                 out.push((String::from(k.text()?), v.bytes_value()?.to_vec()));
             }
             // the wire order is canonical CBOR (shorter key first); the in-memory form is raw
@@ -480,6 +487,11 @@ impl TrustBaseEntry {
         data: &[u8],
         signatures: &[(String, Vec<u8>)],
     ) -> Result<(), TrustBaseError> {
+        if signatures.len() > MAX_ENTRY_SIGNATURES {
+            return Err(TrustBaseError::Signature(String::from(
+                "too many signatures",
+            )));
+        }
         let mut weight = 0u64;
         for (i, (node_id, sig)) in signatures.iter().enumerate() {
             if signatures[..i].iter().any(|(other, _)| other == node_id) {
