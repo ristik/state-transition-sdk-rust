@@ -8,6 +8,8 @@ pub mod shard_id;
 pub mod shard_tree;
 pub mod trust_base_cache;
 pub mod trust_base_entry;
+#[cfg(feature = "file-cache")]
+pub mod trust_base_file_store;
 pub mod trust_base_history;
 pub mod uc_interner;
 pub mod unicity_certificate;
