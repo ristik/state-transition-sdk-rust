@@ -614,6 +614,17 @@ fn verify_with_update_fetches_only_for_the_missing_entry_and_retries_once() {
     );
     assert_eq!(runs.get(), 1);
 
+    // a seal below the genesis epoch is final: verify ran once and the source was never asked
+    let mut cur = genesis_only();
+    let untouched = fixed(case("range from epoch 2 to the tip"));
+    let runs = Cell::new(0);
+    let r = verify_with_update(&mut cur, &[src(&untouched)], &opts, |h| {
+        runs.set(runs.get() + 1);
+        check(h, &seal(0, 50, &["a", "b", "c"]))
+    });
+    assert_eq!(r, Ok(Err(VerificationError::SealBeforeEpochStart)));
+    assert_eq!((runs.get(), untouched.count()), (1, 0));
+
     // an update that failed without helping is the outer error
     let mut cur = genesis_only();
     let dead = down();
