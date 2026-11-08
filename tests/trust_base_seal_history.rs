@@ -77,10 +77,10 @@ fn a_missing_entry_is_the_typed_retryable_error_and_appending_it_fixes_it() {
         check(&h, &s3),
         Err(VerificationError::UnknownTrustEpoch { epoch: 3 })
     );
-    // an epoch before the genesis is as unknown as one after the tip
+    // an epoch before the genesis is not "missing": no fetch can supply it, so it is a final failure
     assert_eq!(
         check(&h, &seal(5, 0, 50, &["a", "b", "c"])),
-        Err(VerificationError::UnknownTrustEpoch { epoch: 0 })
+        Err(VerificationError::SealBeforeEpochStart)
     );
     h.append(entry(&vectors(), "epoch3-signed-abc")).unwrap();
     assert_eq!(check(&h, &s3), Ok(()));
