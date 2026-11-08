@@ -687,7 +687,7 @@ fn seal_authentication_is_strict_and_not_reusable_across_witnesses() {
     assert!(assemble(&c.uc, &c.trust_base).is_ok());
 
     let mut tb = c.trust_base.clone();
-    tb.network_id = NetworkId::TESTNET;
+    tb.network_id = NetworkId::TESTNET2; // some other network than the fixture's
     assert_eq!(
         assemble(&c.uc, &tb),
         Err(PartitionViewError::Seal(

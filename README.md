@@ -30,6 +30,8 @@ Mainnet is live. Start with testnet2; for production, use the mainnet gateway an
 
 Pass your gateway API key through `HttpAggregatorClient::with_api_key`. The public testnet2 key is `sk_ddc3cfcc001e4a28ac3fad7407f99590`. Use your own mainnet key obtained from [Sphere](https://sphere.unicity.network/) and keep it secure.
 
+Every aggregator request carries `X-SDK-Version: rust/<crate version>` so that the SDK versions in use can be measured (the aggregator never reads it). Switch it off or set your own value with `HttpAggregatorClient::with_sdk_version_header(SdkVersionHeader::Off | Custom(..))`.
+
 ### Client setup
 
 Download the testnet2 trust base above as `bft-trustbase.testnet2.json` in your working directory. Configure the client and load the trust base:
@@ -54,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The trust base identifies the Consensus Layer (BFT Core) instance. Pin a trusted copy in your application for production. Use `trust_base.network_id` when creating tokens so they match your gateway; testnet2 is network ID `4` (`NetworkId::TESTNET` is `2`).
+The trust base identifies the Consensus Layer (BFT Core) instance. Pin a trusted copy in your application for production. Use `trust_base.network_id` when creating tokens so they match your gateway; testnet2 is network ID `4` (`NetworkId::TESTNET2`).
 
 `HttpAggregatorClient` provides a blocking HTTP transport. Applications can implement the `AggregatorClient` trait to supply their own transport.
 

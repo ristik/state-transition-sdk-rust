@@ -190,6 +190,20 @@ mod mock {
         pub method: String,
         /// The JSON `params` value.
         pub params: serde_json::Value,
+        /// The request headers, names lowercased.
+        pub headers: Vec<(String, String)>,
+    }
+
+    impl Seen {
+        /// The values of header `name` (case-insensitive), in order.
+        pub fn header(&self, name: &str) -> Vec<String> {
+            let name = name.to_lowercase();
+            self.headers
+                .iter()
+                .filter(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+                .collect()
+        }
     }
 
     pub struct Scripted {
@@ -223,6 +237,15 @@ mod mock {
                             at: Instant::now(),
                             method: json["method"].as_str().unwrap_or("").to_string(),
                             params: json["params"].clone(),
+                            headers: request
+                                .split("\r\n\r\n")
+                                .next()
+                                .unwrap_or("")
+                                .lines()
+                                .skip(1)
+                                .filter_map(|l| l.split_once(':'))
+                                .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
+                                .collect(),
                         };
                         let index = {
                             let mut l = log.lock().unwrap();
