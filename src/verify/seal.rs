@@ -437,16 +437,22 @@ pub(crate) fn quorum_met_for(
     }
 }
 
-/// The history entry that judges `seal`: the one of the seal's own epoch (none held is
-/// `UnknownTrustEpoch`, retryable), and the seal's round has to lie inside that epoch - not
-/// before its start, and not at or after the start of the next held epoch.
+/// The history entry that judges `seal`: the one of the seal's own epoch, and the seal's round
+/// has to lie inside that epoch - not before its start, and not at or after the start of the
+/// next held epoch. An epoch above the held tip is `UnknownTrustEpoch` (retryable: a later
+/// fetch can supply it); an epoch below the genesis can never be supplied, so it is the final
+/// `SealBeforeEpochStart` and triggers no fetch.
 pub(crate) fn entry_for_seal<'h>(
     history: &'h TrustBaseHistory,
     seal: &UnicitySeal,
 ) -> Result<&'h TrustBaseEntry, VerificationError> {
-    let entry = history
-        .get(seal.epoch)
-        .ok_or(VerificationError::UnknownTrustEpoch { epoch: seal.epoch })?;
+    let Some(entry) = history.get(seal.epoch) else {
+        return Err(if seal.epoch < history.genesis().epoch {
+            VerificationError::SealBeforeEpochStart
+        } else {
+            VerificationError::UnknownTrustEpoch { epoch: seal.epoch }
+        });
+    };
     if seal.root_chain_round_number < entry.epoch_start {
         return Err(VerificationError::SealBeforeEpochStart);
     }
