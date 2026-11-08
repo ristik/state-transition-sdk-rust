@@ -4,7 +4,8 @@
 //! This is the synchronous transport for production use: it speaks the same
 //! JSON-RPC protocol as the reference SDKs (methods `certification_request`,
 //! `get_inclusion_proof.v2`, and `get_non_inclusion_proof.v1`), authenticates
-//! with an optional `X-API-Key`, and
+//! with an optional `X-API-Key`, announces itself with `X-SDK-Version: rust/<crate version>` (owner §43: so the update window can be
+//! measured; see [`SdkVersionHeader`]), and
 //! **polls** `get_inclusion_proof` until the aggregator has certified the state
 //! (so the [`mint`](super::mint)/[`transfer`](super::transfer) helpers work
 //! unchanged against live infrastructure).
@@ -243,6 +244,22 @@ pub struct HttpAggregatorClient {
     long_poll: bool,
     unknown_grace: u32,
     allow_insecure_http: bool,
+    sdk_version: Option<String>,
+}
+
+/// The value of the `X-SDK-Version` header this crate sends: `rust/<crate version>`.
+pub const SDK_VERSION: &str = concat!("rust/", env!("CARGO_PKG_VERSION"));
+
+/// What the client sends as `X-SDK-Version` on every aggregator request (the aggregator never reads it; it is for measuring which SDK versions are in use).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SdkVersionHeader {
+    /// `rust/<crate version>` ([`SDK_VERSION`]). The default.
+    #[default]
+    Default,
+    /// No header.
+    Off,
+    /// This value (printable ASCII, not empty).
+    Custom(String),
 }
 
 #[derive(Clone)]
@@ -290,6 +307,7 @@ impl HttpAggregatorClient {
             long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: false,
+            sdk_version: Some(SDK_VERSION.to_string()),
         }
     }
 
@@ -315,7 +333,26 @@ impl HttpAggregatorClient {
             long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: true,
+            sdk_version: Some(SDK_VERSION.to_string()),
         }
+    }
+
+    /// Choose the `X-SDK-Version` header sent on every request (default: `rust/<crate version>`). A custom value has to be non-empty printable ASCII,
+    /// otherwise this is an [`HttpError::Configuration`].
+    pub fn with_sdk_version_header(mut self, header: SdkVersionHeader) -> Result<Self, HttpError> {
+        self.sdk_version = match header {
+            SdkVersionHeader::Default => Some(SDK_VERSION.to_string()),
+            SdkVersionHeader::Off => None,
+            SdkVersionHeader::Custom(value) => {
+                if value.is_empty() || !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                    return Err(HttpError::Configuration(
+                        "the SDK version header must be non-empty printable ASCII".to_string(),
+                    ));
+                }
+                Some(value)
+            }
+        };
+        Ok(self)
     }
 
     /// Set the API key sent as `X-API-Key` on certification requests.
@@ -677,6 +714,9 @@ impl HttpAggregatorClient {
             .set("Content-Type", "application/json");
         if let Some(t) = timeout {
             request = request.timeout(t);
+        }
+        if let Some(version) = &self.sdk_version {
+            request = request.set("X-SDK-Version", version);
         }
         for (k, v) in headers {
             request = request.set(k, v);

@@ -30,6 +30,8 @@ Mainnet is live. Start with testnet2; for production, use the mainnet gateway an
 
 Pass your gateway API key through `HttpAggregatorClient::with_api_key`. The public testnet2 key is `sk_ddc3cfcc001e4a28ac3fad7407f99590`. Use your own mainnet key obtained from [Sphere](https://sphere.unicity.network/) and keep it secure.
 
+Every aggregator request carries `X-SDK-Version: rust/<crate version>` so that the SDK versions in use can be measured (the aggregator never reads it). Switch it off or set your own value with `HttpAggregatorClient::with_sdk_version_header(SdkVersionHeader::Off | Custom(..))`.
+
 ### Client setup
 
 Download the testnet2 trust base above as `bft-trustbase.testnet2.json` in your working directory. Configure the client and load the trust base:
