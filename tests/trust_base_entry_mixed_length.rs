@@ -80,6 +80,21 @@ fn a_non_canonical_wire_order_of_the_signatures_is_still_refused() {
     ));
 }
 
+#[test]
+fn mixed_length_signer_ids_through_append_and_the_bundle_round_trip() {
+    use unicity_token::api::bft::TrustBaseHistory;
+    let (g, e) = pair();
+    let mut h = TrustBaseHistory::from_genesis(g.clone(), Some(g.entry_id())).unwrap();
+    h.append(e.clone()).unwrap();
+    let bundle = h.to_bundle();
+    let back = TrustBaseHistory::from_bundle(&bundle, Some(g.entry_id())).unwrap();
+    assert_eq!(back.latest().entry_id(), e.entry_id());
+    assert_eq!(back.to_bundle(), bundle);
+    let mut fresh = TrustBaseHistory::from_genesis(g.clone(), Some(g.entry_id())).unwrap();
+    fresh.install_bundle(&bundle).unwrap();
+    assert_eq!(fresh.latest().entry_id(), e.entry_id());
+}
+
 /// 256 members with 128-byte ids and 256 predecessor signatures: the largest entry the bounds allow (about 95,400 bytes) round-trips, the
 /// 128 KiB cap is exact.
 #[test]

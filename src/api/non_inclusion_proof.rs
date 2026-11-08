@@ -3,10 +3,11 @@
 
 use alloc::vec::Vec;
 
-use super::bft::{RootTrustBase, UnicityCertificate};
+use super::bft::UnicityCertificate;
 use super::{NonInclusionCertificate, StateId};
 use crate::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
 use crate::error::Error;
+use crate::verify::TrustAnchor;
 use crate::verify::{self, NonInclusionContext, NonInclusionOutcome, VerificationError};
 
 /// CBOR tag for [`NonInclusionProof`].
@@ -151,7 +152,7 @@ impl NonInclusionProof {
     /// ```
     pub fn verify_at_snapshot(
         &self,
-        trust_base: &RootTrustBase,
+        trust_base: &(impl TrustAnchor + ?Sized),
         context: &NonInclusionContext,
     ) -> Result<NonInclusionOutcome, VerificationError> {
         let target = self
@@ -174,7 +175,7 @@ impl NonInclusionProof {
     pub fn verify_for_at_snapshot(
         &self,
         target: &StateId,
-        trust_base: &RootTrustBase,
+        trust_base: &(impl TrustAnchor + ?Sized),
         context: &NonInclusionContext,
     ) -> Result<NonInclusionOutcome, VerificationError> {
         if self

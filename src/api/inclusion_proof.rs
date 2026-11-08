@@ -3,12 +3,13 @@
 
 use alloc::vec::Vec;
 
-use super::bft::{RootTrustBase, UnicityCertificate};
+use super::bft::UnicityCertificate;
 use super::certification::CertificationData;
 use super::inclusion_certificate::InclusionCertificate;
 use super::StateId;
 use crate::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint, Decoder};
 use crate::error::Error;
+use crate::verify::TrustAnchor;
 use crate::verify::{self, VerificationError};
 
 /// CBOR tag for [`InclusionProof`].
@@ -90,7 +91,7 @@ impl InclusionProof {
         &self,
         state_id: &StateId,
         reference_time: u64,
-        trust_base: &RootTrustBase,
+        trust_base: &(impl TrustAnchor + ?Sized),
     ) -> Result<(), VerificationError> {
         verify::verify_inclusion_proof_for(trust_base, self, state_id, reference_time)
     }
