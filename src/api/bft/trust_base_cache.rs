@@ -33,6 +33,7 @@ use core::task::{Context, Poll};
 
 use super::trust_base_entry::{TrustBaseEntry, ID_LEN};
 use super::trust_base_history::{Appended, BundleLimits, HistoryError, TrustBaseHistory};
+use super::trust_base_update::{update, TrustBaseSource, UpdateError, UpdateOptions};
 use crate::api::NetworkId;
 use crate::crypto::hash::sha256;
 
@@ -496,6 +497,43 @@ pub enum Flush {
     Pending(CacheError),
 }
 
+/// The result of [`Session::refresh`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refreshed {
+    /// Entries appended; 0 means every source said there was nothing newer (not authenticated).
+    pub appended: usize,
+    /// The save outcome.
+    pub flush: Flush,
+}
+
+/// Why [`Session::refresh`] did not end with "current".
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefreshError {
+    /// The session is conflicted; nothing was requested.
+    Conflicted,
+    /// No source served the range, or the update was cancelled. The authenticated prefix
+    /// (`error.appended`) is held and was saved if the store allowed it (`flush`).
+    Update {
+        /// The update failure.
+        error: UpdateError,
+        /// The save outcome of the prefix.
+        flush: Flush,
+    },
+}
+
+impl fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RefreshError::Conflicted => write!(f, "HistoryConflicted"),
+            RefreshError::Update { error, .. } => write!(f, "{error}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RefreshError {}
+
 struct YieldNow(bool);
 
 impl Future for YieldNow {
@@ -794,6 +832,39 @@ impl<S: TrustBaseStore> Session<S> {
             }
         }
         Ok(added)
+    }
+
+    /// Fetch the entries after the held tip from `sources` (see [`update`]) and save the result: the
+    /// session counterpart of the JS SDK's `session.refresh`.
+    ///
+    /// The fetch is bounded by [`UpdateOptions`] (rounds, page size, cancellation) and by the page
+    /// budget of the response decode; every entry is authenticated from the held tip by
+    /// [`TrustBaseHistory::append`] before it is held, and the result is saved by [`flush`](Self::flush)
+    /// (one complete bundle, compare-and-swap against the revision just read). A valid prefix is held and
+    /// saved even when a later page fails ([`RefreshError::Update`] then carries the flush as well).
+    ///
+    /// The sources are blocking (`TrustBaseSource`); the async part is the store. A conflicted session
+    /// is refused before any request ([`RefreshError::Conflicted`]). The loop only ever offers entries
+    /// after the held tip, so it cannot meet a held epoch: a fork after the checkpoint cannot arise
+    /// here, and the refusal of an entry is the source's, as in [`update`].
+    pub async fn refresh(
+        &mut self,
+        sources: &[&dyn TrustBaseSource],
+        options: &UpdateOptions<'_>,
+    ) -> Result<Refreshed, RefreshError> {
+        if self.conflict.is_some() {
+            return Err(RefreshError::Conflicted);
+        }
+        let before = self.history.latest().epoch;
+        let result = update(&mut self.history, sources, options);
+        if self.history.latest().epoch > before {
+            self.dirty = true;
+        }
+        let flush = self.flush().await;
+        match result {
+            Ok(appended) => Ok(Refreshed { appended, flush }),
+            Err(error) => Err(RefreshError::Update { error, flush }),
+        }
     }
 
     /// Save one complete bundle. **A clean session does not touch the store**: with nothing

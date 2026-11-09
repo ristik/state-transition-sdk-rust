@@ -2326,3 +2326,262 @@ fn a_local_bundle_with_a_forged_signature_is_refused_at_open() {
         Err(CacheError::ReleasePinInvalid(_))
     ));
 }
+
+// ---------------------------------------------------------------- Session::refresh
+//
+// The session counterpart of the JS `session.refresh`: fetch through the update loop, then save by compare-and-swap. The entries and the
+// stores are those of the shared-vector world above.
+
+mod refresh {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use unicity_token::api::bft::trust_base_update::{
+        SourceError, TrustBaseRequest, TrustBaseSource, UpdateCause, UpdateFailure, UpdateOptions,
+    };
+
+    /// One GetTrustBase page (tag 39015, version 1). `status` 0 is OK.
+    fn page(
+        status: u64,
+        from: u64,
+        end: u64,
+        end_id: Option<[u8; 32]>,
+        entries: &[&TrustBaseEntry],
+        next: Option<u64>,
+    ) -> Vec<u8> {
+        let raw: Vec<Vec<u8>> = entries.iter().map(|e| e.to_cbor()).collect();
+        let refs: Vec<&[u8]> = raw.iter().map(Vec::as_slice).collect();
+        let id = end_id.map_or_else(encode_null, |i| encode_byte_string(&i));
+        let next = next.map_or_else(encode_null, encode_uint);
+        encode_tag(
+            39015,
+            &encode_array(&[
+                &encode_uint(1),
+                &encode_uint(7),
+                &encode_uint(status),
+                &encode_uint(from),
+                &encode_uint(end),
+                &id,
+                &encode_array(&refs),
+                &next,
+            ]),
+        )
+    }
+
+    /// Answers in order; once they are used up every request fails. Requests are recorded.
+    struct Scripted {
+        answers: RefCell<Vec<Vec<u8>>>,
+        seen: RefCell<Vec<TrustBaseRequest>>,
+        calls: Cell<usize>,
+    }
+
+    impl Scripted {
+        fn new(answers: Vec<Vec<u8>>) -> Self {
+            Scripted {
+                answers: RefCell::new(answers.into_iter().rev().collect()),
+                seen: RefCell::new(Vec::new()),
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl TrustBaseSource for Scripted {
+        fn get_trust_base_page(&self, r: &TrustBaseRequest) -> Result<Vec<u8>, SourceError> {
+            self.calls.set(self.calls.get() + 1);
+            self.seen.borrow_mut().push(r.clone());
+            self.answers
+                .borrow_mut()
+                .pop()
+                .ok_or_else(|| SourceError("gone".into()))
+        }
+    }
+
+    fn opts() -> UpdateOptions<'static> {
+        UpdateOptions::default()
+    }
+
+    fn src(s: &Scripted) -> [&dyn TrustBaseSource; 1] {
+        [s]
+    }
+
+    fn saved(wrote: bool) -> Flush {
+        Flush::Saved {
+            wrote,
+            diagnostics: vec![],
+        }
+    }
+
+    #[test]
+    fn fetches_the_entries_after_the_tip_and_saves_one_complete_bundle() {
+        let f = Fix::new();
+        let pin = f.pin(3);
+        let store = MemoryStore::new();
+        let (mut s, _) = open_on(&pin, &store);
+        let a = &f.w.a;
+        let source = Scripted::new(vec![page(
+            0,
+            4,
+            6,
+            Some(a[5].entry_id()),
+            &[&a[3], &a[4], &a[5]],
+            None,
+        )]);
+        let got = block_on(s.refresh(&src(&source), &opts())).unwrap();
+        assert_eq!(got.appended, 3);
+        assert_eq!(got.flush, saved(true));
+        assert_eq!(
+            source.seen.borrow()[0].from_epoch,
+            4,
+            "asks from the epoch after the held tip"
+        );
+        assert!(!s.is_dirty());
+        assert_eq!(store.get(&f.key(&pin)).unwrap(), f.bytes(6));
+    }
+
+    #[test]
+    fn a_source_with_nothing_newer_appends_nothing_and_writes_nothing() {
+        let f = Fix::new();
+        let pin = f.pin(3);
+        let store = MemoryStore::new();
+        let (mut s, _) = open_on(&pin, &store);
+        let source = Scripted::new(vec![page(3, 4, 3, Some(f.w.a[2].entry_id()), &[], None)]);
+        let got = block_on(s.refresh(&src(&source), &opts())).unwrap();
+        assert_eq!(got.appended, 0);
+        assert_eq!(got.flush, saved(false));
+        assert_eq!(store.get(&f.key(&pin)), None);
+        assert!(!s.is_dirty());
+    }
+
+    #[test]
+    fn the_valid_prefix_is_held_and_saved_when_a_later_page_fails() {
+        let f = Fix::new();
+        let pin = f.pin(3);
+        let store = MemoryStore::new();
+        let (mut s, _) = open_on(&pin, &store);
+        let a = &f.w.a;
+        // the first page announces the end at epoch 6 and carries epoch 4 only; every later request fails
+        let source = Scripted::new(vec![page(
+            0,
+            4,
+            6,
+            Some(a[5].entry_id()),
+            &[&a[3]],
+            Some(5),
+        )]);
+        let e = block_on(s.refresh(&src(&source), &opts())).unwrap_err();
+        let RefreshError::Update { error, flush } = e else {
+            panic!("expected an update failure, got {e:?}");
+        };
+        assert_eq!(error.failure, UpdateFailure::NoneServed);
+        assert_eq!(error.appended, 1);
+        assert_eq!(flush, saved(true));
+        assert_eq!(s.history().unwrap().latest().epoch, 4);
+        assert_eq!(store.get(&f.key(&pin)).unwrap(), f.bytes(4));
+    }
+
+    #[test]
+    fn an_entry_the_history_refuses_is_the_sources_fault_and_nothing_is_saved() {
+        let f = Fix::new();
+        let pin = f.pin(3);
+        let store = MemoryStore::new();
+        let (mut s, _) = open_on(&pin, &store);
+        // epoch 4 with an extra bad signature: structurally a page, refused by the history
+        let source = Scripted::new(vec![page(
+            0,
+            4,
+            4,
+            Some(f.w.f4bad.entry_id()),
+            &[&f.w.f4bad],
+            None,
+        )]);
+        let e = block_on(s.refresh(&src(&source), &opts())).unwrap_err();
+        let RefreshError::Update { error, flush } = e else {
+            panic!("expected an update failure");
+        };
+        assert_eq!(error.appended, 0);
+        assert!(
+            error
+                .causes
+                .iter()
+                .any(|c| matches!(c, UpdateCause::Refused { .. })),
+            "the refusal is recorded: {:?}",
+            error.causes
+        );
+        assert_eq!(flush, saved(false));
+        assert_eq!(s.history().unwrap().latest().epoch, 3);
+        assert!(!s.is_dirty());
+        assert_eq!(store.get(&f.key(&pin)), None);
+    }
+
+    #[test]
+    fn a_conflicted_session_is_refused_before_any_request() {
+        let f = Fix::new();
+        let pin = f.pin(2);
+        let store = MemoryStore::new();
+        let (mut s, _) = open_on(&pin, &store);
+        s.append(f.w.a[2].clone()).unwrap();
+        assert!(matches!(
+            s.append(f.w.f3.clone()),
+            Err(SessionError::Conflict(_))
+        ));
+        let source = Scripted::new(vec![]);
+        assert_eq!(
+            block_on(s.refresh(&src(&source), &opts())),
+            Err(RefreshError::Conflicted)
+        );
+        assert_eq!(source.calls.get(), 0, "no request on a conflicted session");
+        assert_eq!(store.get(&f.key(&pin)), None, "nothing written");
+    }
+
+    #[test]
+    fn a_longer_history_another_writer_saved_is_imported_by_the_save_not_overwritten() {
+        let f = Fix::new();
+        let pin = f.pin(3);
+        let store = MemoryStore::new();
+        let (mut s, _) = open_on(&pin, &store);
+        // another process saved epochs 1..5 after this one opened; this one fetches epoch 4 only
+        store.put(&f.key(&pin), &f.bytes(5));
+        let a = &f.w.a;
+        let source = Scripted::new(vec![page(0, 4, 4, Some(a[3].entry_id()), &[&a[3]], None)]);
+        let got = block_on(s.refresh(&src(&source), &opts())).unwrap();
+        assert_eq!(got.appended, 1);
+        assert_eq!(
+            got.flush,
+            saved(false),
+            "the store already holds everything held"
+        );
+        assert_eq!(s.history().unwrap().latest().epoch, 5);
+        assert_eq!(store.get(&f.key(&pin)).unwrap(), f.bytes(5));
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_written_leaves_the_history_held_dirty_and_the_save_pending() {
+        let f = Fix::new();
+        let pin = f.pin(3);
+        let store = MemoryStore::new();
+        let a = &f.w.a;
+        let source = Scripted::new(vec![page(0, 4, 4, Some(a[3].entry_id()), &[&a[3]], None)]);
+        // every write fails: the history is held, the save is pending
+        let (mut s, _) = open_on(&pin, FaultOnWrite(&store));
+        let got = block_on(s.refresh(&src(&source), &opts())).unwrap();
+        assert_eq!(got.appended, 1);
+        assert!(matches!(got.flush, Flush::Pending(_)), "{:?}", got.flush);
+        assert!(s.is_dirty(), "the history stays dirty for a later flush");
+        assert_eq!(s.history().unwrap().latest().epoch, 4);
+    }
+
+    /// Reads through; every write fails.
+    struct FaultOnWrite<'a>(&'a MemoryStore);
+    impl TrustBaseStore for FaultOnWrite<'_> {
+        async fn read(&self, k: &StoreKey, max: usize) -> Result<StoreRead, StoreError> {
+            self.0.read(k, max).await
+        }
+        async fn compare_and_swap(
+            &self,
+            _: &StoreKey,
+            _: Option<&Revision>,
+            _: &[u8],
+        ) -> Result<StoreCas, StoreError> {
+            Err(StoreError::Io("injected".into()))
+        }
+    }
+}
