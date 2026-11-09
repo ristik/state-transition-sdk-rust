@@ -42,12 +42,15 @@ pub const TRUST_BASE_V2_VERSION: u64 = 2;
 pub const MAX_MEMBERS: usize = 256;
 /// Bound on a node identifier in bytes.
 pub const MAX_NODE_ID_LEN: usize = 128;
+/// Bound on the signatures an entry may carry: its predecessor's members, at most [`MAX_MEMBERS`], however small the entry itself is (a 256-member
+/// committee hands over to 4 members with 256 signatures). A resource ceiling checked before the signatures are copied or verified.
+pub const MAX_ENTRY_SIGNATURES: usize = MAX_MEMBERS;
 /// Bound on one member's weight, so that the sum over [`MAX_MEMBERS`] cannot overflow.
 pub const MAX_WEIGHT: u64 = 1 << 40;
 /// Length of an entry identity and of a present state/change hash.
 pub const ID_LEN: usize = 32;
-/// Bound on the encoded size of one entry: 128 KiB. The largest valid entry (256 members with 128-byte node ids and the signatures of 256
-/// predecessors) is 95,365 bytes, 16 members need about 6 KiB.
+/// Bound on the encoded size of one entry: 128 KiB. A full entry (256 members with 128-byte ids and 256 predecessor signatures) is about
+/// 95,400 bytes; 16 members need at most about 6 KiB.
 pub const MAX_ENTRY_BYTES: usize = 128 << 10;
 
 /// Why an entry was refused.
@@ -297,10 +300,11 @@ impl TrustBaseEntry {
         if items[0].uint()? != TRUST_BASE_V2_VERSION {
             return Err(TrustBaseError::Encoding("record version is not 2"));
         }
-        let network_id = NetworkId::new(
-            u16::try_from(items[1].uint()?)
-                .map_err(|_| TrustBaseError::Encoding("network id out of range"))?,
-        )?;
+        let network = u16::try_from(items[1].uint()?)
+            .map_err(|_| TrustBaseError::Encoding("network id out of range"))?;
+        // network ids are 1..=0xffff; 0 is a well-formed number but not an entry (Go and JS refuse it too)
+        let network_id =
+            NetworkId::new(network).map_err(|_| TrustBaseError::Invalid("network id is zero"))?;
         let epoch = items[2].uint()?;
         let epoch_start = items[3].uint()?;
         let member_items = items[4].array(None)?;
@@ -338,10 +342,17 @@ impl TrustBaseEntry {
         let signatures = if items[9].is_null() {
             None
         } else {
-            let mut out = Vec::new();
-            for (k, v) in items[9].map()? {
+            let pairs = items[9].map()?;
+            if pairs.len() > MAX_ENTRY_SIGNATURES {
+                return Err(TrustBaseError::Encoding("too many signatures"));
+            }
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
                 out.push((String::from(k.text()?), v.bytes_value()?.to_vec()));
             }
+            // the wire order is canonical CBOR (shorter key first); the in-memory form is raw
+            // byte order, as for members. The re-encoding check below still pins the wire order.
+            out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             Some(out)
         };
         let entry = TrustBaseEntry {
@@ -363,92 +374,6 @@ impl TrustBaseEntry {
         Ok(entry)
     }
 
-    /// Parse the JSON form of an entry (bft-go-base `RootTrustBaseV2` JSON tags), meant for an
-    /// on-disk genesis file. Host only. An absent, `null` or empty hash is read as absent
-    /// (`null`, the one canonical form). Compare the result's identity with the deployment's pin
-    /// ([`TrustBaseHistory::from_genesis`](super::TrustBaseHistory::from_genesis)); a mismatch
-    /// means the file is not the pinned genesis.
-    #[cfg(feature = "std")]
-    pub fn from_json(input: &str) -> Result<Self, TrustBaseError> {
-        use serde_json::Value;
-        const MAX_JSON_BYTES: usize = 1 << 20;
-        let bad = TrustBaseError::Encoding;
-        if input.len() > MAX_JSON_BYTES {
-            return Err(bad("trust base JSON exceeds the size bound"));
-        }
-        let root: Value = serde_json::from_str(input).map_err(|_| bad("invalid JSON"))?;
-        let num = |v: &Value| -> Result<u64, TrustBaseError> {
-            match v {
-                Value::Number(n) => n.as_u64().ok_or(bad("not an unsigned integer")),
-                Value::String(s) => s.parse::<u64>().map_err(|_| bad("not an unsigned integer")),
-                _ => Err(bad("not an unsigned integer")),
-            }
-        };
-        let hex_bytes = |v: &Value| -> Result<Vec<u8>, TrustBaseError> {
-            match v {
-                Value::Null => Ok(Vec::new()),
-                Value::String(s) => {
-                    hex::decode(s.strip_prefix("0x").unwrap_or(s)).map_err(|_| bad("invalid hex"))
-                }
-                _ => Err(bad("not a hex string")),
-            }
-        };
-        if num(&root["version"])? != TRUST_BASE_V2_VERSION {
-            return Err(bad("record version is not 2"));
-        }
-        let network_id = NetworkId::new(
-            u16::try_from(num(&root["networkId"])?).map_err(|_| bad("network id out of range"))?,
-        )?;
-        let nodes = root["rootNodes"]
-            .as_array()
-            .ok_or(bad("rootNodes is not an array"))?;
-        if nodes.len() > MAX_MEMBERS {
-            return Err(bad("too many members"));
-        }
-        let mut members = Vec::with_capacity(nodes.len());
-        for n in nodes {
-            members.push(TrustBaseMember {
-                node_id: String::from(n["nodeId"].as_str().ok_or(bad("nodeId is not a string"))?),
-                signing_key: PublicKey::from_bytes(&hex_bytes(&n["sigKey"])?).map_err(|_| {
-                    TrustBaseError::Invalid("member key is not a valid compressed key")
-                })?,
-                weight: num(&n["stake"])?,
-            });
-        }
-        let opt_hash = |v: &Value| -> Result<OptionalHash, TrustBaseError> {
-            let b = hex_bytes(v)?;
-            Ok(if b.is_empty() { None } else { Some(b) })
-        };
-        let previous_entry_id: [u8; ID_LEN] = hex_bytes(&root["previousEntryId"])?
-            .try_into()
-            .map_err(|_| TrustBaseError::Invalid("previous entry id is not 32 bytes"))?;
-        let signatures = match &root["signatures"] {
-            Value::Null => None,
-            Value::Object(m) => {
-                let mut v = Vec::with_capacity(m.len());
-                for (k, s) in m {
-                    v.push((k.clone(), hex_bytes(s)?));
-                }
-                v.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-                Some(v)
-            }
-            _ => return Err(bad("signatures is not an object")),
-        };
-        let entry = TrustBaseEntry {
-            network_id,
-            epoch: num(&root["epoch"])?,
-            epoch_start: num(&root["epochStartRound"])?,
-            members,
-            quorum_threshold: num(&root["quorumThreshold"])?,
-            state_hash: opt_hash(&root["stateHash"])?,
-            change_record_hash: opt_hash(&root["changeRecordHash"])?,
-            previous_entry_id,
-            signatures,
-        };
-        entry.validate()?;
-        Ok(entry)
-    }
-
     /// Check the entry's structure, not its signatures: epoch, members (sorted by raw node
     /// id bytes, unique, valid keys, positive bounded weights), the exact threshold, hash
     /// lengths, and genesis (zero predecessor, null signatures) versus non-genesis
@@ -457,9 +382,9 @@ impl TrustBaseEntry {
         self.validate_inner(false)
     }
 
-    /// [`validate`](Self::validate), optionally admitting epoch 0. A real network's epochs
-    /// start at 1; epoch 0 appears only in test environments and conformance fixtures, which
-    /// can only enter a history through [`TrustBaseHistory::from_trusted_chain`].
+    /// [`validate`](Self::validate), optionally admitting epoch 0. A real network's epochs start at
+    /// 1; epoch 0 appears only in test environments and conformance fixtures, which can only enter
+    /// a history through [`TrustBaseHistory::from_trusted_chain`].
     pub(crate) fn validate_inner(&self, allow_epoch_zero: bool) -> Result<(), TrustBaseError> {
         let bad = TrustBaseError::Invalid;
         if self.epoch == 0 && !allow_epoch_zero {
@@ -569,6 +494,11 @@ impl TrustBaseEntry {
         data: &[u8],
         signatures: &[(String, Vec<u8>)],
     ) -> Result<(), TrustBaseError> {
+        if signatures.len() > MAX_ENTRY_SIGNATURES {
+            return Err(TrustBaseError::Signature(String::from(
+                "too many signatures",
+            )));
+        }
         let mut weight = 0u64;
         for (i, (node_id, sig)) in signatures.iter().enumerate() {
             if signatures[..i].iter().any(|(other, _)| other == node_id) {

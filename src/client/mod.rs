@@ -11,13 +11,13 @@ mod batch;
 mod consolidate;
 #[cfg(feature = "http")]
 mod http;
-mod trust_base;
 #[cfg(all(test, feature = "http"))]
 pub(crate) use http::conflict_error;
 #[cfg(feature = "http")]
 pub use http::{
-    HttpAggregatorClient, HttpError, SubmitOutcome, WaitOptions, WaitOutcome, WaitStats,
-    WaitedLookup, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT, DEFAULT_UNKNOWN_GRACE,
+    HttpAggregatorClient, HttpError, SdkVersionHeader, SubmitOutcome, WaitOptions, WaitOutcome,
+    WaitStats, WaitedLookup, DEFAULT_MAX_REQUEST_TIMEOUT, DEFAULT_PREFERRED_WAIT,
+    DEFAULT_UNKNOWN_GRACE, MAX_TRUST_BASE_RESPONSE_BYTES, SDK_VERSION,
 };
 
 pub use batch::{
@@ -34,16 +34,11 @@ pub use consolidate::{
 };
 #[cfg(feature = "std")]
 pub use consolidate::{SystemClock, ThreadedExecutor};
-pub use trust_base::{
-    update_trust_base, TrustBaseSource, UpdateError, UpdateLimits, UpdateOutcome,
-};
-#[cfg(feature = "std")]
-pub use trust_base::{verify_token_updating, UpdatePolicy, VerifyUpdateError};
 
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::api::bft::TrustBaseHistory;
+use crate::api::bft::RootTrustBase;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::{CertificationData, NetworkId, NonInclusionProof, StateId};
 use crate::crypto::signer::Signer;
@@ -133,18 +128,6 @@ pub enum ClientError<E> {
     Aggregator(E),
     /// The assembled token failed verification.
     Verification(VerificationError),
-    /// A certificate names a trust base epoch the source did not have within the budget
-    /// (`*_updating` flows only). Retry later; nothing is wrong with the token.
-    EpochUnavailable {
-        /// The latest epoch the history holds.
-        held: u64,
-        /// The epoch the certificate names.
-        wanted: u64,
-        /// Attempts made.
-        attempts: u32,
-    },
-    /// Fetching or authenticating trust base entries failed (`*_updating` flows only).
-    TrustBaseUpdate(UpdateError<E>),
 }
 
 impl<E> From<Error> for ClientError<E> {
@@ -164,15 +147,6 @@ impl<E: fmt::Display> fmt::Display for ClientError<E> {
             ClientError::Build(e) => write!(f, "build error: {e}"),
             ClientError::Aggregator(e) => write!(f, "aggregator error: {e}"),
             ClientError::Verification(e) => write!(f, "verification error: {e}"),
-            ClientError::EpochUnavailable {
-                held,
-                wanted,
-                attempts,
-            } => write!(
-                f,
-                "trust base epoch {wanted} not available (holding {held}) after {attempts} attempts"
-            ),
-            ClientError::TrustBaseUpdate(e) => write!(f, "trust base update: {e}"),
         }
     }
 }
@@ -192,14 +166,10 @@ pub fn certification_data_for(
 }
 
 /// Mint a new token and return the verified [`Token`].
-///
-/// Verification uses `history` as it is: a certificate of an epoch the history does not hold is
-/// [`ClientError::Verification`] with [`VerificationError::UnknownTrustEpoch`]. Use
-/// [`mint_updating`] to fetch the missing entries.
 #[allow(clippy::too_many_arguments)]
 pub fn mint<A: AggregatorClient>(
     aggregator: &A,
-    history: &TrustBaseHistory,
+    trust_base: &RootTrustBase,
     network: NetworkId,
     recipient: &impl Predicate,
     token_type: TokenType,
@@ -208,101 +178,10 @@ pub fn mint<A: AggregatorClient>(
     justification: Option<Vec<u8>>,
     expires_at: Option<u64>,
 ) -> Result<Token, ClientError<A::Error>> {
-    mint_with(
-        aggregator,
-        history.network_id(),
-        network,
-        recipient,
-        token_type,
-        salt,
-        data,
-        justification,
-        expires_at,
-        |t| Ok(t.verify(history)?),
-    )
-}
-
-/// [`mint`] that, when the minted token's certificate names a trust base epoch the history does
-/// not hold yet (a freshly certified proof can come from a newer epoch than the one the
-/// application shipped with), fetches the missing entries from the aggregator, appends them to
-/// `history` in place (verified from the latest held entry) and verifies again, within the
-/// bounds of `policy` (see [`verify_token_updating`]). Host only.
-///
-/// On [`ClientError::EpochUnavailable`] the token **is certified** (the request was submitted
-/// and its proof received) but not yet verifiable here: the token is not returned. Recover it
-/// later by fetching the proof again for the same transaction (`get_inclusion_proof` with the
-/// state id) and verifying with [`verify_token_updating`] once the epoch is available.
-#[cfg(feature = "std")]
-#[allow(clippy::too_many_arguments)]
-pub fn mint_updating<A>(
-    aggregator: &A,
-    history: &mut TrustBaseHistory,
-    policy: &UpdatePolicy,
-    network: NetworkId,
-    recipient: &impl Predicate,
-    token_type: TokenType,
-    salt: TokenSalt,
-    data: Option<Vec<u8>>,
-    justification: Option<Vec<u8>>,
-    expires_at: Option<u64>,
-) -> Result<Token, ClientError<<A as AggregatorClient>::Error>>
-where
-    A: AggregatorClient + TrustBaseSource<Error = <A as AggregatorClient>::Error>,
-{
-    let history_network = history.network_id();
-    mint_with(
-        aggregator,
-        history_network,
-        network,
-        recipient,
-        token_type,
-        salt,
-        data,
-        justification,
-        expires_at,
-        |t| verify_updating(t, history, aggregator, policy),
-    )
-}
-
-#[cfg(feature = "std")]
-fn verify_updating<A>(
-    token: &Token,
-    history: &mut TrustBaseHistory,
-    aggregator: &A,
-    policy: &UpdatePolicy,
-) -> Result<(), ClientError<<A as AggregatorClient>::Error>>
-where
-    A: AggregatorClient + TrustBaseSource<Error = <A as AggregatorClient>::Error>,
-{
-    verify_token_updating(token, history, aggregator, policy).map_err(|e| match e {
-        VerifyUpdateError::Verification(v) => ClientError::Verification(v),
-        VerifyUpdateError::EpochUnavailable {
-            held,
-            wanted,
-            attempts,
-        } => ClientError::EpochUnavailable {
-            held,
-            wanted,
-            attempts,
-        },
-        VerifyUpdateError::Update(u) => ClientError::TrustBaseUpdate(u),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn mint_with<A: AggregatorClient>(
-    aggregator: &A,
-    history_network: NetworkId,
-    network: NetworkId,
-    recipient: &impl Predicate,
-    token_type: TokenType,
-    salt: TokenSalt,
-    data: Option<Vec<u8>>,
-    justification: Option<Vec<u8>>,
-    expires_at: Option<u64>,
-    verify: impl FnOnce(&Token) -> Result<(), ClientError<A::Error>>,
-) -> Result<Token, ClientError<A::Error>> {
-    if network != history_network {
+    trust_base
+        .validate()
+        .map_err(VerificationError::InvalidTrustBase)?;
+    if network != trust_base.network_id {
         return Err(VerificationError::NetworkMismatch.into());
     }
     let transaction = MintTransaction::create(
@@ -330,82 +209,26 @@ fn mint_with<A: AggregatorClient>(
         CertifiedMintTransaction::new(transaction, proof),
         Vec::new(),
     );
-    verify(&token)?;
+    token.verify(trust_base)?;
     Ok(token)
 }
 
 /// Transfer `token` to `recipient`, authorised by `signer` (the current
 /// owner's key), and return the verified successor [`Token`].
-///
-/// Verification uses `history` as it is (see [`mint`]); [`transfer_updating`] fetches missing
-/// trust base entries.
 #[allow(clippy::too_many_arguments)]
 pub fn transfer<A: AggregatorClient>(
     aggregator: &A,
-    history: &TrustBaseHistory,
+    trust_base: &RootTrustBase,
     token: &Token,
     recipient: &impl Predicate,
     signer: &impl Signer,
     state_mask: StateMask,
     data: Option<Vec<u8>>,
     expires_at: Option<u64>,
-) -> Result<Token, ClientError<A::Error>> {
-    transfer_with(
-        aggregator,
-        token,
-        recipient,
-        signer,
-        state_mask,
-        data,
-        expires_at,
-        |t| Ok(t.verify(history)?),
-    )
-}
-
-/// [`transfer`] that updates `history` in place when the input token or the successor names a
-/// trust base epoch it does not hold (see [`mint_updating`]). Host only.
-#[cfg(feature = "std")]
-#[allow(clippy::too_many_arguments)]
-pub fn transfer_updating<A>(
-    aggregator: &A,
-    history: &mut TrustBaseHistory,
-    policy: &UpdatePolicy,
-    token: &Token,
-    recipient: &impl Predicate,
-    signer: &impl Signer,
-    state_mask: StateMask,
-    data: Option<Vec<u8>>,
-    expires_at: Option<u64>,
-) -> Result<Token, ClientError<<A as AggregatorClient>::Error>>
-where
-    A: AggregatorClient + TrustBaseSource<Error = <A as AggregatorClient>::Error>,
-{
-    transfer_with(
-        aggregator,
-        token,
-        recipient,
-        signer,
-        state_mask,
-        data,
-        expires_at,
-        |t| verify_updating(t, history, aggregator, policy),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn transfer_with<A: AggregatorClient>(
-    aggregator: &A,
-    token: &Token,
-    recipient: &impl Predicate,
-    signer: &impl Signer,
-    state_mask: StateMask,
-    data: Option<Vec<u8>>,
-    expires_at: Option<u64>,
-    mut verify: impl FnMut(&Token) -> Result<(), ClientError<A::Error>>,
 ) -> Result<Token, ClientError<A::Error>> {
     // Reject an untrusted or stale input before causing any aggregator side
     // effect. The successor is verified again below as defense in depth.
-    verify(token)?;
+    token.verify(trust_base)?;
     let (source_state_hash, lock_script) = token.latest_state();
     let transaction = TransferTransaction::new(
         source_state_hash,
@@ -428,7 +251,7 @@ fn transfer_with<A: AggregatorClient>(
     let mut transactions = token.transactions().to_vec();
     transactions.push(CertifiedTransferTransaction::new(transaction, proof));
     let next = Token::new(token.genesis().clone(), transactions);
-    verify(&next)?;
+    next.verify(trust_base)?;
     Ok(next)
 }
 
@@ -479,25 +302,23 @@ mod tests {
             ))
             .unwrap(),
         );
-        let history = TrustBaseHistory::from_genesis(
-            crate::api::bft::TrustBaseEntry::genesis(
-                NetworkId::MAINNET,
-                1,
-                0,
-                alloc::vec![crate::api::bft::TrustBaseMember::new(
-                    "NODE",
-                    recipient.public_key().clone(),
-                    1,
-                )],
-            ),
-            None,
-        )
-        .unwrap();
+        let trust_base = RootTrustBase::new(
+            1,
+            NetworkId::MAINNET,
+            0,
+            0,
+            alloc::vec![crate::api::bft::root_trust_base::RootTrustBaseNodeInfo {
+                node_id: "NODE".into(),
+                signing_key: recipient.public_key().clone(),
+                stake: 1,
+            }],
+            1,
+        );
 
         // Fetching the proof fails in the mock, so the flow stops there.
         let err = mint(
             &agg,
-            &history,
+            &trust_base,
             NetworkId::MAINNET,
             &recipient,
             TokenType::new([0u8; 32]),

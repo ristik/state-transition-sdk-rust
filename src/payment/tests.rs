@@ -16,7 +16,7 @@ use super::{
     SplitOutputPayload, SplitTokenRequest, TokenSplit,
 };
 use crate::api::bft::{
-    InputRecord, ShardId, ShardTreeCertificate, TrustBaseEntry, TrustBaseHistory, TrustBaseMember,
+    InputRecord, RootTrustBase, RootTrustBaseNodeInfo, ShardId, ShardTreeCertificate,
     UnicityCertificate, UnicitySeal, UnicityTreeCertificate,
 };
 use crate::api::calculate_leaf_value;
@@ -53,17 +53,16 @@ fn sig_pred(s: &Secp256k1Signer) -> EncodedPredicate {
     SignaturePredicate::new(s.public_key()).to_encoded()
 }
 
-fn node_info(s: &Secp256k1Signer, id: &str) -> TrustBaseMember {
-    TrustBaseMember::new(id.to_string(), s.public_key(), 1)
+fn node_info(s: &Secp256k1Signer, id: &str) -> RootTrustBaseNodeInfo {
+    RootTrustBaseNodeInfo {
+        node_id: id.to_string(),
+        signing_key: s.public_key(),
+        stake: 1,
+    }
 }
 
-/// One-entry history (epoch 1, from round 0) whose only validator is `node`.
-fn trust_base(node: &Secp256k1Signer) -> TrustBaseHistory {
-    TrustBaseHistory::from_genesis(
-        TrustBaseEntry::genesis(NetworkId::LOCAL, 1, 0, vec![node_info(node, "NODE")]),
-        None,
-    )
-    .unwrap()
+fn trust_base(node: &Secp256k1Signer) -> RootTrustBase {
+    RootTrustBase::new(0, NetworkId::LOCAL, 0, 0, vec![node_info(node, "NODE")], 1)
 }
 
 fn empty_shard() -> ShardId {
@@ -74,7 +73,7 @@ fn mk_seal(hash: Vec<u8>, signatures: Vec<(String, Vec<u8>)>) -> UnicitySeal {
     UnicitySeal {
         network_id: NetworkId::LOCAL,
         root_chain_round_number: 1,
-        epoch: 1,
+        epoch: 0,
         timestamp: REFERENCE_TIME,
         previous_hash: None,
         hash,
@@ -108,14 +107,14 @@ fn signed_uc(node: &Secp256k1Signer, root: [u8; 32]) -> UnicityCertificate {
         technical_record_hash: Some(vec![6; 32]),
         shard_configuration_hash: vec![0u8; 32],
         shard_tree_certificate: ShardTreeCertificate {
+            empty_as_null: false,
             shard: empty_shard(),
             sibling_hash_list: Vec::new(),
-            empty_as_null: false,
         },
         unicity_tree_certificate: UnicityTreeCertificate {
+            empty_as_null: false,
             partition_identifier: crate::api::AGGREGATION_PARTITION_ID,
             steps: Vec::new(),
-            empty_as_null: false,
         },
         unicity_seal: mk_seal(vec![0u8; 32], Vec::new()),
     };
@@ -270,7 +269,7 @@ fn authorize_test_payment(
 
 /// Build the full positive scenario, returning everything needed by the tests.
 struct Scenario {
-    tb: TrustBaseHistory,
+    tb: RootTrustBase,
     node: Secp256k1Signer,
     source: Token,
     alice: Secp256k1Signer,
@@ -883,7 +882,7 @@ fn wrapped_source(node: &Secp256k1Signer, owner: &Secp256k1Signer, amount: u32) 
 /// Split `source` (owned by `owner`) and mint every output with exactly the
 /// bytes the split returned.
 fn split_and_mint(
-    tb: &TrustBaseHistory,
+    tb: &RootTrustBase,
     node: &Secp256k1Signer,
     owner: &Secp256k1Signer,
     source: &Token,

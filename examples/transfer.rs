@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use unicity_token::api::bft::TrustBaseHistory;
+use unicity_token::api::bft::RootTrustBase;
 use unicity_token::cbor::encode_text_string;
 use unicity_token::client::{self, HttpAggregatorClient};
 use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
@@ -19,27 +19,25 @@ use unicity_token::predicate::builtin::SignaturePredicate;
 use unicity_token::transaction::ids::{StateMask, TokenSalt, TokenType};
 use unicity_token::transaction::Token;
 
+const DEFAULT_GATEWAY: &str = "https://gateway.testnet2.unicity.network/";
+const DEFAULT_TRUSTBASE: &str = "bft-trustbase.testnet2.json";
+
 /// Build an aggregator client and its trust base from `e2e/.env`.
-fn load() -> (HttpAggregatorClient, TrustBaseHistory) {
+fn load() -> (HttpAggregatorClient, RootTrustBase) {
     dotenvy::from_path("e2e/.env").ok();
 
-    let gateway = std::env::var("UNICITY_GATEWAY").unwrap_or_else(|_| {
-        panic!("set UNICITY_GATEWAY to your deployment's aggregator URL (testnet2's V1 trust base is not supported by this major version)")
-    });
+    let gateway = std::env::var("UNICITY_GATEWAY").unwrap_or_else(|_| DEFAULT_GATEWAY.to_string());
     let trustbase =
-        std::env::var("UNICITY_TRUSTBASE").unwrap_or_else(|_| {
-        panic!("set UNICITY_TRUSTBASE to your deployment's V2 genesis (JSON or CBOR) or release bundle; e2e/dev has a development fixture")
-    });
+        std::env::var("UNICITY_TRUSTBASE").unwrap_or_else(|_| DEFAULT_TRUSTBASE.to_string());
     let trustbase_path = if Path::new(&trustbase).is_absolute() {
         trustbase
     } else {
         format!("e2e/{trustbase}")
     };
 
-    let trust_base = TrustBaseHistory::from_file(
-        &std::fs::read(&trustbase_path)
+    let trust_base = RootTrustBase::from_json(
+        &std::fs::read_to_string(&trustbase_path)
             .unwrap_or_else(|e| panic!("read trust base {trustbase_path}: {e}")),
-        None,
     )
     .expect("parse trust base");
 
@@ -60,7 +58,7 @@ fn main() {
     let alice_token = client::mint(
         &aggregator,
         &trust_base,
-        trust_base.network_id(),
+        trust_base.network_id,
         &SignaturePredicate::new(alice.public_key()),
         TokenType::random().expect("token type"),
         TokenSalt::random().expect("salt"),

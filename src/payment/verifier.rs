@@ -137,7 +137,7 @@ impl TokenDataVerifier for PaymentDataVerifier {
 /// validated payment carried by `token`.
 pub fn verify_payment_token(
     token: &Token,
-    history: &crate::api::bft::TrustBaseHistory,
+    trust_base: &(impl crate::verify::TrustAnchor + ?Sized),
     registry: &MintJustificationRegistry,
     decode_payment_data: PaymentDataDecoder,
 ) -> Result<PaymentAssetCollection, VerificationError> {
@@ -145,7 +145,7 @@ pub fn verify_payment_token(
         require_token_data_verifier: true,
         ..VerificationPolicy::default()
     };
-    verify_token_with_policy(token, history, registry, policy)?;
+    verify_token_with_policy(token, trust_base, registry, policy)?;
     let bytes = token
         .genesis()
         .transaction()

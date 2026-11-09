@@ -18,7 +18,6 @@ use super::asset::PaymentAssetCollection;
 use super::commitment::split_output_commitment;
 use super::manifest::SplitManifest;
 use super::verifier::{verify_payment_token, PaymentDataDecoder};
-use crate::api::bft::TrustBaseHistory;
 use crate::api::network_id::NetworkId;
 use crate::error::Error;
 use crate::predicate::builtin::BurnPredicate;
@@ -28,6 +27,7 @@ use crate::rsmst::RsmstInclusionProof;
 use crate::transaction::ids::{TokenId, TokenSalt, TokenType};
 use crate::transaction::{Token, TransferTransaction};
 use crate::verify::MintJustificationRegistry;
+use crate::verify::TrustAnchor;
 use crate::VerificationError;
 
 /// The payment payload of one split output: the assets it is allocated plus the
@@ -213,14 +213,14 @@ impl TokenSplit {
     /// means, use [`TokenSplit::split_unchecked`].
     pub fn split(
         token: &Token,
-        history: &TrustBaseHistory,
+        trust_base: &(impl TrustAnchor + ?Sized),
         registry: &MintJustificationRegistry,
         decode_payment_data: PaymentDataDecoder,
         requests: Vec<SplitTokenRequest>,
         burn_state_mask: Option<[u8; 32]>,
         burn_expires_at: Option<u64>,
     ) -> Result<Split, SplitError> {
-        let assets = verify_payment_token(token, history, registry, decode_payment_data)
+        let assets = verify_payment_token(token, trust_base, registry, decode_payment_data)
             .map_err(SplitError::Verification)?;
         Self::build_split(
             token,

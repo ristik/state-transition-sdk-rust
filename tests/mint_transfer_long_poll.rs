@@ -9,12 +9,12 @@
 #![cfg(feature = "http")]
 
 mod common;
-mod trust_support;
 
 use std::time::Duration;
 
 use common::*;
-use unicity_token::api::bft::TrustBaseHistory;
+use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
+use unicity_token::api::bft::RootTrustBase;
 use unicity_token::api::NetworkId;
 use unicity_token::client::{self, ClientError, HttpAggregatorClient};
 use unicity_token::crypto::signature::PublicKey;
@@ -25,10 +25,21 @@ use unicity_token::transaction::Token;
 
 const FIXTURE: &str = include_str!("vectors/transition_flow.json");
 
-fn trust_base() -> TrustBaseHistory {
+fn trust_base() -> RootTrustBase {
     let pk = PublicKey::from_bytes(&hex::decode(field(FIXTURE, "aggregatorPublicKey")).unwrap())
         .unwrap();
-    trust_support::single_node_history(pk)
+    RootTrustBase::new(
+        0,
+        NetworkId::LOCAL,
+        0,
+        0,
+        vec![RootTrustBaseNodeInfo {
+            node_id: "NODE".into(),
+            signing_key: pk,
+            stake: 1,
+        }],
+        1,
+    )
 }
 
 fn obj(proof: &str, status: &str, echo: Option<u64>) -> String {
