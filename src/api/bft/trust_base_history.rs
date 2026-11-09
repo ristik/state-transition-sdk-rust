@@ -158,13 +158,14 @@ pub struct TrustBaseHistory {
 }
 
 impl TrustBaseHistory {
-    /// A history of a trusted chain: the entries are taken as shipped, their structure and links are checked but **no signature is verified** (a
-    /// bundle shipped with the application, a conformance fixture); anything received from a peer goes through [`append`](Self::append) or the
-    /// bundle loaders, which verify the predecessor's quorum. Unlike every other entry point it admits epoch 0 (test environments and conformance
-    /// fixtures, never a real network).
+    /// A history of a trusted chain: the entries are taken as shipped, their structure and links
+    /// are checked but **no signature is verified** (a bundle shipped with the application, a
+    /// conformance fixture); anything received from a peer goes through [`append`](Self::append) or
+    /// the bundle loaders, which verify the predecessor's quorum. Unlike every other entry point it
+    /// admits epoch 0 (test environments and conformance fixtures, never a real network).
     ///
-    /// **Test-only**: compiled for this crate's tests and under the `test-fixtures` feature, never in a release build. It must not load a cache or
-    /// an embedded release history.
+    /// **Test-only**: compiled for this crate's tests and under the `test-fixtures` feature, never
+    /// in a release build. It must not load a cache or an embedded release history.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn from_trusted_chain(entries: Vec<TrustBaseEntry>) -> Result<Self, HistoryError> {
         let mut it = entries.into_iter();

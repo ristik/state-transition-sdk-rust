@@ -123,3 +123,7 @@ if snapshot.network_id().id() != checkpoint.network_id
 `NonInclusionProof::for_state` only records which state ID a proof was requested for. It is request bookkeeping, not evidence.
 
 `HttpError::StateIncluded` reports the server's claim that the state is included. The claim is unauthenticated; request an inclusion proof and verify it.
+
+## 6. Trusted chains (tests only)
+
+`TrustBaseHistory::from_trusted_chain` builds a history without verifying signatures (epoch 0 is admitted for fixtures). It exists only for this crate's tests and the `test-fixtures` feature, never in a release build, and never loads a cache or an embedded release history. Peer-supplied entries go through `append` or the bundle loaders.

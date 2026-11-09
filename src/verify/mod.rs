@@ -369,10 +369,12 @@ fn verify_unicity_certificate(
     verify_certificate_of_partition(seals, uc, AGGREGATION_PARTITION_ID, policy)
 }
 
-/// Verify a unicity certificate on its own for the unicity-tree partition `partition`: structure, the recomputed tree root against the seal hash,
-/// and the seal under the entry of its epoch. Everything about the claims a proof makes on top of the certificate (state path, shard membership,
-/// reference time) is the caller's. Token verification uses the fixed [`AGGREGATION_PARTITION_ID`]; this entry point is for tools that verify a
-/// certificate of another partition and for conformance tests (the B1 seal vectors).
+/// Verify a unicity certificate on its own for the unicity-tree partition `partition`: structure,
+/// the recomputed tree root against the seal hash, and the seal under the entry of its epoch.
+/// Everything about the claims a proof makes on top of the certificate (state path, shard
+/// membership, reference time) is the caller's. Token verification uses the fixed
+/// [`AGGREGATION_PARTITION_ID`]; this entry point is for tools that verify a certificate of another
+/// partition and for conformance tests (the B1 seal vectors).
 pub fn verify_certificate_of_partition(
     seals: &mut SealSession<'_>,
     uc: &UnicityCertificate,
