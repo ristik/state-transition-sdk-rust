@@ -167,17 +167,15 @@ impl PartitionView {
     /// one and every pinned configuration hash must match. Pins are part of the
     /// resulting view's [`identity`](AuthenticatedView::identity).
     ///
-    /// The authority is the history entry of the enclosing seal's epoch, including the end of
-    /// that epoch when its successor is held.
+    /// Not enforced: the end boundary of the authority's epoch (needs
+    /// authenticated history, which a fixed-authority session does not have).
     pub fn authenticate(
         &self,
         enclosing: &UnicityCertificate,
         pins: Option<&PartitionTopology>,
         authority: &mut SealSession<'_>,
     ) -> Result<AuthenticatedView, PartitionViewError> {
-        let authority_identity = authority
-            .authority_identity(&enclosing.unicity_seal)
-            .map_err(PartitionViewError::Seal)?;
+        let authority_identity = authority.authority_identity();
         self.authenticate_with(enclosing, pins, authority, authority_identity)
     }
 

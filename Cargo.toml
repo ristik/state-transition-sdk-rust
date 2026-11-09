@@ -1,6 +1,6 @@
 [package]
 name = "unicity-token"
-version = "4.0.0"
+version = "3.0.1"
 edition = "2021"
 rust-version = "1.81"
 description = "Clean-room Rust SDK for the Unicity token state-transition protocol, binary-compatible with the Java and TypeScript SDKs. no_std-first, zkVM/WASM friendly."
@@ -28,6 +28,8 @@ test-fixtures = ["alloc"]
 # client adds transaction construction, signing, and the mint/transfer flow
 # over a caller-supplied AggregatorClient transport.
 client = ["alloc"]
+# file-cache adds the optional on-disk TrustBaseStore (host only; not part of the core).
+file-cache = ["std"]
 # http adds a blocking JSON-RPC AggregatorClient for talking to a live
 # aggregator/gateway (host only; pulls in a TLS HTTP stack).
 http = ["std", "client", "dep:ureq", "dep:url", "dep:zeroize"]

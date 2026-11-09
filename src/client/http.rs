@@ -4,7 +4,8 @@
 //! This is the synchronous transport for production use: it speaks the same
 //! JSON-RPC protocol as the reference SDKs (methods `certification_request`,
 //! `get_inclusion_proof.v2`, and `get_non_inclusion_proof.v1`), authenticates
-//! with an optional `X-API-Key`, and
+//! with an optional `X-API-Key`, announces itself with `X-SDK-Version: rust/<crate version>` (owner §43: so the update window can be
+//! measured; see [`SdkVersionHeader`]), and
 //! **polls** `get_inclusion_proof` until the aggregator has certified the state
 //! (so the [`mint`](super::mint)/[`transfer`](super::transfer) helpers work
 //! unchanged against live infrastructure).
@@ -20,7 +21,8 @@ use std::io::Read;
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
-use crate::api::bft::{TrustBaseHistory, TrustBasePage, TrustBaseRequest};
+use crate::api::bft::trust_base_update::{SourceError, TrustBaseRequest, TrustBaseSource};
+use crate::api::bft::RootTrustBase;
 use crate::api::certification_request::CertificationRequest;
 use crate::api::inclusion_proof::InclusionProof;
 use crate::api::{
@@ -31,8 +33,8 @@ use crate::cbor::Decoder;
 use super::{
     rpc_code, AggregatorClient, BatchAggregatorClient, BatchFailure, BatchProof, BatchRequest,
     InclusionProofBatch, MembershipStatus, NonInclusionAggregatorClient, RequestOptions, StateRoot,
-    TrustBaseSource, WaitRequest, WaitedBatch, WaitedFailure, DEFAULT_WAIT_MARGIN_MS,
-    MAX_BATCH_STATE_IDS, MAX_WAIT_MS, UNCLASSIFIED,
+    WaitRequest, WaitedBatch, WaitedFailure, DEFAULT_WAIT_MARGIN_MS, MAX_BATCH_STATE_IDS,
+    MAX_WAIT_MS, UNCLASSIFIED,
 };
 use crate::consolidation::PartitionView;
 
@@ -43,7 +45,6 @@ pub use wait::{
 
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
-const MAX_TRUST_BASE_PAGE_BYTES: usize = crate::api::bft::trust_base_fetch::MAX_PAGE_BYTES;
 const MAX_PROOF_HEX_CHARS: usize = MAX_RESPONSE_BODY_BYTES - 1024;
 // Shared proof-lookup states. JSON-RPC 2.0 reserves -32000..-32099 for
 // implementation-defined server errors; the Unicity aggregators keep
@@ -219,14 +220,14 @@ impl std::error::Error for HttpError {
 }
 
 /// The error for a proof that certifies other data than the submitted request: authenticated
-/// (`StateCertifiedWithOtherData`) only when the proof verifies under `history` for
+/// (`StateCertifiedWithOtherData`) only when the proof verifies under `trust_base` for
 /// `state_id`, at the reference time the proof itself commits to.
 pub(crate) fn conflict_error(
     proof: &InclusionProof,
     state_id: &StateId,
-    history: &TrustBaseHistory,
+    trust_base: &RootTrustBase,
 ) -> HttpError {
-    match proof.verify_for(state_id, proof.reference_time, history) {
+    match proof.verify_for(state_id, proof.reference_time, trust_base) {
         Ok(()) => HttpError::StateCertifiedWithOtherData,
         Err(_) => HttpError::ProofOfOtherData,
     }
@@ -243,6 +244,22 @@ pub struct HttpAggregatorClient {
     long_poll: bool,
     unknown_grace: u32,
     allow_insecure_http: bool,
+    sdk_version: Option<String>,
+}
+
+/// The value of the `X-SDK-Version` header this crate sends: `rust/<crate version>`.
+pub const SDK_VERSION: &str = concat!("rust/", env!("CARGO_PKG_VERSION"));
+
+/// What the client sends as `X-SDK-Version` on every aggregator request (the aggregator never reads it; it is for measuring which SDK versions are in use).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SdkVersionHeader {
+    /// `rust/<crate version>` ([`SDK_VERSION`]). The default.
+    #[default]
+    Default,
+    /// No header.
+    Off,
+    /// This value (printable ASCII, not empty).
+    Custom(String),
 }
 
 #[derive(Clone)]
@@ -290,6 +307,7 @@ impl HttpAggregatorClient {
             long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: false,
+            sdk_version: Some(SDK_VERSION.to_string()),
         }
     }
 
@@ -315,7 +333,26 @@ impl HttpAggregatorClient {
             long_poll: true,
             unknown_grace: DEFAULT_UNKNOWN_GRACE,
             allow_insecure_http: true,
+            sdk_version: Some(SDK_VERSION.to_string()),
         }
+    }
+
+    /// Choose the `X-SDK-Version` header sent on every request (default: `rust/<crate version>`). A custom value has to be non-empty printable ASCII,
+    /// otherwise this is an [`HttpError::Configuration`].
+    pub fn with_sdk_version_header(mut self, header: SdkVersionHeader) -> Result<Self, HttpError> {
+        self.sdk_version = match header {
+            SdkVersionHeader::Default => Some(SDK_VERSION.to_string()),
+            SdkVersionHeader::Off => None,
+            SdkVersionHeader::Custom(value) => {
+                if value.is_empty() || !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                    return Err(HttpError::Configuration(
+                        "the SDK version header must be non-empty printable ASCII".to_string(),
+                    ));
+                }
+                Some(value)
+            }
+        };
+        Ok(self)
     }
 
     /// Set the API key sent as `X-API-Key` on certification requests.
@@ -455,7 +492,7 @@ impl HttpAggregatorClient {
     }
 
     /// Like [`submit_and_wait`](Self::submit_and_wait), but a proof for other data is
-    /// authenticated under `history` before it is believed: only a proof that verifies
+    /// authenticated under `trust_base` before it is believed: only a proof that verifies
     /// gives [`HttpError::StateCertifiedWithOtherData`] (the race is lost, not retryable);
     /// a proof that does not verify gives the unauthenticated
     /// [`HttpError::ProofOfOtherData`].
@@ -463,10 +500,10 @@ impl HttpAggregatorClient {
         &self,
         data: &CertificationData,
         max_resubmits: u32,
-        history: &TrustBaseHistory,
+        trust_base: &RootTrustBase,
     ) -> Result<InclusionProof, HttpError> {
         self.submit_and_wait_with(data, max_resubmits, |proof, state_id| {
-            conflict_error(proof, state_id, history)
+            conflict_error(proof, state_id, trust_base)
         })
     }
 
@@ -678,6 +715,9 @@ impl HttpAggregatorClient {
         if let Some(t) = timeout {
             request = request.timeout(t);
         }
+        if let Some(version) = &self.sdk_version {
+            request = request.set("X-SDK-Version", version);
+        }
         for (k, v) in headers {
             request = request.set(k, v);
         }
@@ -742,6 +782,66 @@ impl HttpAggregatorClient {
                 other => other,
             })
         })
+    }
+}
+
+/// Largest GetTrustBase response body read from an aggregator: a full page (1 MiB) plus slack.
+pub const MAX_TRUST_BASE_RESPONSE_BYTES: usize = (1 << 20) + 1024;
+
+/// The aggregator's trust base endpoint, `GET /api/v1/trustbases?from=E&maxEntries=N[&snapshotEnd=E&snapshotEntryId=0x..]` on its origin
+/// (whatever path the JSON-RPC URL has): the only delivery that exists. The body is the tag-39015 response, size-capped; nothing in it is
+/// trusted (see [`TrustBaseSource`]). Same redirect, HTTPS and API-key rules as the JSON-RPC calls.
+impl TrustBaseSource for HttpAggregatorClient {
+    fn get_trust_base_page(&self, request: &TrustBaseRequest) -> Result<Vec<u8>, SourceError> {
+        let mut url = self
+            .validate_endpoint()
+            .map_err(|e| SourceError(e.to_string()))?;
+        url.set_path("/api/v1/trustbases");
+        url.set_fragment(None);
+        {
+            let mut q = url.query_pairs_mut();
+            q.clear();
+            q.append_pair("from", &request.from_epoch.to_string());
+            q.append_pair("maxEntries", &request.max_entries.to_string());
+            if let Some(s) = &request.snapshot {
+                q.append_pair("snapshotEnd", &s.end.to_string());
+                q.append_pair("snapshotEntryId", &format!("0x{}", hex::encode(s.entry_id)));
+            }
+        }
+        let mut call = self
+            .agent
+            .get(url.as_str())
+            .set("Accept", "application/cbor");
+        if let Some(key) = &self.api_key {
+            call = call.set("X-API-Key", key.expose());
+        }
+        match call.call() {
+            Ok(response) => {
+                // redirects are off; a 3xx is a refusal, not a page
+                if !(200..300).contains(&response.status()) {
+                    return Err(SourceError(format!(
+                        "HTTP {} from the trust base endpoint",
+                        response.status()
+                    )));
+                }
+                let mut bytes = Vec::new();
+                response
+                    .into_reader()
+                    .take(MAX_TRUST_BASE_RESPONSE_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| SourceError(format!("reading the trust base response: {e}")))?;
+                if bytes.len() > MAX_TRUST_BASE_RESPONSE_BYTES {
+                    return Err(SourceError(
+                        "the trust base response exceeds the size cap".to_string(),
+                    ));
+                }
+                Ok(bytes)
+            }
+            Err(ureq::Error::Status(status, _)) => Err(SourceError(format!(
+                "HTTP {status} from the trust base endpoint"
+            ))),
+            Err(e) => Err(SourceError(format!("trust base request failed: {e}"))),
+        }
     }
 }
 
@@ -1377,72 +1477,6 @@ fn parse_waited_ms(value: &serde_json::Value) -> Result<u64, String> {
         .as_u64()
         .filter(|v| *v <= MAX_WAIT_MS)
         .ok_or_else(|| "malformed waitedMs".to_string())
-}
-
-/// `GET /api/v1/trustbases` on the aggregator's origin: plain HTTP, no JSON-RPC; the body is
-/// the raw `GetTrustBase` response (`application/cbor`, tag 39015). The status is inside the
-/// body. The server speaks for one network, so the request names none.
-impl TrustBaseSource for HttpAggregatorClient {
-    type Error = HttpError;
-
-    fn get_trust_bases(&self, request: &TrustBaseRequest) -> Result<TrustBasePage, HttpError> {
-        let mut url = self.validate_endpoint()?;
-        url.set_path("/api/v1/trustbases");
-        url.set_fragment(None);
-        {
-            let mut q = url.query_pairs_mut();
-            q.clear().append_pair("from", &request.from.to_string());
-            if let Some(to) = request.to {
-                q.append_pair("to", &to.to_string());
-            }
-            if let Some((end, id)) = &request.snapshot {
-                q.append_pair("snapshotEnd", &end.to_string());
-                q.append_pair("snapshotEntryId", &format!("0x{}", hex::encode(id)));
-            }
-            q.append_pair("maxEntries", &request.max_entries.to_string());
-        }
-        let mut call = self
-            .agent
-            .get(url.as_str())
-            .set("Accept", "application/cbor");
-        if let Some(key) = &self.api_key {
-            call = call.set("X-API-Key", key.expose());
-        }
-        let response = match call.call() {
-            Ok(r) => r,
-            Err(ureq::Error::Status(status, r)) => {
-                let body = read_response_raw(r, MAX_ERROR_BODY_BYTES).map_err(raw_to_http)?;
-                return Err(HttpError::Http { status, body });
-            }
-            Err(e) => return Err(raw_to_http(transport_failure(&e))),
-        };
-        if response.status() != 200 {
-            let status = response.status();
-            let body = read_response_raw(response, MAX_ERROR_BODY_BYTES).map_err(raw_to_http)?;
-            return Err(HttpError::Http { status, body });
-        }
-        if !response.header("Content-Type").is_some_and(|c| {
-            c.trim()
-                .to_ascii_lowercase()
-                .starts_with("application/cbor")
-        }) {
-            return Err(HttpError::Decode(
-                "GetTrustBase response is not application/cbor".to_string(),
-            ));
-        }
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .take(MAX_TRUST_BASE_PAGE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| raw_to_http(io_failure(&e)))?;
-        if bytes.len() > MAX_TRUST_BASE_PAGE_BYTES {
-            return Err(HttpError::ResponseTooLarge {
-                limit: MAX_TRUST_BASE_PAGE_BYTES,
-            });
-        }
-        TrustBasePage::from_cbor(&bytes).map_err(|e| HttpError::Decode(e.to_string()))
-    }
 }
 
 impl NonInclusionAggregatorClient for HttpAggregatorClient {

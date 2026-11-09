@@ -1,52 +1,43 @@
-//! Operation-scoped authentication of unicity seals against the trust base history.
+//! Operation-scoped authentication of unicity seals.
 //!
-//! A [`SealSession`] binds one [`TrustBaseHistory`] (the authorities) to a small, bounded
-//! memo of *successful* quorum-signature checks. Every seal is judged by the entry of its own
-//! epoch (`seal.epoch`), whatever the latest epoch is: a token certified long ago verifies with
-//! no age limit as long as the history holds the entry of that epoch. Tokens whose history
-//! shares a seal (for example after proof consolidation), or whose nested proofs repeat one,
-//! pay for the signature work once per session.
+//! A [`SealSession`] binds one authority (a [`RootTrustBase`], or a [`TrustBaseHistory`]
+//! that selects the entry of each seal's epoch) to a small,
+//! bounded memo of *successful* quorum-signature checks. Tokens whose history
+//! shares a seal (for example after proof consolidation), or whose nested
+//! proofs repeat one, pay for the signature work once per session.
 //!
-//! The seal rule is upstream's, in the bridge verifier and bft-core `b1ref` as well: the epoch's
-//! entry must exist and contain the seal's root round (`start <= r`, and `r < next start` when
-//! the successor is held; the newest epoch is open-ended until its successor is known). Each
-//! supplied signature is judged alone: a signer that is not a member of the entry, and a
-//! signature that is not exactly 65 canonical bytes `r || s || v` (low s, `v` in 0..=3) that
-//! recovers to the member's key, contribute zero and never fail the seal; the weights of the
-//! valid signatures have to reach the entry's threshold (`floor(2W/3)+1`). A trust-base ENTRY's
-//! witnesses are a different object and stay strict (`TrustBaseEntry::verify_successor`).
+//! The memo only ever skips the quorum signature check of a seal whose complete
+//! encoding (signatures included) has already passed that check under the same
+//! trust base. Every other rule - unicity-tree path, shard path, network,
+//! reference times, predicates - is evaluated by the caller each time.
+//! Failures are never remembered, and a different signature witness for the
+//! same unsigned seal is a different key, so it can not reuse a verdict.
 //!
-//! The memo only ever skips the quorum signature check of a seal whose complete encoding
-//! (signatures included) has already passed under the same entry (its identity is part of the
-//! key). Every other rule - unicity-tree path, shard path, network, reference times,
-//! predicates - is evaluated by the caller each time. Failures are never remembered, and a
-//! different signature witness for the same unsigned seal is a different key, so it can not
-//! reuse a verdict.
+//! The memo key is a SHA-256 digest of the length-delimited complete seal
+//! encoding, so its size is bounded regardless of how many signatures an
+//! attacker-supplied seal carries. The session owns its authority by
+//! reference, hence a verdict can never be applied under another trust base.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-use crate::api::bft::trust_base_entry::TrustBaseEntry;
-use crate::api::bft::{TrustBaseHistory, UnicityCertificate, UnicitySeal};
-use crate::api::NetworkId;
+use crate::api::bft::{RootTrustBase, TrustBaseEntry, TrustBaseHistory, UnicitySeal};
 use crate::crypto::hash::{DataHasher, HashAlgorithm};
-use crate::crypto::signature::Signature;
-use crate::fifo_index::FifoIndex;
+use crate::crypto::signature::{PublicKey, Signature};
 
 use super::VerificationError;
+pub use crate::api::bft::unicity_seal::MAX_SEAL_SIGNATURES;
+use crate::api::bft::UnicityCertificate;
+use crate::fifo_index::FifoIndex;
 
 /// Default number of successful seals remembered by a session.
 pub const DEFAULT_SEAL_MEMO_CAPACITY: usize = 64;
-
-/// The most signatures a seal may carry: a resource ceiling equal to the most members an entry may have (256), counting unknown and bad extras too.
-/// It is not the bridge's 16-signature profile, which stays with the B1 verifier.
-pub const MAX_SEAL_SIGNATURES: usize = 256;
 
 /// Earliest plausible seal timestamp (2023-04-20), as in the reference
 /// implementation's seal sanity check.
 const GENESIS_TIME: u64 = 1_681_971_084;
 
-const MEMO_DOMAIN: &[u8] = b"unicity-token/seal-memo/v2";
-const AUTHORITY_DOMAIN: &[u8] = b"unicity-token/authority/v2";
+const MEMO_DOMAIN: &[u8] = b"unicity-token/seal-memo/v1";
 
 /// Counters of the signature work a session performed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,8 +58,8 @@ pub struct SealStats {
 
 /// Authenticates unicity seals against a trusted authority.
 pub trait SealAuthenticator {
-    /// Succeeds only for a seal authenticated by the verifier's authority: network, epoch,
-    /// position and quorum signatures.
+    /// Succeeds only for a seal authenticated by the verifier's authority:
+    /// network, epoch, position and quorum signatures.
     fn authenticate_seal(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError>;
 
     /// [`authenticate_seal`](Self::authenticate_seal) under an immutable caller
@@ -89,41 +80,85 @@ pub trait SealAuthenticator {
     }
 }
 
-/// One operation's seal authentication state: a trust base history and a bounded memo.
+/// The authority a seal session judges seals by.
+#[derive(Debug, Clone, Copy)]
+pub enum Authority<'a> {
+    /// One trust base for every seal (the seal's epoch has to be the trust base's).
+    Single(&'a RootTrustBase),
+    /// A history of signed trust base entries: each seal is judged by the entry of its own
+    /// epoch, by weight.
+    History(&'a TrustBaseHistory),
+}
+
+/// Something verification can be anchored in: a [`RootTrustBase`] or a [`TrustBaseHistory`].
+pub trait TrustAnchor {
+    /// The authority this anchor stands for.
+    fn authority(&self) -> Authority<'_>;
+}
+
+impl TrustAnchor for RootTrustBase {
+    fn authority(&self) -> Authority<'_> {
+        Authority::Single(self)
+    }
+}
+
+impl TrustAnchor for TrustBaseHistory {
+    fn authority(&self) -> Authority<'_> {
+        Authority::History(self)
+    }
+}
+
+impl Authority<'_> {
+    /// Structural soundness of the authority (a trust base is checked; history entries were
+    /// validated when they entered the history).
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        match self {
+            Authority::Single(tb) => tb.validate(),
+            Authority::History(_) => Ok(()),
+        }
+    }
+
+    /// The network the authority belongs to.
+    pub fn network_id(&self) -> crate::api::NetworkId {
+        match self {
+            Authority::Single(tb) => tb.network_id,
+            Authority::History(h) => h.network_id(),
+        }
+    }
+}
+
+/// One operation's seal authentication state: an authority and a bounded memo.
 #[derive(Debug)]
 pub struct SealSession<'a> {
-    history: &'a TrustBaseHistory,
-    // digests of (entry identity, complete seal encoding), bounded FIFO with O(1) indexed lookup
+    authority: Authority<'a>,
+    validated: bool,
+    // digests of complete seal encodings, bounded FIFO with O(1) indexed lookup
     memo: FifoIndex<[u8; 32]>,
-    // certificates whose body (and seal) already passed under (policy, their epoch's entry)
+    // certificates whose body (and seal) already passed under (policy, this authority)
     bodies: FifoIndex<([u8; 32], UnicityCertificate)>,
     stats: SealStats,
 }
 
 impl<'a> SealSession<'a> {
     /// Session with the [`DEFAULT_SEAL_MEMO_CAPACITY`].
-    pub fn new(history: &'a TrustBaseHistory) -> Self {
-        Self::with_capacity(history, DEFAULT_SEAL_MEMO_CAPACITY)
+    pub fn new(anchor: &'a (impl TrustAnchor + ?Sized)) -> Self {
+        Self::with_capacity(anchor, DEFAULT_SEAL_MEMO_CAPACITY)
     }
 
     /// Session remembering at most `capacity` seals; `0` disables reuse.
-    pub fn with_capacity(history: &'a TrustBaseHistory, capacity: usize) -> Self {
+    pub fn with_capacity(anchor: &'a (impl TrustAnchor + ?Sized), capacity: usize) -> Self {
         Self {
-            history,
+            authority: anchor.authority(),
+            validated: false,
             memo: FifoIndex::new(capacity),
             bodies: FifoIndex::new(capacity),
             stats: SealStats::default(),
         }
     }
 
-    /// The trust base history of this session.
-    pub fn history(&self) -> &'a TrustBaseHistory {
-        self.history
-    }
-
-    /// The network of the history.
-    pub fn network_id(&self) -> NetworkId {
-        self.history.network_id()
+    /// The authority of this session.
+    pub fn authority(&self) -> Authority<'a> {
+        self.authority
     }
 
     /// Signature work performed so far.
@@ -157,64 +192,66 @@ impl<'a> SealSession<'a> {
             .insert(uc_fingerprint(uc, policy), (*policy, uc.clone()));
     }
 
-    /// The entry that judges `seal`: the history's entry of `seal.epoch`, provided the seal's
-    /// network and root round belong to it. The newest epoch is open-ended until its successor
-    /// is held.
-    ///
-    /// * network of another history: `SealNetworkMismatch`;
-    /// * epoch above the latest held one: `UnknownTrustEpoch` (retryable after an update);
-    /// * epoch below the first held one: `EpochBeforeGenesis`;
-    /// * round before the epoch's start: `SealBeforeEpochStart`;
-    /// * round at or after the successor's start: `SealAfterAuthorityEnd`.
-    pub fn authority_for(
-        &self,
-        seal: &UnicitySeal,
-    ) -> Result<&'a TrustBaseEntry, VerificationError> {
-        let history: &'a TrustBaseHistory = self.history;
-        if seal.network_id != history.network_id() {
-            return Err(VerificationError::SealNetworkMismatch);
-        }
-        let entry = match history.get(seal.epoch) {
-            Some(e) => e,
-            None if seal.epoch > history.latest().epoch => {
-                return Err(VerificationError::UnknownTrustEpoch { epoch: seal.epoch })
+    pub(crate) fn ensure_trust_base(&mut self) -> Result<(), VerificationError> {
+        if !self.validated {
+            // history entries are validated when they enter the history
+            if let Authority::Single(tb) = self.authority {
+                tb.validate().map_err(VerificationError::InvalidTrustBase)?;
             }
-            None => return Err(VerificationError::EpochBeforeGenesis),
+            self.validated = true;
+        }
+        Ok(())
+    }
+
+    /// Content identity of the authority: a digest over the trust base's
+    /// version, network, epoch, epoch start, threshold and every validator
+    /// (id, key, stake). Two sessions with the same identity judge seals alike.
+    pub fn authority_identity(&self) -> [u8; 32] {
+        let h = match self.authority {
+            Authority::Single(tb) => {
+                let mut h = DataHasher::new(HashAlgorithm::Sha256)
+                    .expect("sha256")
+                    .update(b"unicity-token/authority/v1")
+                    .update(&tb.version.to_be_bytes())
+                    .update(&tb.network_id.id().to_be_bytes())
+                    .update(&tb.epoch.to_be_bytes())
+                    .update(&tb.epoch_start_round.to_be_bytes())
+                    .update(&tb.quorum_threshold.to_be_bytes())
+                    .update(&(tb.root_nodes.len() as u64).to_be_bytes());
+                for n in &tb.root_nodes {
+                    h = h
+                        .update(&(n.node_id.len() as u64).to_be_bytes())
+                        .update(n.node_id.as_bytes())
+                        .update(n.signing_key.as_bytes())
+                        .update(&n.stake.to_be_bytes());
+                }
+                h
+            }
+            // a history is append-only: its genesis and its latest entry name every entry
+            Authority::History(history) => DataHasher::new(HashAlgorithm::Sha256)
+                .expect("sha256")
+                .update(b"unicity-token/authority/history/v1")
+                .update(&history.network_id().id().to_be_bytes())
+                .update(&history.genesis_id())
+                .update(&history.latest().epoch.to_be_bytes())
+                .update(&history.latest().entry_id()),
         };
-        if seal.root_chain_round_number < entry.epoch_start {
-            return Err(VerificationError::SealBeforeEpochStart);
-        }
-        if let Some(next) = history.get(seal.epoch.saturating_add(1)) {
-            if seal.root_chain_round_number >= next.epoch_start {
-                return Err(VerificationError::SealAfterAuthorityEnd);
-            }
-        }
-        Ok(entry)
-    }
-
-    /// Identity of the authority that judges `seal`: a digest over the identity of its epoch's
-    /// entry. Two sessions with the same history entry judge seals alike.
-    pub fn authority_identity(&self, seal: &UnicitySeal) -> Result<[u8; 32], VerificationError> {
-        let entry = self.authority_for(seal)?;
-        let digest = DataHasher::new(HashAlgorithm::Sha256)
-            .expect("sha256")
-            .update(AUTHORITY_DOMAIN)
-            .update(&entry.entry_id())
-            .finalize();
         let mut id = [0u8; 32];
-        id.copy_from_slice(digest.data());
-        Ok(id)
+        id.copy_from_slice(h.finalize().data());
+        id
     }
 
-    /// Memo key of the signature verdict: the entry identity and the complete seal encoding.
-    /// The verdict "this exact seal carries a quorum of valid signatures of *this entry*" does
-    /// not depend on any caller policy, so one verification serves every policy.
-    fn key(entry: &TrustBaseEntry, seal: &UnicitySeal) -> [u8; 32] {
+    /// Memo key of the signature verdict: the complete seal encoding. The verdict
+    /// "this exact seal carries a quorum of valid signatures of *this session's*
+    /// authority" does not depend on any caller policy, so one verification serves
+    /// every policy; all policy-dependent rules (network, epoch, position, body,
+    /// pins) are evaluated by the callers each time or kept in the policy-keyed
+    /// body memo.
+    fn key(seal: &UnicitySeal) -> [u8; 32] {
         let encoded = seal.to_cbor();
         let digest = DataHasher::new(HashAlgorithm::Sha256)
             .expect("sha256")
             .update(MEMO_DOMAIN)
-            .update(&entry.entry_id())
             .update(&(encoded.len() as u64).to_be_bytes())
             .update(&encoded)
             .finalize();
@@ -223,45 +260,50 @@ impl<'a> SealSession<'a> {
         key
     }
 
-    /// Authenticate `seal`: the authority of its epoch (see
-    /// [`authority_for`](Self::authority_for)) and the weighted quorum of valid signatures,
-    /// reusing an earlier success of the identical complete seal under the same entry.
+    /// Check the quorum of valid, distinct root-node signatures over `seal`,
+    /// reusing an earlier success of the identical complete seal.
     ///
-    /// This is only the signature part; callers check the unicity-tree root and everything
-    /// else themselves. It does not run the structural seal checks of `authenticate_seal`, so
-    /// the signature ceiling applies on the authenticate path only (the seal's size bounds the
-    /// work here).
+    /// This is only the signature part; callers check network, unicity-tree
+    /// root and everything else themselves.
     pub fn verify_quorum(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
         self.verify_quorum_under(seal, &[0; 32])
     }
 
-    /// [`verify_quorum`](Self::verify_quorum) for a caller that evaluates under an immutable
-    /// `policy`. The signature verdict is a property of the complete seal and its entry only,
-    /// so it is shared by all policies; the policy-dependent verdicts of whole certificates
-    /// stay namespaced by it in the body memo.
+    /// [`verify_quorum`](Self::verify_quorum) for a caller that evaluates under an
+    /// immutable `policy`. The signature verdict is a property of the complete
+    /// seal and this session's authority only, so it is shared by all policies
+    /// (the total number of native quorum verifications is the number of distinct
+    /// seals); the policy-dependent verdicts of whole certificates stay namespaced
+    /// by it in the body memo.
     pub fn verify_quorum_under(
         &mut self,
         seal: &UnicitySeal,
         _policy: &[u8; 32],
     ) -> Result<(), VerificationError> {
-        let entry = self.authority_for(seal)?;
-        let key = Self::key(entry, seal);
+        // a resource ceiling, before the seal is hashed or any signature is looked at
+        if seal.signatures.len() > MAX_SEAL_SIGNATURES {
+            return Err(VerificationError::SealMalformed);
+        }
+        // an unsafe authority (no validators, zero threshold, ...) never yields
+        // or caches a success
+        self.ensure_trust_base()?;
+        let key = Self::key(seal);
         let hash = u64::from_le_bytes(key[..8].try_into().expect("8 bytes"));
         if self.memo.contains(hash, |k| k == &key) {
             self.stats.memo_hits += 1;
             return Ok(());
         }
         self.stats.quorum_checks += 1;
-        quorum_met(entry, seal)?;
+        quorum_met_for(self.authority, seal, &mut QuorumWork::default())?;
         self.memo.insert(hash, key);
         Ok(())
     }
 }
 
 impl SealAuthenticator for SealSession<'_> {
-    /// The strict policy used when a seal becomes the master of derived certificates: the
-    /// seal must have a sane shape and belong to its epoch's entry, then pass the (memoized)
-    /// quorum check.
+    /// The strict policy used when a seal becomes the master of derived
+    /// certificates: the seal must be of the trust base's network and epoch and
+    /// not predate the epoch, then pass the (memoized) quorum check.
     fn authenticate_seal(&mut self, seal: &UnicitySeal) -> Result<(), VerificationError> {
         self.authenticate_seal_under(seal, &[0; 32])
     }
@@ -271,7 +313,33 @@ impl SealAuthenticator for SealSession<'_> {
         seal: &UnicitySeal,
         policy: &[u8; 32],
     ) -> Result<(), VerificationError> {
-        check_seal_shape(seal)?;
+        self.ensure_trust_base()?;
+        match self.authority {
+            Authority::Single(tb) => {
+                // the quorum rule implemented here counts signers; a stake-weighted
+                // authority would be judged by another rule, so refuse it explicitly,
+                // before any memo lookup or signature work
+                if tb.root_nodes.iter().any(|n| n.stake != 1) {
+                    return Err(VerificationError::UnsupportedAuthority);
+                }
+                check_seal_shape(seal)?;
+                if seal.network_id != tb.network_id {
+                    return Err(VerificationError::SealNetworkMismatch);
+                }
+                if seal.epoch != tb.epoch {
+                    return Err(VerificationError::SealEpochMismatch);
+                }
+                if seal.root_chain_round_number < tb.epoch_start_round {
+                    return Err(VerificationError::SealBeforeEpochStart);
+                }
+            }
+            Authority::History(history) => {
+                check_seal_shape(seal)?;
+                if seal.network_id != history.network_id() {
+                    return Err(VerificationError::SealNetworkMismatch);
+                }
+            }
+        }
         self.verify_quorum_under(seal, policy)
     }
 }
@@ -312,47 +380,151 @@ pub(crate) fn check_seal_shape(seal: &UnicitySeal) -> Result<(), VerificationErr
     Ok(())
 }
 
-/// The seal quorum rule over `seal` under `entry` (upstream's): every supplied signature is
-/// judged alone and counts its member's weight only if it is valid; an unknown signer, a
-/// repeated signer's later copy, and any signature that is malformed or does not recover to the
-/// member's key count zero. The weights, summed with checked arithmetic, have to reach the
-/// entry's threshold. A repeated signer ID cannot occur in a canonical seal (a duplicate map
-/// key); it is refused as structure.
-fn quorum_met(entry: &TrustBaseEntry, seal: &UnicitySeal) -> Result<(), VerificationError> {
-    let seal_hash = seal.calculate_hash();
-    let mut weight = 0u64;
-    let mut seen: Vec<&str> = Vec::with_capacity(seal.signatures.len());
-    for (node_id, signature) in &seal.signatures {
-        if seen.contains(&node_id.as_str()) {
-            return Err(VerificationError::SealMalformed);
+/// Signature work of one quorum check (the metric of its early exit).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct QuorumWork {
+    /// Signature encodings parsed.
+    pub decodes: u64,
+    /// ECDSA verifications executed.
+    pub verifications: u64,
+}
+
+/// The weight of distinct, valid root-node signatures over the seal hash must reach the
+/// threshold: one unit per signer for a [`RootTrustBase`] (upstream's rule, unchanged), the
+/// member's weight for a trust base entry.
+///
+/// This is the one quorum implementation of the crate. It stops as soon as the
+/// threshold is reached: later signatures are neither decoded nor verified, which
+/// cannot change the verdict because the weight only grows. Entries that do not
+/// count - a repeated node id, an unknown node, a key already counted, an
+/// undecodable or invalid signature - are skipped exactly as before.
+#[cfg(test)]
+fn quorum_met(trust_base: &RootTrustBase, seal: &UnicitySeal) -> Result<(), VerificationError> {
+    quorum_met_counted(trust_base, seal, &mut QuorumWork::default())
+}
+
+pub(crate) fn quorum_met_counted(
+    trust_base: &RootTrustBase,
+    seal: &UnicitySeal,
+    work: &mut QuorumWork,
+) -> Result<(), VerificationError> {
+    quorum_weight_met(
+        trust_base.quorum_threshold,
+        |id| trust_base.signing_key(id).map(|k| (k, 1)),
+        seal,
+        work,
+    )
+}
+
+/// The quorum of the authority for this seal: a single trust base, or the history entry of the
+/// seal's epoch (`UnknownTrustEpoch` when none is held).
+pub(crate) fn quorum_met_for(
+    authority: Authority<'_>,
+    seal: &UnicitySeal,
+    work: &mut QuorumWork,
+) -> Result<(), VerificationError> {
+    match authority {
+        Authority::Single(tb) => quorum_met_counted(tb, seal, work),
+        Authority::History(history) => {
+            let entry = entry_for_seal(history, seal)?;
+            quorum_weight_met(
+                entry.quorum_threshold,
+                |id| entry.member(id).map(|m| (&m.signing_key, m.weight)),
+                seal,
+                work,
+            )
         }
-        seen.push(node_id.as_str());
-        let Some(member) = entry.member(node_id) else {
+    }
+}
+
+/// The history entry that judges `seal`: the one of the seal's own epoch, and the seal's round
+/// has to lie inside that epoch - not before its start, and not at or after the start of the
+/// next held epoch. An epoch above the held tip is `UnknownTrustEpoch` (retryable: a later
+/// fetch can supply it); an epoch below the genesis can never be supplied, so it is the final
+/// `SealBeforeEpochStart` and triggers no fetch.
+pub(crate) fn entry_for_seal<'h>(
+    history: &'h TrustBaseHistory,
+    seal: &UnicitySeal,
+) -> Result<&'h TrustBaseEntry, VerificationError> {
+    let Some(entry) = history.get(seal.epoch) else {
+        return Err(if seal.epoch < history.genesis().epoch {
+            VerificationError::SealBeforeEpochStart
+        } else {
+            VerificationError::UnknownTrustEpoch { epoch: seal.epoch }
+        });
+    };
+    if seal.root_chain_round_number < entry.epoch_start {
+        return Err(VerificationError::SealBeforeEpochStart);
+    }
+    if let Some(next) = seal.epoch.checked_add(1).and_then(|e| history.get(e)) {
+        if seal.root_chain_round_number >= next.epoch_start {
+            return Err(VerificationError::SealEpochMismatch);
+        }
+    }
+    Ok(entry)
+}
+
+fn quorum_weight_met<'k>(
+    threshold: u64,
+    member: impl Fn(&str) -> Option<(&'k PublicKey, u64)>,
+    seal: &UnicitySeal,
+    work: &mut QuorumWork,
+) -> Result<(), VerificationError> {
+    if threshold == 0 {
+        return Ok(());
+    }
+    let seal_hash = seal.calculate_hash();
+    let mut counted: BTreeSet<&str> = BTreeSet::new();
+    let mut counted_keys = Vec::new();
+    let mut weight = 0u64;
+    for (node_id, signature) in &seal.signatures {
+        if counted.contains(node_id.as_str()) {
+            continue;
+        }
+        let Some((key, w)) = member(node_id) else {
             continue;
         };
-        let valid = Signature::decode(signature)
-            .is_ok_and(|sig| sig.verify(seal_hash.data(), &member.signing_key));
-        if valid {
-            weight = weight
-                .checked_add(member.weight)
-                .ok_or(VerificationError::QuorumNotMet)?;
+        if counted_keys.contains(&key) {
+            continue;
+        }
+        work.decodes += 1;
+        let Ok(sig) = Signature::decode(signature) else {
+            continue;
+        };
+        work.verifications += 1;
+        if sig.verify(seal_hash.data(), key) {
+            counted.insert(node_id.as_str());
+            counted_keys.push(key);
+            weight = weight.saturating_add(w);
+            if weight >= threshold {
+                return Ok(());
+            }
         }
     }
-    if weight < entry.quorum_threshold {
-        return Err(VerificationError::QuorumNotMet);
-    }
-    Ok(())
+    Err(VerificationError::QuorumNotMet)
 }
 
 #[cfg(all(test, feature = "client"))]
 mod tests {
     use super::*;
-    use crate::api::bft::{TrustBaseEntry, TrustBaseMember};
-    use crate::crypto::hash::HashAlgorithm;
+    use crate::api::bft::root_trust_base::RootTrustBaseNodeInfo;
+    use crate::api::NetworkId;
+    use crate::crypto::hash::{DataHash, HashAlgorithm};
     use crate::crypto::signer::{Secp256k1Signer, Signer};
     use alloc::format;
     use alloc::string::String;
     use alloc::vec;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+    }
 
     fn signers(n: usize) -> Vec<Secp256k1Signer> {
         (0..n)
@@ -360,19 +532,23 @@ mod tests {
             .collect()
     }
 
-    /// A one-entry history, epoch 1 from round 1, validator `n{i}` with weight `weights[i]`.
-    fn history(signers: &[Secp256k1Signer], weights: &[u64]) -> TrustBaseHistory {
-        let members = signers
-            .iter()
-            .zip(weights)
-            .enumerate()
-            .map(|(i, (s, w))| TrustBaseMember::new(format!("n{i}"), s.public_key(), *w))
-            .collect();
-        TrustBaseHistory::from_genesis(
-            TrustBaseEntry::genesis(NetworkId::LOCAL, 1, 1, members),
-            None,
+    fn trust_base(signers: &[Secp256k1Signer], threshold: u64) -> RootTrustBase {
+        RootTrustBase::new(
+            1,
+            NetworkId::LOCAL,
+            1,
+            1,
+            signers
+                .iter()
+                .enumerate()
+                .map(|(i, s)| RootTrustBaseNodeInfo {
+                    node_id: format!("n{i}"),
+                    signing_key: s.public_key(),
+                    stake: 1,
+                })
+                .collect(),
+            threshold,
         )
-        .unwrap()
     }
 
     fn seal_with(signatures: Vec<(String, Vec<u8>)>) -> UnicitySeal {
@@ -388,126 +564,237 @@ mod tests {
     }
 
     fn sign(signer: &Secp256k1Signer, seal: &UnicitySeal) -> Vec<u8> {
-        let digest = seal.calculate_hash();
+        let digest: DataHash = seal.calculate_hash();
         assert_eq!(digest.algorithm(), HashAlgorithm::Sha256);
         signer.sign(&digest).encode().to_vec()
     }
 
-    fn signed_by(signers: &[Secp256k1Signer], who: &[usize]) -> UnicitySeal {
+    /// The previous implementation: scans every signature (the reference model).
+    fn reference(trust_base: &RootTrustBase, seal: &UnicitySeal) -> (bool, u64) {
+        let seal_hash = seal.calculate_hash();
+        let mut counted: BTreeSet<&str> = BTreeSet::new();
+        let mut keys = Vec::new();
+        let mut verifications = 0;
+        for (node_id, signature) in &seal.signatures {
+            if counted.contains(node_id.as_str()) {
+                continue;
+            }
+            let Some(key) = trust_base.signing_key(node_id) else {
+                continue;
+            };
+            if keys.contains(&key) {
+                continue;
+            }
+            let Ok(sig) = Signature::decode(signature) else {
+                continue;
+            };
+            verifications += 1;
+            if sig.verify(seal_hash.data(), key) {
+                counted.insert(node_id.as_str());
+                keys.push(key);
+            }
+        }
+        (
+            counted.len() as u64 >= trust_base.quorum_threshold,
+            verifications,
+        )
+    }
+
+    fn verdict(tb: &RootTrustBase, seal: &UnicitySeal) -> (bool, QuorumWork) {
+        let mut work = QuorumWork::default();
+        let ok = quorum_met_counted(tb, seal, &mut work).is_ok();
+        (ok, work)
+    }
+
+    /// The signature verdict is a property of the complete seal and the session's
+    /// authority: one native verification per distinct seal, whatever the policy that
+    /// asks; a different witness, a failure and another authority are never covered.
+    #[test]
+    fn signature_verdicts_are_shared_across_policies_but_nothing_looser() {
+        let signers = signers(4);
+        let tb = trust_base(&signers, 3);
         let mut seal = seal_with(Vec::new());
-        seal.signatures = who
-            .iter()
-            .map(|&i| (format!("n{i}"), sign(&signers[i], &seal)))
+        seal.signatures = (0..3)
+            .map(|i| (format!("n{i}"), sign(&signers[i], &seal)))
             .collect();
-        seal
-    }
 
-    #[test]
-    fn a_weighted_quorum_counts_weights_not_signers() {
-        let s = signers(3);
-        // weights 98, 1, 1: the threshold is floor(200/3)+1 = 67
-        let h = history(&s, &[98, 1, 1]);
-        assert_eq!(h.latest().quorum_threshold, 67);
-        assert_eq!(
-            SealSession::new(&h).verify_quorum(&signed_by(&s, &[0])),
-            Ok(())
-        );
-        assert_eq!(
-            SealSession::new(&h).verify_quorum(&signed_by(&s, &[1, 2])),
-            Err(VerificationError::QuorumNotMet)
-        );
-    }
+        let mut session = SealSession::new(&tb);
+        let (p1, p2) = ([1u8; 32], [2u8; 32]);
+        session.verify_quorum(&seal).unwrap(); // zero policy: input evidence
+        session.verify_quorum_under(&seal, &p1).unwrap(); // a view / direct target
+        session.verify_quorum_under(&seal, &p2).unwrap();
+        let s = session.stats();
+        assert_eq!((s.quorum_checks, s.memo_hits), (1, 2));
+        assert_eq!(session.authenticate_seal_under(&seal, &p1), Ok(()));
+        assert_eq!(session.stats().quorum_checks, 1);
 
-    #[test]
-    fn the_seal_rule_counts_valid_signatures_and_ignores_the_rest() {
-        let s = signers(4);
-        let h = history(&s, &[1, 1, 1, 1]); // threshold 3
-        let good = signed_by(&s, &[0, 1, 2]);
-        assert_eq!(SealSession::new(&h).verify_quorum(&good), Ok(()));
-
-        // a bad signature beside a quorum counts zero and does not fail the seal
-        let mut bad_extra = signed_by(&s, &[0, 1, 2, 3]);
-        bad_extra.signatures[3].1[5] ^= 1;
-        assert_eq!(SealSession::new(&h).verify_quorum(&bad_extra), Ok(()));
-        // ... and makes up for nothing: two valid plus a bad one is a signer short
-        let mut short = signed_by(&s, &[0, 1, 3]);
-        short.signatures[2].1[5] ^= 1;
-        assert_eq!(
-            SealSession::new(&h).verify_quorum(&short),
-            Err(VerificationError::QuorumNotMet)
-        );
-        // an unknown signer beside a quorum counts zero
-        let mut unknown = good.clone();
-        unknown
+        // another witness for the same unsigned seal is another seal
+        let mut other = seal.clone();
+        other
             .signatures
-            .push(("zz".into(), unknown.signatures[0].1.clone()));
-        assert_eq!(SealSession::new(&h).verify_quorum(&unknown), Ok(()));
-        // a repeated signer ID is structure (a duplicate map key), not a vote
-        let mut twice = good.clone();
-        twice.signatures.push(twice.signatures[0].clone());
-        assert_eq!(
-            SealSession::new(&h).verify_quorum(&twice),
-            Err(VerificationError::SealMalformed)
-        );
-        // every witness that is not an exact canonical recoverable signature counts zero, as an extra
-        let extra = |sig: Vec<u8>| {
-            let mut x = good.clone();
-            x.signatures.push((s_id(&h, 3), sig));
-            x
-        };
-        let valid3 = signed_by(&s, &[3]).signatures[0].1.clone();
-        let mut compact = valid3.clone();
-        compact.truncate(64);
-        let mut flipped = valid3.clone();
-        flipped[64] ^= 1;
-        let mut v2 = valid3.clone();
-        v2[64] = 2;
-        let mut v27 = valid3.clone();
-        v27[64] = 27;
-        let mut long = valid3.clone();
-        long.push(0);
-        for (name, sig) in [
-            ("compact", compact.clone()),
-            ("recovery byte flipped", flipped.clone()),
-            ("recovery id 2 that does not recover the key", v2.clone()),
-            ("recovery byte 27", v27.clone()),
-            ("66 bytes", long.clone()),
-            ("63 bytes", valid3[..63].to_vec()),
-        ] {
-            assert_eq!(
-                SealSession::new(&h).verify_quorum(&extra(sig)),
-                Ok(()),
-                "{name} as an extra"
-            );
+            .push(("n3".into(), sign(&signers[3], &seal)));
+        session.verify_quorum_under(&other, &p1).unwrap();
+        assert_eq!(session.stats().quorum_checks, 2);
+
+        // failures are never remembered
+        let mut bad = seal.clone();
+        bad.signatures.truncate(2);
+        for _ in 0..2 {
+            assert!(session.verify_quorum_under(&bad, &p1).is_err());
         }
-        // ... and as a needed signature none of them has weight
-        for (name, sig) in [
-            ("compact", compact),
-            ("recovery byte flipped", flipped),
-            ("recovery id 2", v2),
-            ("recovery byte 27", v27),
-            ("66 bytes", long),
-        ] {
-            let mut two_and = signed_by(&s, &[0, 1]);
-            two_and.signatures.push((s_id(&h, 2), sig));
-            assert_eq!(
-                SealSession::new(&h).verify_quorum(&two_and),
-                Err(VerificationError::QuorumNotMet),
-                "{name} as a needed signature"
-            );
-        }
-        // below the threshold
-        assert_eq!(
-            SealSession::new(&h).verify_quorum(&signed_by(&s, &[0, 1])),
-            Err(VerificationError::QuorumNotMet)
-        );
+        assert_eq!(session.stats().quorum_checks, 4);
+
+        // another authority never inherits a verdict (the memo belongs to the session)
+        let other_tb = trust_base(&signers, 4);
+        let mut fresh = SealSession::new(&other_tb);
+        assert!(fresh.verify_quorum_under(&seal, &p1).is_err());
+        assert_eq!(fresh.stats().quorum_checks, 1);
     }
 
-    fn s_id(h: &TrustBaseHistory, i: usize) -> alloc::string::String {
-        h.latest().members[i].node_id.clone()
+    #[test]
+    fn stops_at_the_threshold_whatever_the_number_of_valid_signatures() {
+        let threshold = 5u64;
+        for n in [5usize, 6, 8, 12, 20, 40] {
+            let signers = signers(n);
+            let tb = trust_base(&signers, threshold);
+            let mut seal = seal_with(Vec::new());
+            let sigs: Vec<_> = signers
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (format!("n{i}"), sign(s, &seal)))
+                .collect();
+            seal.signatures = sigs;
+            let (ok, work) = verdict(&tb, &seal);
+            assert!(ok);
+            assert_eq!(
+                work,
+                QuorumWork {
+                    decodes: threshold,
+                    verifications: threshold
+                },
+                "N={n}: exactly the threshold, no further decode/verify"
+            );
+            // the reference scanned them all
+            assert_eq!(reference(&tb, &seal), (true, n as u64));
+            // and the public check agrees
+            let mut session = SealSession::new(&tb);
+            session.verify_quorum(&seal).unwrap();
+        }
     }
 
-    /// 256 distinct keys (two-byte seeds; `signers` repeats after 255).
+    #[test]
+    fn one_short_of_the_threshold_verifies_everything_and_fails() {
+        let signers = signers(9);
+        let tb = trust_base(&signers, 5);
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = signers
+            .iter()
+            .take(4)
+            .enumerate()
+            .map(|(i, s)| (format!("n{i}"), sign(s, &seal)))
+            .collect();
+        let (ok, work) = verdict(&tb, &seal);
+        assert!(!ok);
+        assert_eq!(work.verifications, 4);
+        assert_eq!(quorum_met(&tb, &seal), Err(VerificationError::QuorumNotMet));
+    }
+
+    /// Junk before, between and after valid signatures never changes the verdict.
+    #[test]
+    fn invalid_duplicate_and_unknown_signers_in_any_order_give_the_reference_result() {
+        let signers = signers(8);
+        let mut rng = Rng(99);
+        let outsider = Secp256k1Signer::from_bytes(&[0xee; 32]).unwrap();
+        for case in 0..300u64 {
+            let threshold = 1 + rng.next() % 6;
+            let mut tb = trust_base(&signers, threshold);
+            if case % 5 == 0 {
+                // two node ids with one key: the key counts once (unvalidated trust base)
+                tb.root_nodes[1].signing_key = tb.root_nodes[0].signing_key.clone();
+            }
+            let mut seal = seal_with(Vec::new());
+            let mut sigs: Vec<(String, Vec<u8>)> = Vec::new();
+            for _ in 0..(rng.next() % 14) {
+                let i = (rng.next() % 8) as usize;
+                let id = format!("n{i}");
+                let valid = sign(&signers[i], &seal);
+                let entry = match rng.next() % 6 {
+                    0..=2 => (id, valid),
+                    3 => {
+                        let mut bad = valid;
+                        bad[(rng.next() % 64) as usize] ^= 1; // invalid (or non-canonical)
+                        (id, bad)
+                    }
+                    4 => (id, vec![1, 2, 3]), // undecodable
+                    _ => ("stranger".into(), sign(&outsider, &seal)), // unknown node
+                };
+                sigs.push(entry);
+                if rng.next() % 5 == 0 {
+                    sigs.push(sigs[sigs.len() - 1].clone()); // the same node twice
+                }
+            }
+            seal.signatures = sigs;
+            let (ok, work) = verdict(&tb, &seal);
+            let (ref_ok, ref_verifications) = reference(&tb, &seal);
+            assert_eq!(ok, ref_ok, "case {case}");
+            assert!(work.verifications <= ref_verifications, "case {case}");
+            assert!(work.decodes >= work.verifications);
+            if !ok {
+                // an unreachable quorum scans everything, like before
+                assert_eq!(work.verifications, ref_verifications, "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_entries_before_valid_ones_are_skipped_then_it_stops() {
+        let signers = signers(6);
+        let tb = trust_base(&signers, 3);
+        let mut seal = seal_with(Vec::new());
+        let good = |i: usize, seal: &UnicitySeal| (format!("n{i}"), sign(&signers[i], seal));
+        let mut bad = good(0, &seal);
+        bad.1[9] ^= 1;
+        seal.signatures = vec![
+            ("ghost".into(), vec![0; 65]), // unknown: not even decoded
+            ("n0".into(), vec![1, 2]),     // undecodable: decoded, not verified
+            bad,                           // verified, invalid
+            good(1, &seal),                // valid 1
+            good(1, &seal),                // the same node again: skipped
+            good(2, &seal),                // valid 2
+            good(0, &seal),                // valid 3 -> stop
+            good(3, &seal),                // never looked at
+            ("n4".into(), vec![9]),        // never looked at
+        ];
+        let (ok, work) = verdict(&tb, &seal);
+        assert!(ok);
+        // n0(undecodable) + n0(bad) + n1 + n2 + n0(valid)
+        assert_eq!(work.decodes, 5);
+        assert_eq!(work.verifications, 4);
+        assert!(reference(&tb, &seal).0);
+    }
+
+    #[test]
+    fn one_key_under_two_node_ids_counts_once() {
+        let signers = signers(3);
+        let mut tb = trust_base(&signers, 2);
+        tb.root_nodes[1].signing_key = tb.root_nodes[0].signing_key.clone();
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = vec![
+            ("n0".into(), sign(&signers[0], &seal)),
+            ("n1".into(), sign(&signers[0], &seal)), // same key, other node id
+        ];
+        let (ok, work) = verdict(&tb, &seal);
+        assert!(!ok);
+        assert_eq!(
+            work.verifications, 1,
+            "the second entry is skipped before any decode"
+        );
+        seal.signatures
+            .push(("n2".into(), sign(&signers[2], &seal)));
+        assert!(verdict(&tb, &seal).0);
+    }
+
+    /// 256 distinct keys (`signers` repeats after 255).
     fn many_signers(n: usize) -> Vec<Secp256k1Signer> {
         (0..n)
             .map(|i| {
@@ -519,125 +806,81 @@ mod tests {
             .collect()
     }
 
+    /// Owner §49: a native seal carries at most 256 signatures, counting unknown and bad extras, checked before any hashing or signature work.
     #[test]
-    fn at_most_256_signatures() {
-        let s = many_signers(256);
-        let h = history(&s, &[1; 256]);
-        let mut seal = signed_by(&s, &(0..256).collect::<Vec<_>>());
-        // every one of 256 members, 256 signatures: accepted
-        assert_eq!(SealSession::new(&h).authenticate_seal(&seal), Ok(()));
-        // a 257th signature (an unknown extra, which would count zero) is over the resource ceiling: refused before any signature work
-        seal.signatures.push(("zz".into(), alloc::vec![1, 2, 3]));
+    fn at_most_256_seal_signatures_before_any_work() {
+        assert_eq!(MAX_SEAL_SIGNATURES, 256);
+        let signers = many_signers(256);
+        let tb = trust_base(&signers, 171);
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = signers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("n{i}"), sign(s, &seal)))
+            .collect();
+        // all 256 members sign: verifies, on both paths
+        let mut session = SealSession::new(&tb);
+        session.verify_quorum(&seal).unwrap();
+        assert_eq!(check_seal_shape(&seal), Ok(()));
+        // a 257th (an unknown extra, worth zero) is over the ceiling
+        seal.signatures.push(("zz".into(), vec![1, 2, 3]));
+        let mut session = SealSession::new(&tb);
         assert_eq!(
-            SealSession::new(&h).authenticate_seal(&seal),
+            session.verify_quorum(&seal),
+            Err(VerificationError::SealMalformed)
+        );
+        assert_eq!(
+            session.stats().quorum_checks,
+            0,
+            "refused before the memo key and any signature work"
+        );
+        assert_eq!(
+            check_seal_shape(&seal),
             Err(VerificationError::SealMalformed)
         );
     }
 
+    /// 128 operating validators: the quorum is 86 and the valid signatures of a full committee are enough.
     #[test]
-    fn a_128_validator_seal_needs_its_quorum_and_a_full_one_verifies() {
-        let s = many_signers(128);
-        let h = history(&s, &[1; 128]);
-        assert_eq!(h.latest().quorum_threshold, 86);
-        let quorum = signed_by(&s, &(0..86).collect::<Vec<_>>());
-        assert_eq!(SealSession::new(&h).authenticate_seal(&quorum), Ok(()));
-        let short = signed_by(&s, &(0..85).collect::<Vec<_>>());
+    fn a_128_validator_committee_reaches_its_quorum() {
+        let signers = many_signers(128);
+        let tb = trust_base(&signers, 86);
+        let mut seal = seal_with(Vec::new());
+        seal.signatures = signers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("n{i}"), sign(s, &seal)))
+            .collect();
+        SealSession::new(&tb).verify_quorum(&seal).unwrap();
+        seal.signatures.truncate(85);
         assert_eq!(
-            SealSession::new(&h).authenticate_seal(&short),
+            SealSession::new(&tb).verify_quorum(&seal),
             Err(VerificationError::QuorumNotMet)
         );
-        let all = signed_by(&s, &(0..128).collect::<Vec<_>>());
-        assert_eq!(SealSession::new(&h).authenticate_seal(&all), Ok(()));
     }
 
+    /// The decoder refuses a seal over the ceiling before it copies the keys and signatures.
     #[test]
-    fn verdicts_are_bound_to_the_entry_and_the_complete_seal() {
-        let s = signers(3);
-        let h = history(&s, &[1, 1, 1]); // threshold 3
-        let seal = signed_by(&s, &[0, 1, 2]);
-        let mut session = SealSession::new(&h);
-        session.verify_quorum(&seal).unwrap();
-        session.verify_quorum(&seal).unwrap();
-        let st = session.stats();
-        assert_eq!((st.quorum_checks, st.memo_hits), (1, 1));
-
-        // another witness of the same unsigned seal (an extra of an unknown signer, zero weight) is another key
-        let mut twin = seal.clone();
-        twin.signatures.push(("zz".into(), alloc::vec![1, 2, 3]));
-        session.verify_quorum(&twin).unwrap();
-        assert_eq!(session.stats().quorum_checks, 2);
-
-        // a tampered witness never reuses a verdict
-        let mut tampered = seal.clone();
-        tampered.signatures[0].1[3] ^= 1;
-        assert!(session.verify_quorum(&tampered).is_err());
-        assert_eq!(session.stats().quorum_checks, 3);
-
-        // capacity 0: nothing is reused
-        let mut none = SealSession::with_capacity(&h, 0);
-        none.verify_quorum(&seal).unwrap();
-        none.verify_quorum(&seal).unwrap();
-        assert_eq!((none.stats().quorum_checks, none.stats().memo_hits), (2, 0));
-
-        // the entry identity is part of the authority identity: another entry, another identity
-        let mut other_entry = h.latest().clone();
-        other_entry.state_hash = Some(vec![9; 32]);
-        let other = TrustBaseHistory::from_genesis(other_entry, None).unwrap();
-        assert_ne!(
-            SealSession::new(&h).authority_identity(&seal).unwrap(),
-            SealSession::new(&other).authority_identity(&seal).unwrap()
-        );
-    }
-
-    #[test]
-    fn the_authority_is_the_entry_of_the_seal_epoch() {
-        let s = signers(1);
-        let g = history(&s, &[1]); // epoch 1 from round 1
-        let mut h = g.clone();
-        let mut next = TrustBaseEntry::new(
-            NetworkId::LOCAL,
-            2,
-            10,
-            g.latest().members.clone(),
-            1,
-            None,
-            None,
-            g.latest().entry_id(),
-        );
-        next.sign("n0", &s[0]);
-        h.append(next).unwrap();
-
-        let at = |epoch: u64, round: u64| {
-            let mut seal = seal_with(Vec::new());
-            seal.epoch = epoch;
-            seal.root_chain_round_number = round;
-            seal.signatures = vec![("n0".into(), sign(&s[0], &seal))];
-            seal
+    fn a_seal_with_more_than_256_signatures_does_not_decode() {
+        use crate::cbor::Decoder;
+        let sigs = |n: usize| -> Vec<(String, Vec<u8>)> {
+            (0..n)
+                .map(|i| (format!("n{i:04}"), vec![0u8; 65]))
+                .collect()
         };
-        let mut session = SealSession::new(&h);
-        assert_eq!(session.verify_quorum(&at(1, 9)), Ok(()));
+        let ok = seal_with(sigs(256));
+        let bytes = ok.to_cbor();
         assert_eq!(
-            session.verify_quorum(&at(1, 10)),
-            Err(VerificationError::SealAfterAuthorityEnd)
+            UnicitySeal::from_cbor(Decoder::new(&bytes))
+                .unwrap()
+                .signatures
+                .len(),
+            256
         );
-        assert_eq!(session.verify_quorum(&at(2, 10)), Ok(()));
-        assert_eq!(
-            session.verify_quorum(&at(2, 9)),
-            Err(VerificationError::SealBeforeEpochStart)
-        );
-        assert_eq!(
-            session.verify_quorum(&at(3, 99)),
-            Err(VerificationError::UnknownTrustEpoch { epoch: 3 })
-        );
-        assert_eq!(
-            session.verify_quorum(&at(0, 5)),
-            Err(VerificationError::EpochBeforeGenesis)
-        );
-        let mut foreign = at(1, 5);
-        foreign.network_id = NetworkId::MAINNET;
-        assert_eq!(
-            session.verify_quorum(&foreign),
-            Err(VerificationError::SealNetworkMismatch)
-        );
+        let over = seal_with(sigs(257)).to_cbor();
+        assert!(matches!(
+            UnicitySeal::from_cbor(Decoder::new(&over)),
+            Err(crate::error::Error::OutOfRange("seal signatures"))
+        ));
     }
 }

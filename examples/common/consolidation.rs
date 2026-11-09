@@ -5,12 +5,12 @@
 //!
 //! | Variable | Meaning |
 //! |---|---|
-//! | `UNICITY_TRUSTBASE` | path of the trust base file: a release bundle, a genesis entry or a V2 genesis JSON (required) |
+//! | `UNICITY_TRUSTBASE` | path of the root trust base JSON (default `e2e/bft-trustbase.testnet2.json`) |
 //! | `UNICITY_PARTITION_ID` | the partition number |
 //! | `UNICITY_SHARD_ENDPOINTS` | `bits=url` pairs, comma separated, e.g. `00=https://a/,01=https://b/,10=...,11=...`; one shard: `=https://a/` |
 //! | `UNICITY_API_KEY` | optional API key (HTTPS only) |
 
-use unicity_token::api::bft::{ShardId, TrustBaseHistory};
+use unicity_token::api::bft::{RootTrustBase, ShardId};
 use unicity_token::client::{HttpAggregatorClient, ProofClient, ProofClientConfig};
 use unicity_token::client::{SystemClock, ThreadedExecutor};
 use unicity_token::consolidation::PartitionTopology;
@@ -27,14 +27,12 @@ fn shard(bits: &str) -> ShardId {
 pub type Client = ProofClient<HttpAggregatorClient, SystemClock, ThreadedExecutor>;
 
 /// Build the trust base and the proof client from the environment.
-pub fn load() -> (TrustBaseHistory, Client) {
+pub fn load() -> (RootTrustBase, Client) {
     dotenvy::from_path("e2e/.env").ok();
-    let trustbase = std::env::var("UNICITY_TRUSTBASE").unwrap_or_else(|_| {
-        panic!("set UNICITY_TRUSTBASE to your deployment's V2 genesis (JSON or CBOR) or release bundle; e2e/dev has a development fixture")
-    });
-    let trust_base = TrustBaseHistory::from_file(
-        &std::fs::read(&trustbase).unwrap_or_else(|e| panic!("read {trustbase}: {e}")),
-        None,
+    let trustbase = std::env::var("UNICITY_TRUSTBASE")
+        .unwrap_or_else(|_| "e2e/bft-trustbase.testnet2.json".into());
+    let trust_base = RootTrustBase::from_json(
+        &std::fs::read_to_string(&trustbase).unwrap_or_else(|e| panic!("read {trustbase}: {e}")),
     )
     .expect("parse trust base");
 

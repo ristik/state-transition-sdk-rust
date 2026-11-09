@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use unicity_token::api::bft::TrustBaseHistory;
+use unicity_token::api::bft::RootTrustBase;
 use unicity_token::cbor::encode_text_string;
 use unicity_token::client::{self, HttpAggregatorClient};
 use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
@@ -12,6 +12,8 @@ use unicity_token::predicate::builtin::SignaturePredicate;
 use unicity_token::transaction::ids::{StateMask, TokenSalt, TokenType};
 use unicity_token::transaction::Token;
 
+const DEFAULT_GATEWAY: &str = "https://gateway.testnet2.unicity.network/";
+const DEFAULT_TRUSTBASE: &str = "bft-trustbase.testnet2.json";
 const DEFAULT_OUTPUT_DIR: &str = "artifacts";
 
 fn request_timeout() -> Result<u64, Box<dyn Error>> {
@@ -38,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bob_lock = SignaturePredicate::new(bob.public_key());
 
     println!("Gateway: {}", config.gateway);
-    println!("Network ID: {}", trust_base.network_id().id());
+    println!("Network ID: {}", trust_base.network_id.id());
     println!(
         "Alice public key: {}",
         hex::encode(alice.public_key().as_bytes())
@@ -52,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let minted = client::mint(
         &gateway,
         &trust_base,
-        trust_base.network_id(),
+        trust_base.network_id,
         &alice_lock,
         TokenType::random()?,
         TokenSalt::random()?,
@@ -105,9 +107,9 @@ struct Config {
 
 impl Config {
     fn load() -> Result<Self, Box<dyn Error>> {
-        let gateway = env::var("UNICITY_GATEWAY").map_err(|_| {
-            "set UNICITY_GATEWAY to your deployment's aggregator URL (testnet2's V1 trust base is not supported by this major version)"
-        })?;
+        let gateway = env::var("UNICITY_GATEWAY")
+            .ok()
+            .unwrap_or_else(|| DEFAULT_GATEWAY.to_owned());
         let api_key = env::var("UNICITY_API_KEY")
             .ok()
             .filter(|value| !value.is_empty())
@@ -116,9 +118,9 @@ impl Config {
         Ok(Self {
             gateway,
             api_key,
-            trustbase: env::var_os("UNICITY_TRUSTBASE").map(PathBuf::from).ok_or(
-                "set UNICITY_TRUSTBASE to your deployment's V2 genesis (JSON or CBOR) or release bundle; dev/ has a development fixture",
-            )?,
+            trustbase: env::var_os("UNICITY_TRUSTBASE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_TRUSTBASE)),
             output_dir: env::var_os("UNICITY_OUTPUT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_DIR)),
@@ -126,9 +128,9 @@ impl Config {
     }
 }
 
-fn load_trust_base(path: &Path) -> Result<TrustBaseHistory, Box<dyn Error>> {
-    let contents = fs::read(path)?;
-    Ok(TrustBaseHistory::from_file(&contents, None)?)
+fn load_trust_base(path: &Path) -> Result<RootTrustBase, Box<dyn Error>> {
+    let json = fs::read_to_string(path)?;
+    Ok(RootTrustBase::from_json(&json)?)
 }
 
 fn save_token(path: &Path, token: &Token) -> Result<(), Box<dyn Error>> {
@@ -136,7 +138,7 @@ fn save_token(path: &Path, token: &Token) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn load_and_verify(path: &Path, trust_base: &TrustBaseHistory) -> Result<Token, Box<dyn Error>> {
+fn load_and_verify(path: &Path, trust_base: &RootTrustBase) -> Result<Token, Box<dyn Error>> {
     let bytes = fs::read(path)?;
     let token = Token::from_cbor(&bytes)?;
     token.verify(trust_base)?;

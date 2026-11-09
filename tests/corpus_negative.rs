@@ -16,8 +16,6 @@
 //! applies.
 #![cfg(feature = "http")]
 
-mod trust_support;
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -25,14 +23,16 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use unicity_token::api::bft::ShardId;
-use unicity_token::api::{InclusionProofResponse, StateId};
+use unicity_token::api::bft::root_trust_base::RootTrustBaseNodeInfo;
+use unicity_token::api::bft::{RootTrustBase, ShardId};
+use unicity_token::api::{InclusionProofResponse, NetworkId, StateId};
 use unicity_token::cbor::Decoder;
 use unicity_token::client::{
     BatchFailure, BundleOutcome, ConsolidateOptions, ConsolidationError, HttpAggregatorClient,
     IntegrityError, ProofClient, ProofClientConfig, ProofItem, UnavailableReason,
 };
 use unicity_token::consolidation::{PartitionTopology, PartitionViewError};
+use unicity_token::crypto::signature::PublicKey;
 use unicity_token::verify::VerificationError;
 
 fn corpus_root() -> PathBuf {
@@ -70,6 +70,36 @@ fn shard(bits: &str) -> ShardId {
         id = if c == '0' { zero } else { one };
     }
     id
+}
+
+fn trust_base(bytes: &[u8]) -> RootTrustBase {
+    let items = Decoder::new(bytes)
+        .expect_tag(39000)
+        .unwrap()
+        .array(Some(10))
+        .unwrap();
+    let nodes = items[4]
+        .array(None)
+        .unwrap()
+        .into_iter()
+        .map(|n| {
+            let f = n.array(Some(3)).unwrap();
+            RootTrustBaseNodeInfo {
+                node_id: f[0].text().unwrap().into(),
+                signing_key: PublicKey::from_bytes(f[1].bytes_value().unwrap()).unwrap(),
+                stake: f[2].uint().unwrap(),
+            }
+        })
+        .collect();
+    RootTrustBase::try_new(
+        items[0].uint().unwrap(),
+        NetworkId::new(items[1].uint().unwrap() as u16).unwrap(),
+        items[2].uint().unwrap(),
+        items[3].uint().unwrap(),
+        nodes,
+        items[5].uint().unwrap(),
+    )
+    .unwrap()
 }
 
 // ---------------------------------------------------------------- scripted server
@@ -202,7 +232,7 @@ fn run(files: &Files) -> Got {
     let client = match ProofClient::with_host_defaults(
         ProofClientConfig { topology },
         endpoints,
-        trust_support::history_from_corpus_trust_base(&files["trust-base.cbor"]),
+        trust_base(&files["trust-base.cbor"]),
         4,
     ) {
         Ok(client) => client,
@@ -223,16 +253,9 @@ fn run(files: &Files) -> Got {
 fn seal_class(e: &VerificationError) -> String {
     use VerificationError::*;
     match e {
-        // the fork's trust base history: an unknown signer or an epoch outside the history
-        // is refused by name, not as a missed quorum
-        QuorumNotMet
-        | SealNetworkMismatch
-        // the fork's native seal rule refuses a seal carrying any unknown or invalid signature
-        // (the other-authority case) instead of counting the valid ones towards a quorum
-        | EpochBeforeGenesis
-        | UnknownTrustEpoch { .. }
-        | SealAfterAuthorityEnd
-        | SealBeforeEpochStart => "unauthenticated".into(),
+        QuorumNotMet | SealNetworkMismatch | SealEpochMismatch | SealBeforeEpochStart => {
+            "unauthenticated".into()
+        }
         SealMalformed => "invalid_input".into(),
         other => format!("unmapped seal failure {other:?}"),
     }

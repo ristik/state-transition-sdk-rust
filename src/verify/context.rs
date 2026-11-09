@@ -1,10 +1,13 @@
 //! Shared state and cumulative limits for recursive token verification.
 
-use crate::api::bft::{TrustBaseHistory, UcInterner};
+use crate::api::bft::UcInterner;
 use crate::cbor::DecodeLimits;
 use crate::transaction::Token;
 
-use super::{verify_token_in_context, MintJustificationRegistry, SealSession, VerificationError};
+use super::{
+    verify_token_in_context, Authority, MintJustificationRegistry, SealSession, TrustAnchor,
+    VerificationError,
+};
 
 /// Resource limits applied across one complete, possibly recursive verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +49,6 @@ pub struct VerificationPolicy {
 
 /// Mutable context shared by all recursively invoked verifiers.
 pub struct VerificationContext<'a> {
-    history: &'a TrustBaseHistory,
     registry: &'a MintJustificationRegistry,
     policy: VerificationPolicy,
     seals: SealSession<'a>,
@@ -72,16 +74,15 @@ impl<'a> VerificationContext<'a> {
     /// A context whose seal/certificate memos hold at most `capacity` entries
     /// (`0` disables reuse: the slow reference behavior).
     pub(crate) fn with_memo_capacity(
-        history: &'a TrustBaseHistory,
+        trust_base: &'a (impl TrustAnchor + ?Sized),
         registry: &'a MintJustificationRegistry,
         policy: VerificationPolicy,
         capacity: usize,
     ) -> Self {
         Self {
-            history,
             registry,
             policy,
-            seals: SealSession::with_capacity(history, capacity),
+            seals: SealSession::with_capacity(trust_base, capacity),
             interner: UcInterner::with_capacity(capacity),
             embedded_token_depth: 0,
             total_embedded_token_bytes: 0,
@@ -97,7 +98,6 @@ impl<'a> VerificationContext<'a> {
         policy: VerificationPolicy,
     ) -> Self {
         Self {
-            history: seals.history(),
             registry,
             policy,
             seals,
@@ -113,9 +113,9 @@ impl<'a> VerificationContext<'a> {
         self.seals
     }
 
-    /// Trust base history used by the entire recursive verification chain.
-    pub fn history(&self) -> &'a TrustBaseHistory {
-        self.history
+    /// Root of trust used by the entire recursive verification chain.
+    pub fn authority(&self) -> Authority<'a> {
+        self.seals.authority()
     }
 
     /// The seal authentication session shared by the whole recursive

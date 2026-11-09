@@ -1,4 +1,4 @@
-//! Live end-to-end test against a gateway of your own deployment (V2 trust base).
+//! Live end-to-end test against the testnet2 gateway.
 //!
 //! Reads connection parameters from `e2e/.env` (see `e2e/.env.example`), the
 //! same source the examples and the `e2e/` demo crate use, then mints and
@@ -11,11 +11,14 @@
 use std::path::Path;
 use std::time::Duration;
 
-use unicity_token::api::bft::TrustBaseHistory;
+use unicity_token::api::bft::RootTrustBase;
 use unicity_token::client::{self, HttpAggregatorClient};
 use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
 use unicity_token::predicate::builtin::SignaturePredicate;
 use unicity_token::transaction::ids::{StateMask, TokenSalt, TokenType};
+
+const DEFAULT_GATEWAY: &str = "https://gateway.testnet2.unicity.network/";
+const DEFAULT_TRUSTBASE: &str = "bft-trustbase.testnet2.json";
 
 /// Read connection parameters from `e2e/.env`, matching the examples and the
 /// `e2e/` demo crate. Values already in the process environment take
@@ -23,16 +26,12 @@ use unicity_token::transaction::ids::{StateMask, TokenSalt, TokenType};
 fn read_service() -> (String, Option<String>, String) {
     dotenvy::from_path("e2e/.env").ok();
 
-    let gateway = std::env::var("UNICITY_GATEWAY").unwrap_or_else(|_| {
-        panic!("set UNICITY_GATEWAY to your deployment's aggregator URL (testnet2's V1 trust base is not supported by this major version)")
-    });
+    let gateway = std::env::var("UNICITY_GATEWAY").unwrap_or_else(|_| DEFAULT_GATEWAY.to_string());
     let api_key = std::env::var("UNICITY_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
     let trustbase =
-        std::env::var("UNICITY_TRUSTBASE").unwrap_or_else(|_| {
-        panic!("set UNICITY_TRUSTBASE to your deployment's V2 genesis (JSON or CBOR) or release bundle; e2e/dev has a development fixture")
-    });
+        std::env::var("UNICITY_TRUSTBASE").unwrap_or_else(|_| DEFAULT_TRUSTBASE.to_string());
     let trustbase_path = if Path::new(&trustbase).is_absolute() {
         trustbase
     } else {
@@ -42,7 +41,7 @@ fn read_service() -> (String, Option<String>, String) {
 }
 
 #[test]
-#[ignore = "hits a live gateway"]
+#[ignore = "hits the live testnet2 gateway"]
 fn e2e_mint_transfer_verify() {
     let timeout = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -50,9 +49,9 @@ fn e2e_mint_transfer_verify() {
         .as_secs()
         + 3600;
     let (gateway, api_key, trustbase_path) = read_service();
-    let trust_file = std::fs::read(&trustbase_path)
+    let trust_json = std::fs::read_to_string(&trustbase_path)
         .unwrap_or_else(|e| panic!("read trust base {trustbase_path}: {e}"));
-    let trust_base = TrustBaseHistory::from_file(&trust_file, None).expect("parse trust base");
+    let trust_base = RootTrustBase::from_json(&trust_json).expect("parse trust base");
 
     let mut aggregator =
         HttpAggregatorClient::new(gateway).with_polling(Duration::from_secs(2), 90);
@@ -66,7 +65,7 @@ fn e2e_mint_transfer_verify() {
     let token = client::mint(
         &aggregator,
         &trust_base,
-        trust_base.network_id(),
+        trust_base.network_id,
         &SignaturePredicate::new(alice.public_key()),
         TokenType::random().unwrap(),
         TokenSalt::random().unwrap(),
